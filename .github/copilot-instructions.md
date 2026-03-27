@@ -43,6 +43,8 @@ Two processes, communicating via JSON state files on disk (`desired.json` and `c
 - 500 MB max upload size
 - Assets organized into `videos/`, `images/`, `splash/` subdirectories under `/opt/agora/assets/`
 - Supported formats: `.mp4` (video), `.jpg`/`.jpeg`/`.png` (images)
+- API version lives in `api/__init__.py` (`__version__`)
+- **Whenever API endpoints are added, changed, or removed, update `docs/openapi.yaml` to match.**
 
 ## Hardware Target
 
