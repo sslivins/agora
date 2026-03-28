@@ -47,6 +47,11 @@ Two processes, communicating via JSON state files on disk (`desired.json` and `c
 - API version lives in `api/__init__.py` (`__version__`)
 - **Whenever API endpoints are added, changed, or removed, update `docs/openapi.yaml` to match.**
 
+## Bug Fixing — Test-Driven
+
+- **Before fixing any bug, write a failing test that reproduces it.** Confirm the test fails, then implement the fix, then confirm the test passes.
+- Tests live in `tests/` and use pytest + pytest-asyncio + httpx.
+
 ## Git Workflow
 
 - **`main` is sacred** — never commit directly to `main`.

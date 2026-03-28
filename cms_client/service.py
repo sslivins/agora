@@ -239,6 +239,8 @@ class CMSClient:
         """CMS sent a state sync — update desired state if applicable."""
         logger.info("Received sync from CMS")
         current_window = msg.get("current")
+        default_asset = msg.get("default_asset")
+
         if current_window:
             asset = current_window.get("asset", "")
             loop = current_window.get("loop", True)
@@ -249,8 +251,17 @@ class CMSClient:
             )
             write_state(self.settings.desired_state_path, desired)
             logger.info("Sync: playing %s (loop=%s)", asset, loop)
+        elif default_asset:
+            # No schedule but a default asset is assigned — play it
+            desired = DesiredState(
+                mode=PlaybackMode.PLAY,
+                asset=default_asset,
+                loop=True,
+            )
+            write_state(self.settings.desired_state_path, desired)
+            logger.info("Sync: playing default asset %s", default_asset)
         else:
-            # Nothing scheduled — show splash
+            # Nothing scheduled, no default — show splash
             desired = DesiredState(mode=PlaybackMode.SPLASH)
             write_state(self.settings.desired_state_path, desired)
             logger.info("Sync: no schedule, showing splash")
@@ -369,6 +380,44 @@ class CMSClient:
 
         if "device_name" in msg and msg["device_name"]:
             logger.info("Device name updated to: %s (requires restart to apply)", msg["device_name"])
+
+        if "web_password" in msg and msg["web_password"]:
+            new_password = msg["web_password"]
+            # Write override file for immediate effect (API reads this on login)
+            override_path = self.settings.state_dir / "web_password"
+            atomic_write(override_path, new_password)
+            try:
+                os.chmod(override_path, 0o644)
+            except OSError:
+                pass
+            # Also persist to /boot/agora-config.json for reboot survival
+            boot_config = Path("/boot/agora-config.json")
+            try:
+                cfg = json.loads(boot_config.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                cfg = {}
+            cfg["web_password"] = new_password
+            atomic_write(boot_config, json.dumps(cfg, indent=2))
+            logger.info("Web UI password updated")
+
+        if "api_key" in msg and msg["api_key"]:
+            new_key = msg["api_key"]
+            # Write override file for immediate effect (API reads this on auth)
+            override_path = self.settings.state_dir / "api_key"
+            atomic_write(override_path, new_key)
+            try:
+                os.chmod(override_path, 0o644)
+            except OSError:
+                pass
+            # Also persist to /boot/agora-config.json for reboot survival
+            boot_config = Path("/boot/agora-config.json")
+            try:
+                cfg = json.loads(boot_config.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                cfg = {}
+            cfg["api_key"] = new_key
+            atomic_write(boot_config, json.dumps(cfg, indent=2))
+            logger.info("API key updated")
 
     def _get_version(self) -> str:
         """Get the agora package version."""

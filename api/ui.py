@@ -32,8 +32,18 @@ async def login_submit(
     password: str = Form(...),
     settings: Settings = Depends(get_settings),
 ):
+    # Check for CMS-pushed password override, fall back to boot config
+    effective_password = settings.web_password
+    override_path = settings.state_dir / "web_password"
+    try:
+        override = override_path.read_text().strip()
+        if override:
+            effective_password = override
+    except (FileNotFoundError, OSError):
+        pass
+
     if hmac.compare_digest(username, settings.web_username) and hmac.compare_digest(
-        password, settings.web_password
+        password, effective_password
     ):
         response = RedirectResponse("/", status_code=303)
         create_session(response, username, settings)
