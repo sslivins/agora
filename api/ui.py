@@ -69,12 +69,32 @@ async def dashboard(
     user: str = Depends(require_web_auth),
     settings: Settings = Depends(get_settings),
 ):
+    import shutil
+    from pathlib import Path
+
     current = read_state(settings.current_state_path, CurrentState)
     desired = read_state(settings.desired_state_path, DesiredState)
     asset_count = 0
     for subdir in [settings.videos_dir, settings.images_dir]:
         if subdir.exists():
             asset_count += sum(1 for f in subdir.iterdir() if f.is_file())
+
+    # Storage info
+    try:
+        usage = shutil.disk_usage(settings.assets_dir)
+        storage_total_mb = int(usage.total / (1024 * 1024))
+        storage_used_mb = int(usage.used / (1024 * 1024))
+        storage_free_mb = int(usage.free / (1024 * 1024))
+        storage_pct_free = round(usage.free / usage.total * 100) if usage.total else 0
+    except OSError:
+        storage_total_mb = storage_used_mb = storage_free_mb = storage_pct_free = 0
+
+    # Device type
+    try:
+        device_type = Path("/proc/device-tree/model").read_text().strip().rstrip("\x00")
+    except (FileNotFoundError, OSError):
+        device_type = ""
+
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -84,6 +104,11 @@ async def dashboard(
             "desired": desired,
             "asset_count": asset_count,
             "device_name": settings.device_name,
+            "device_type": device_type,
+            "storage_total_mb": storage_total_mb,
+            "storage_used_mb": storage_used_mb,
+            "storage_free_mb": storage_free_mb,
+            "storage_pct_free": storage_pct_free,
         },
     )
 

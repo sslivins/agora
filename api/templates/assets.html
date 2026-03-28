@@ -33,12 +33,7 @@
                 <td>{{ asset.asset_type }}</td>
                 <td>{{ "%.1f MB" | format(asset.size / 1048576) }}</td>
                 <td>{{ asset.modified_at.strftime("%Y-%m-%d %H:%M") }}</td>
-                <td>
-                    {% if asset.asset_type in ('video', 'image') %}
-                    <button class="btn-sm" onclick="setSplash('{{ asset.name }}')">Set Splash</button>
-                    {% endif %}
-                    <button class="btn-sm danger" onclick="deleteAsset('{{ asset.name }}')">Delete</button>
-                </td>
+                <td></td>
             </tr>
             {% endfor %}
         </tbody>

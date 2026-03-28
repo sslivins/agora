@@ -7,7 +7,16 @@
         <h2>Device</h2>
         <dl>
             <dt>Name</dt><dd>{{ device_name }}</dd>
+            {% if device_type %}<dt>Type</dt><dd>{{ device_type }}</dd>{% endif %}
             <dt>Assets</dt><dd>{{ asset_count }}</dd>
+            <dt>Storage</dt>
+            <dd>
+                {% if storage_total_mb >= 1024 %}
+                {{ "%.1f"|format(storage_free_mb / 1024) }} GB free / {{ "%.1f"|format(storage_total_mb / 1024) }} GB total ({{ storage_pct_free }}% free)
+                {% else %}
+                {{ storage_free_mb }} MB free / {{ storage_total_mb }} MB total ({{ storage_pct_free }}% free)
+                {% endif %}
+            </dd>
         </dl>
     </div>
     <div class="card">

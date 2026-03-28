@@ -58,6 +58,14 @@ def _get_storage_mb(path: Path) -> tuple[int, int]:
         return 0, 0
 
 
+def _get_device_type() -> str:
+    """Read device model from /proc/device-tree/model (standard on Raspberry Pi)."""
+    try:
+        return Path("/proc/device-tree/model").read_text().strip().rstrip("\x00")
+    except (FileNotFoundError, OSError):
+        return ""
+
+
 def _read_auth_token(path: Path) -> str:
     """Read persisted device auth token, or empty string if none."""
     try:
@@ -160,6 +168,7 @@ class CMSClient:
                 "device_id": self.device_id,
                 "auth_token": auth_token,
                 "firmware_version": self._get_version(),
+                "device_type": _get_device_type(),
                 "storage_capacity_mb": cap_mb,
                 "storage_used_mb": used_mb,
             }

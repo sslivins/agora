@@ -42,17 +42,31 @@ def _target_dir(asset_type: str, settings: Settings) -> Path:
 
 def _list_assets(settings: Settings) -> List[AssetInfo]:
     """List all assets across all subdirectories."""
+    # Determine which asset is currently active (the "splash")
+    active_asset = None
+    try:
+        import json
+        desired = json.loads(settings.desired_state_path.read_text())
+        if desired.get("mode") == "play":
+            active_asset = desired.get("asset")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
     assets: List[AssetInfo] = []
+    seen: set[str] = set()
     for subdir, atype in [
         (settings.videos_dir, "video"),
         (settings.images_dir, "image"),
-        (settings.splash_dir, "splash"),
+        (settings.splash_dir, "image"),
     ]:
         if not subdir.exists():
             continue
         for f in subdir.iterdir():
-            if f.is_file() and f.suffix.lower() in ALLOWED_EXTENSIONS:
+            if f.is_file() and f.suffix.lower() in ALLOWED_EXTENSIONS and f.name not in seen:
+                seen.add(f.name)
                 stat = f.stat()
+                # Mark the currently playing asset as "active"
+                effective_type = "active" if f.name == active_asset else atype
                 assets.append(
                     AssetInfo(
                         name=f.name,
@@ -60,7 +74,7 @@ def _list_assets(settings: Settings) -> List[AssetInfo]:
                         modified_at=datetime.fromtimestamp(
                             stat.st_mtime, tz=timezone.utc
                         ),
-                        asset_type=atype,
+                        asset_type=effective_type,
                     )
                 )
     return sorted(assets, key=lambda a: a.name)
