@@ -109,3 +109,48 @@ async def playback_page(
         "playback.html",
         context={"user": user, "current": current, "assets": assets},
     )
+
+
+@router.get("/setup")
+async def setup_page(
+    request: Request,
+    user: str = Depends(require_web_auth),
+    settings: Settings = Depends(get_settings),
+):
+    import json
+    import subprocess
+
+    cms_host = ""
+    cms_port = ""
+    try:
+        config = json.loads(settings.cms_config_path.read_text())
+        cms_host = config.get("cms_host", "")
+        cms_port = config.get("cms_port", "")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    service_active = False
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "agora-cms-client"],
+            capture_output=True, text=True, timeout=5,
+        )
+        service_active = result.stdout.strip() == "active"
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    has_auth_token = settings.auth_token_path.exists()
+    configured = bool(cms_host)
+
+    return templates.TemplateResponse(
+        request,
+        "setup.html",
+        context={
+            "user": user,
+            "cms_host": cms_host,
+            "cms_port": cms_port,
+            "configured": configured,
+            "service_active": service_active,
+            "has_auth_token": has_auth_token,
+        },
+    )

@@ -89,6 +89,12 @@ h2 { margin-bottom: 1rem; font-size: 1.1rem; color: var(--text-muted); }
     margin-bottom: 1rem;
 }
 
+/* Stats */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; }
+.stat { text-align: center; }
+.stat-label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; }
+.stat-value { font-size: 1.3rem; font-weight: 600; }
+
 /* Definition lists */
 dl { display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; }
 dt { color: var(--text-muted); }
@@ -162,3 +168,17 @@ button.danger { background: var(--danger); }
 
 /* Status messages */
 #upload-status, #playback-status { margin-top: 0.5rem; font-size: 0.9rem; }
+
+/* Text utilities */
+.text-success { color: var(--success); }
+.text-warning { color: var(--warning); }
+.text-danger { color: var(--danger); }
+.text-muted { color: var(--text-muted); }
+
+/* Setup page */
+.form-hint { display: block; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem; }
+.form-status { margin: 0.75rem 0; font-size: 0.9rem; min-height: 1.2em; }
+.help-steps { padding-left: 1.5rem; color: var(--text-muted); }
+.help-steps li { margin-bottom: 0.5rem; }
+.help-steps strong { color: var(--text); }
+.help-steps em { color: var(--warning); font-style: normal; }

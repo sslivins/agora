@@ -1,0 +1,379 @@
+"""CMS WebSocket client service.
+
+Maintains a persistent WebSocket connection to the CMS.
+Handles registration, auth token management, state sync, and command execution.
+Reconnects automatically on disconnect.
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import shutil
+import time
+from pathlib import Path
+
+import websockets
+
+from api.config import Settings
+from shared.models import DesiredState, PlaybackMode
+from shared.state import atomic_write, read_state, write_state
+
+logger = logging.getLogger("agora.cms_client")
+
+PROTOCOL_VERSION = 1
+
+# Reconnect backoff: 2s, 4s, 8s, ... capped at 60s
+RECONNECT_BASE = 2
+RECONNECT_MAX = 60
+
+STATUS_INTERVAL = 30  # seconds between heartbeat status messages
+
+
+def _get_device_id() -> str:
+    """Read the Pi CPU serial number as device identity."""
+    try:
+        with open("/sys/firmware/devicetree/base/serial-number") as f:
+            return f.read().strip().strip("\x00")
+    except OSError:
+        pass
+    # Fallback: parse /proc/cpuinfo
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("Serial"):
+                return line.split(":")[1].strip()
+    except OSError:
+        pass
+    logger.error("Cannot determine device serial number")
+    return "unknown"
+
+
+def _get_storage_mb(path: Path) -> tuple[int, int]:
+    """Return (capacity_mb, used_mb) for the filesystem containing path."""
+    try:
+        stat = shutil.disk_usage(path)
+        return int(stat.total / (1024 * 1024)), int(stat.used / (1024 * 1024))
+    except OSError:
+        return 0, 0
+
+
+def _read_auth_token(path: Path) -> str:
+    """Read persisted device auth token, or empty string if none."""
+    try:
+        return path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _save_auth_token(path: Path, token: str) -> None:
+    """Persist device auth token to disk atomically."""
+    atomic_write(path, token)
+    # Restrict permissions — only owner can read
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+class CMSClient:
+    """WebSocket client that connects to the Agora CMS."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.device_id = _get_device_id()
+        self._running = False
+        self._ws = None
+
+    def _get_cms_url(self) -> str:
+        """Get CMS URL from runtime config (state dir), falling back to boot config."""
+        try:
+            config = json.loads(self.settings.cms_config_path.read_text())
+            url = config.get("cms_url", "")
+            if url:
+                return url
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        return self.settings.cms_url
+
+    async def run(self) -> None:
+        """Main loop — connect, communicate, reconnect on failure."""
+        cms_url = self._get_cms_url()
+        if not cms_url:
+            logger.info("No cms_url configured, CMS client disabled")
+            return
+
+        self._running = True
+        attempt = 0
+
+        while self._running:
+            try:
+                await self._connect_and_run()
+                attempt = 0  # Reset on clean disconnect
+            except (
+                websockets.ConnectionClosed,
+                websockets.InvalidURI,
+                websockets.InvalidHandshake,
+                OSError,
+            ) as e:
+                attempt += 1
+                delay = min(RECONNECT_BASE * (2 ** (attempt - 1)), RECONNECT_MAX)
+                logger.warning("CMS connection lost (%s), reconnecting in %ds...", e, delay)
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                logger.info("CMS client shutting down")
+                break
+            except Exception:
+                attempt += 1
+                delay = min(RECONNECT_BASE * (2 ** (attempt - 1)), RECONNECT_MAX)
+                logger.exception("Unexpected CMS client error, reconnecting in %ds...", delay)
+                await asyncio.sleep(delay)
+
+    async def stop(self) -> None:
+        """Signal the client to stop."""
+        self._running = False
+        if self._ws:
+            await self._ws.close()
+
+    async def _connect_and_run(self) -> None:
+        """Single connection lifecycle: connect → register → message loop."""
+        cms_url = self._get_cms_url()
+        logger.info("Connecting to CMS at %s", cms_url)
+
+        async with websockets.connect(
+            cms_url,
+            ping_interval=20,
+            ping_timeout=10,
+            close_timeout=5,
+        ) as ws:
+            self._ws = ws
+            logger.info("WebSocket connected")
+
+            # ── Register ──
+            auth_token = _read_auth_token(self.settings.auth_token_path)
+
+            cap_mb, used_mb = _get_storage_mb(self.settings.assets_dir)
+
+            register_msg = {
+                "type": "register",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "auth_token": auth_token,
+                "firmware_version": self._get_version(),
+                "storage_capacity_mb": cap_mb,
+                "storage_used_mb": used_mb,
+            }
+            await ws.send(json.dumps(register_msg))
+            logger.info("Sent register message (device_id=%s)", self.device_id)
+
+            # ── Wait for response (auth_assigned and/or sync) ──
+            startup_time = time.monotonic()
+            status_task = asyncio.create_task(self._status_loop(ws))
+
+            try:
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    msg_type = msg.get("type")
+
+                    if msg_type == "auth_assigned":
+                        await self._handle_auth_assigned(msg)
+                    elif msg_type == "sync":
+                        await self._handle_sync(msg)
+                    elif msg_type == "play":
+                        await self._handle_play(msg)
+                    elif msg_type == "stop":
+                        await self._handle_stop()
+                    elif msg_type == "fetch_asset":
+                        await self._handle_fetch_asset(msg, ws)
+                    elif msg_type == "delete_asset":
+                        await self._handle_delete_asset(msg, ws)
+                    elif msg_type == "config":
+                        await self._handle_config(msg)
+                    elif "error" in msg:
+                        logger.error("CMS error: %s", msg["error"])
+                        return
+                    else:
+                        logger.warning("Unknown CMS message type: %s", msg_type)
+            finally:
+                status_task.cancel()
+                try:
+                    await status_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _status_loop(self, ws) -> None:
+        """Send periodic status heartbeats."""
+        while True:
+            await asyncio.sleep(STATUS_INTERVAL)
+            try:
+                try:
+                    current_data = json.loads(self.settings.current_state_path.read_text())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    current_data = {}
+
+                _, used_mb = _get_storage_mb(self.settings.assets_dir)
+
+                status_msg = {
+                    "type": "status",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "mode": current_data.get("mode", "splash"),
+                    "asset": current_data.get("asset"),
+                    "uptime_seconds": int(time.monotonic()),
+                    "storage_used_mb": used_mb,
+                }
+                await ws.send(json.dumps(status_msg))
+            except websockets.ConnectionClosed:
+                raise
+            except Exception:
+                logger.exception("Error sending status heartbeat")
+
+    async def _handle_auth_assigned(self, msg: dict) -> None:
+        """CMS assigned us a device auth token — persist it."""
+        token = msg.get("device_auth_token", "")
+        if token:
+            _save_auth_token(self.settings.auth_token_path, token)
+            logger.info("Device auth token received and saved")
+
+    async def _handle_sync(self, msg: dict) -> None:
+        """CMS sent a state sync — update desired state if applicable."""
+        logger.info("Received sync from CMS")
+        current_window = msg.get("current")
+        if current_window:
+            asset = current_window.get("asset", "")
+            loop = current_window.get("loop", True)
+            desired = DesiredState(
+                mode=PlaybackMode.PLAY,
+                asset=asset,
+                loop=loop,
+            )
+            write_state(self.settings.desired_state_path, desired)
+            logger.info("Sync: playing %s (loop=%s)", asset, loop)
+        else:
+            # Nothing scheduled — show splash
+            desired = DesiredState(mode=PlaybackMode.SPLASH)
+            write_state(self.settings.desired_state_path, desired)
+            logger.info("Sync: no schedule, showing splash")
+
+    async def _handle_play(self, msg: dict) -> None:
+        """CMS sent an immediate play command."""
+        asset = msg.get("asset", "")
+        loop = msg.get("loop", True)
+        desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=loop)
+        write_state(self.settings.desired_state_path, desired)
+        logger.info("CMS play command: %s (loop=%s)", asset, loop)
+
+    async def _handle_stop(self) -> None:
+        """CMS sent a stop command."""
+        desired = DesiredState(mode=PlaybackMode.SPLASH)
+        write_state(self.settings.desired_state_path, desired)
+        logger.info("CMS stop command: showing splash")
+
+    async def _handle_fetch_asset(self, msg: dict, ws) -> None:
+        """CMS tells us to download an asset."""
+        asset_name = msg.get("asset_name", "")
+        download_url = msg.get("download_url", "")
+        expected_checksum = msg.get("checksum", "")
+        expected_size = msg.get("size_bytes", 0)
+
+        if not asset_name or not download_url:
+            logger.warning("Invalid fetch_asset message: missing fields")
+            return
+
+        logger.info("Fetching asset: %s from %s", asset_name, download_url)
+
+        try:
+            import aiohttp
+
+            # Determine target directory based on file extension
+            ext = Path(asset_name).suffix.lower()
+            if ext == ".mp4":
+                target_dir = self.settings.videos_dir
+            elif ext in (".jpg", ".jpeg", ".png"):
+                target_dir = self.settings.images_dir
+            else:
+                target_dir = self.settings.assets_dir
+
+            target_path = target_dir / asset_name
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(download_url) as resp:
+                    if resp.status != 200:
+                        logger.error("Failed to download %s: HTTP %d", asset_name, resp.status)
+                        return
+
+                    sha256 = hashlib.sha256()
+                    tmp_path = target_path.with_suffix(".tmp")
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(65536):
+                            f.write(chunk)
+                            sha256.update(chunk)
+
+                    # Verify checksum
+                    actual_checksum = sha256.hexdigest()
+                    if expected_checksum and actual_checksum != expected_checksum:
+                        logger.error("Checksum mismatch for %s: expected %s, got %s",
+                                     asset_name, expected_checksum, actual_checksum)
+                        tmp_path.unlink(missing_ok=True)
+                        return
+
+                    # Atomic move into place
+                    os.replace(tmp_path, target_path)
+                    logger.info("Asset downloaded: %s (%d bytes)", asset_name, target_path.stat().st_size)
+
+            # Confirm to CMS
+            ack = {
+                "type": "asset_ack",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "asset_name": asset_name,
+                "checksum": actual_checksum,
+            }
+            await ws.send(json.dumps(ack))
+
+        except Exception:
+            logger.exception("Error fetching asset %s", asset_name)
+
+    async def _handle_delete_asset(self, msg: dict, ws) -> None:
+        """CMS tells us to delete a local asset."""
+        asset_name = msg.get("asset_name", "")
+        if not asset_name:
+            return
+
+        # Search all asset directories
+        for d in [self.settings.videos_dir, self.settings.images_dir, self.settings.splash_dir]:
+            target = d / asset_name
+            if target.exists():
+                target.unlink()
+                logger.info("Deleted asset: %s", asset_name)
+                break
+        else:
+            logger.warning("Asset not found for deletion: %s", asset_name)
+
+        # Confirm to CMS
+        ack = {
+            "type": "asset_deleted",
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "asset_name": asset_name,
+        }
+        await ws.send(json.dumps(ack))
+
+    async def _handle_config(self, msg: dict) -> None:
+        """CMS sent updated configuration."""
+        if "splash" in msg and msg["splash"]:
+            # Update splash config
+            splash_path = self.settings.splash_config_path
+            atomic_write(splash_path, msg["splash"])
+            logger.info("Splash updated to: %s", msg["splash"])
+
+        if "device_name" in msg and msg["device_name"]:
+            logger.info("Device name updated to: %s (requires restart to apply)", msg["device_name"])
+
+    def _get_version(self) -> str:
+        """Get the agora package version."""
+        try:
+            from api import __version__
+            return __version__
+        except ImportError:
+            return "unknown"

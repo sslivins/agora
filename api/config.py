@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # Splash
     default_splash: str = "splash/default.png"
 
+    # CMS connection
+    cms_url: str = ""  # e.g. ws://192.168.1.100:8080/ws/device
+
     @property
     def assets_dir(self) -> Path:
         return self.agora_base / "assets"
@@ -62,6 +65,14 @@ class Settings(BaseSettings):
     @property
     def current_state_path(self) -> Path:
         return self.state_dir / "current.json"
+
+    @property
+    def auth_token_path(self) -> Path:
+        return self.state_dir / "cms_auth_token"
+
+    @property
+    def cms_config_path(self) -> Path:
+        return self.state_dir / "cms_config.json"
 
     def ensure_dirs(self) -> None:
         for d in [

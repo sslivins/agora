@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}CMS Setup — Agora{% endblock %}
+{% block content %}
+<h1>CMS Connection</h1>
+
+<section class="card">
+    <h2>Status</h2>
+    <div class="stats-grid" id="cms-status">
+        <div class="stat">
+            <div class="stat-label">Connection</div>
+            <div class="stat-value {% if service_active %}text-success{% elif configured %}text-warning{% else %}text-muted{% endif %}">
+                {% if service_active %}Connected{% elif configured %}Configured{% else %}Not configured{% endif %}
+            </div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Registered</div>
+            <div class="stat-value {% if has_auth_token %}text-success{% else %}text-muted{% endif %}">
+                {% if has_auth_token %}Yes{% else %}No{% endif %}
+            </div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Service</div>
+            <div class="stat-value {% if service_active %}text-success{% else %}text-muted{% endif %}">
+                {% if service_active %}Running{% else %}Stopped{% endif %}
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="card">
+    <h2>Configuration</h2>
+    <form id="cms-config-form" onsubmit="return saveCmsConfig(this)">
+        <div class="form-group">
+            <label for="cms-host">CMS Server Address</label>
+            <input type="text" id="cms-host" name="cms_host"
+                   placeholder="192.168.1.100"
+                   value="{{ cms_host }}">
+            <small class="form-hint">IP address or hostname of your Agora CMS server</small>
+        </div>
+        <div class="form-group">
+            <label for="cms-port">Port (optional)</label>
+            <input type="number" id="cms-port" name="cms_port"
+                   placeholder="8080" value="{{ cms_port }}" min="1" max="65535">
+            <small class="form-hint">Default: 8080</small>
+        </div>
+        <div id="config-status" class="form-status"></div>
+        <button type="submit" class="btn btn-primary">Connect</button>
+    </form>
+</section>
+
+<section class="card">
+    <h2>How It Works</h2>
+    <ol class="help-steps">
+        <li>Enter your <strong>CMS server address</strong> above and click Connect.</li>
+        <li>This device will connect and appear as <em>Pending</em> in the CMS dashboard.</li>
+        <li><strong>Approve the device</strong> in the CMS — it will receive a secure auth token automatically.</li>
+        <li>On future connections, the device authenticates automatically.</li>
+    </ol>
+</section>
+
+<script>
+async function saveCmsConfig(form) {
+    const statusEl = document.getElementById("config-status");
+    const cmsHost = document.getElementById("cms-host").value.trim();
+    const cmsPort = document.getElementById("cms-port").value.trim() || "8080";
+
+    if (!cmsHost) {
+        statusEl.textContent = "Server address is required.";
+        statusEl.className = "form-status text-danger";
+        return false;
+    }
+
+    statusEl.textContent = "Connecting…";
+    statusEl.className = "form-status";
+
+    const res = await apiCall("POST", "/cms/config", {
+        cms_host: cmsHost,
+        cms_port: parseInt(cmsPort),
+    });
+
+    if (res && res.ok) {
+        statusEl.textContent = "Connected! Reloading status…";
+        statusEl.className = "form-status text-success";
+        setTimeout(() => window.location.reload(), 3000);
+    } else if (res) {
+        const data = await res.json();
+        statusEl.textContent = "Error: " + (data.detail || "Unknown error");
+        statusEl.className = "form-status text-danger";
+    }
+    return false;
+}
+</script>
+{% endblock %}
