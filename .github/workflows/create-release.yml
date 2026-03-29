@@ -5,10 +5,14 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
-  tag:
+  release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,3 +39,69 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Build .deb package
+        run: bash packaging/build-deb.sh "${{ steps.version.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: build/*.deb
+          generate_release_notes: true
+
+  publish-apt:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+        continue-on-error: true
+
+      - name: Initialize gh-pages if needed
+        run: |
+          if [ ! -f index.html ]; then
+            git checkout --orphan gh-pages 2>/dev/null || true
+            git rm -rf . 2>/dev/null || true
+            echo "<html><body><h1>Agora APT Repository</h1><p>See README for usage.</p></body></html>" > index.html
+            mkdir -p pool dists/stable/main/binary-arm64
+          fi
+
+      - name: Download .deb from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p pool
+          gh release download "${{ needs.release.outputs.tag }}" --pattern "*.deb" --dir pool/
+
+      - name: Generate APT repository metadata
+        run: |
+          cd $GITHUB_WORKSPACE
+
+          # Generate Packages file
+          dpkg-scanpackages --arch arm64 pool/ > dists/stable/main/binary-arm64/Packages
+          gzip -kf dists/stable/main/binary-arm64/Packages
+
+          # Generate Release file
+          cd dists/stable
+          cat > Release <<EOF
+          Origin: sslivins
+          Label: Agora
+          Suite: stable
+          Codename: stable
+          Architectures: arm64
+          Components: main
+          Description: Agora media playback system for Raspberry Pi
+          EOF
+          # Add checksums
+          apt-ftparchive release . >> Release
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Update apt repo: ${{ needs.release.outputs.tag }}"
+          git push origin gh-pages
