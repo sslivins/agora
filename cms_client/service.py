@@ -74,7 +74,7 @@ def _get_cpu_temp() -> float | None:
             # Output format: "temp=45.6'C\n"
             text = result.stdout.strip()
             return float(text.split("=")[1].split("'")[0])
-    except (OSError, ValueError, IndexError):
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
         pass
     return None
 
