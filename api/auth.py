@@ -44,8 +44,18 @@ async def require_auth(
     settings: Settings = Depends(get_settings),
 ) -> str:
     """Dependency for API routes: accepts API key header OR session cookie."""
-    if api_key and hmac.compare_digest(api_key, settings.api_key):
-        return "api_key"
+    if api_key:
+        # Check CMS-pushed key override first, fall back to boot config
+        effective_key = settings.api_key
+        override_path = settings.state_dir / "api_key"
+        try:
+            override = override_path.read_text().strip()
+            if override:
+                effective_key = override
+        except (FileNotFoundError, OSError):
+            pass
+        if hmac.compare_digest(api_key, effective_key):
+            return "api_key"
     user = get_session_user(request, settings)
     if user:
         return user

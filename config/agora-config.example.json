@@ -4,5 +4,6 @@
     "web_password": "CHANGE_ME_to_a_secure_password",
     "secret_key": "CHANGE_ME_to_another_secure_random_string",
     "device_name": "breakroom-01",
-    "default_splash": "splash/default.png"
+    "default_splash": "splash/default.png",
+    "cms_url": "ws://YOUR_CMS_IP:8080/ws/device"
 }

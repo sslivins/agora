@@ -2,35 +2,70 @@
 {% block title %}Dashboard — Agora{% endblock %}
 {% block content %}
 <h1>Dashboard</h1>
-<div class="grid">
-    <div class="card">
-        <h2>Device</h2>
-        <dl>
-            <dt>Name</dt><dd>{{ device_name }}</dd>
-            <dt>Assets</dt><dd>{{ asset_count }}</dd>
-        </dl>
-    </div>
-    <div class="card">
-        <h2>Current State</h2>
-        <dl>
-            <dt>Mode</dt>
-            <dd><span class="badge badge-{{ current.mode.value }}">{{ current.mode.value }}</span></dd>
-            <dt>Asset</dt><dd>{{ current.asset or "—" }}</dd>
-            <dt>Loop</dt><dd>{{ "Yes" if current.loop else "No" }}</dd>
-            <dt>Pipeline</dt><dd>{{ current.pipeline_state }}</dd>
-            {% if current.error %}
-            <dt>Error</dt><dd class="text-error">{{ current.error }}</dd>
-            {% endif %}
-        </dl>
-    </div>
-    <div class="card">
-        <h2>Desired State</h2>
-        <dl>
-            <dt>Mode</dt>
-            <dd><span class="badge badge-{{ desired.mode.value }}">{{ desired.mode.value }}</span></dd>
-            <dt>Asset</dt><dd>{{ desired.asset or "—" }}</dd>
-            <dt>Loop</dt><dd>{{ "Yes" if desired.loop else "No" }}</dd>
-        </dl>
+
+<div class="card">
+    <h2>Now Playing</h2>
+    <div class="now-playing">
+        <span class="badge badge-{{ current.mode.value }}">{{ current.mode.value }}</span>
+        <span class="now-playing-asset">{{ current.asset or "—" }}</span>
+        {% if current.error %}
+        <span class="text-error">{{ current.error }}</span>
+        {% endif %}
     </div>
 </div>
+
+<div class="card">
+    <h2>Schedule</h2>
+    {% if schedules %}
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Asset</th>
+                <th>Time</th>
+                <th>Days</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] %}
+            {% for s in schedules %}
+            <tr>
+                <td>{{ s.name }}</td>
+                <td>{{ s.asset }}</td>
+                <td>{{ s.start_time | time12 }}–{{ s.end_time | time12 }}</td>
+                <td>
+                    {% if s.days_of_week %}
+                        {% for d in s.days_of_week | sort %}{% if not loop.first %}, {% endif %}{{ day_names[d] }}{% endfor %}
+                    {% else %}
+                        Every day
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="text-muted">No schedules assigned to this device.</p>
+    {% endif %}
+    {% if default_asset %}
+    <p class="schedule-default">Default asset: <strong>{{ default_asset }}</strong></p>
+    {% endif %}
+</div>
+
+<script>
+(function() {
+    let lastHash = "{{ schedule_hash }}";
+    setInterval(async () => {
+        try {
+            const res = await fetch("/api/v1/status");
+            if (!res.ok) return;
+            const data = await res.json();
+            const hash = data.schedule_hash || "";
+            if (hash && hash !== lastHash) {
+                location.reload();
+            }
+        } catch (e) { /* ignore */ }
+    }, 5000);
+})();
+</script>
 {% endblock %}

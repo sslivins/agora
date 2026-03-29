@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from api import __version__
 from api.auth import WebAuthRequired
 from api.config import load_settings
-from api.routers import assets, playback, status
+from api.routers import assets, cms, playback, status
 from api.ui import router as ui_router
 
 app = FastAPI(
@@ -38,6 +38,7 @@ async def web_auth_redirect(request: Request, exc: WebAuthRequired):
 app.include_router(assets.router, prefix="/api/v1", tags=["assets"])
 app.include_router(playback.router, prefix="/api/v1", tags=["playback"])
 app.include_router(status.router, prefix="/api/v1", tags=["status"])
+app.include_router(cms.router, prefix="/api/v1", tags=["cms"])
 
 # Web UI router
 app.include_router(ui_router)

@@ -89,6 +89,12 @@ h2 { margin-bottom: 1rem; font-size: 1.1rem; color: var(--text-muted); }
     margin-bottom: 1rem;
 }
 
+/* Stats */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; }
+.stat { text-align: center; }
+.stat-label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; }
+.stat-value { font-size: 1.3rem; font-weight: 600; }
+
 /* Definition lists */
 dl { display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; }
 dt { color: var(--text-muted); }
@@ -122,6 +128,8 @@ button {
     transition: background 0.2s;
 }
 button:hover { background: var(--accent); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:disabled:hover { background: var(--primary); }
 button.primary { background: var(--accent); }
 button.primary:hover { opacity: 0.85; }
 button.danger { background: var(--danger); }
@@ -162,3 +170,32 @@ button.danger { background: var(--danger); }
 
 /* Status messages */
 #upload-status, #playback-status { margin-top: 0.5rem; font-size: 0.9rem; }
+
+/* Text utilities */
+.text-success { color: var(--success); }
+.text-warning { color: var(--warning); }
+.text-danger { color: var(--danger); }
+.text-muted { color: var(--text-muted); }
+
+/* Setup/Settings page */
+.form-hint { display: block; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem; }
+.form-status { margin: 0.75rem 0; font-size: 0.9rem; min-height: 1.2em; }
+.form-row { display: flex; gap: 0.75rem; align-items: flex-end; max-width: 400px; }
+.form-group-grow { flex: 1; }
+.form-group-port { width: 90px; flex-shrink: 0; }
+.cms-status-bar { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--primary); }
+.help-heading { font-size: 0.95rem; color: var(--text-muted); margin: 1.25rem 0 0.75rem; padding-top: 1rem; border-top: 1px solid var(--primary); }
+.help-steps { padding-left: 1.5rem; color: var(--text-muted); }
+.help-steps li { margin-bottom: 0.5rem; }
+.help-steps strong { color: var(--text); }
+.help-steps em { color: var(--warning); font-style: normal; }
+.cms-link { color: var(--accent); text-decoration: none; }
+.cms-link:hover { text-decoration: underline; }
+
+/* Now Playing */
+.now-playing { display: flex; align-items: center; gap: 0.75rem; font-size: 1.1rem; }
+.now-playing-asset { font-weight: 500; }
+
+/* Schedule default */
+.schedule-default { margin-top: 1rem; color: var(--text-muted); font-size: 0.9rem; }
+.schedule-default strong { color: var(--text); }

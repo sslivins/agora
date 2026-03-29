@@ -1,3 +1,4 @@
+import hashlib
 import time
 
 from fastapi import APIRouter, Depends, Request
@@ -28,9 +29,17 @@ async def get_status(request: Request, settings: Settings = Depends(get_settings
     for subdir in [settings.videos_dir, settings.images_dir]:
         if subdir.exists():
             asset_count += sum(1 for f in subdir.iterdir() if f.is_file())
+    schedule_hash = ""
+    try:
+        raw = settings.schedule_path.read_bytes()
+        schedule_hash = hashlib.md5(raw).hexdigest()
+    except (FileNotFoundError, OSError):
+        pass
+
     return StatusResponse(
         device_name=settings.device_name,
         current_state=current,
         desired_state=desired,
         asset_count=asset_count,
+        schedule_hash=schedule_hash,
     )

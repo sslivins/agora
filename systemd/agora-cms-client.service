@@ -1,0 +1,22 @@
+[Unit]
+Description=Agora CMS Client
+After=network-online.target agora-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m cms_client.main
+WorkingDirectory=/opt/agora/src
+Environment=PYTHONPATH=/opt/agora/src
+Environment=AGORA_BASE=/opt/agora
+Restart=always
+RestartSec=10
+
+# Longer initial delay to let network settle
+ExecStartPre=/bin/sleep 5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -6,9 +6,9 @@ A media playback system for Raspberry Pi Zero 2 W that plays video and images on
 
 Two processes communicate through JSON state files on disk:
 
-### API Service (Docker)
+### API Service (systemd)
 
-A FastAPI application running in a Docker container on port 8000. Provides:
+A FastAPI application running natively via systemd on port 8000. Provides:
 
 - **REST API** (`/api/v1/`) — asset upload/delete/list, playback control (play, stop, splash), status and health endpoints
 - **Web UI** (`/`) — Jinja2-based dashboard for managing assets and playback from a browser
@@ -16,7 +16,7 @@ A FastAPI application running in a Docker container on port 8000. Provides:
 
 ### Player Service (systemd)
 
-A GStreamer-based media player that runs natively (not containerized) to access hardware:
+A GStreamer-based media player that runs natively via systemd to access hardware:
 
 - Watches `desired.json` via inotify (2s polling fallback)
 - Builds GStreamer pipelines for video (`v4l2h264dec` → `kmssink` + HDMI audio via ALSA) and images (`decodebin` → `imagefreeze` → `kmssink`)
@@ -90,13 +90,13 @@ All `/api/v1/` endpoints require authentication (`X-API-Key` header or session c
 
 ## Deployment
 
-### API (Docker)
+### API (systemd)
 
 ```bash
-docker compose up -d
+sudo cp systemd/agora-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agora-api
 ```
-
-The API container mounts `/opt/agora/assets`, `/opt/agora/state`, `/opt/agora/logs`, and `/boot/agora-config.json` (read-only).
 
 ### Player (systemd)
 
