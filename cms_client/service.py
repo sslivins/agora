@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +61,22 @@ def _get_storage_mb(path: Path) -> tuple[int, int]:
         return int(stat.total / (1024 * 1024)), int(stat.used / (1024 * 1024))
     except OSError:
         return 0, 0
+
+
+def _get_cpu_temp() -> float | None:
+    """Read CPU temperature via vcgencmd. Returns degrees Celsius or None."""
+    try:
+        result = subprocess.run(
+            ["vcgencmd", "measure_temp"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            # Output format: "temp=45.6'C\n"
+            text = result.stdout.strip()
+            return float(text.split("=")[1].split("'")[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _get_device_type() -> str:
@@ -314,6 +331,7 @@ class CMSClient:
                     "asset": current_data.get("asset"),
                     "uptime_seconds": int(time.monotonic()),
                     "storage_used_mb": used_mb,
+                    "cpu_temp_c": _get_cpu_temp(),
                 }
                 await ws.send(json.dumps(status_msg))
             except websockets.ConnectionClosed:
