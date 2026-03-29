@@ -568,6 +568,12 @@ class CMSClient:
             rel_path = str(target_path.relative_to(self.settings.assets_dir))
             self.asset_manager.register(asset_name, rel_path, file_size, actual_checksum)
 
+            # Re-trigger desired state if player is waiting for this asset
+            desired = read_state(self.settings.desired_state_path)
+            if desired and desired.get("asset") == asset_name:
+                logger.info("Re-applying desired state for just-downloaded asset: %s", asset_name)
+                write_state(self.settings.desired_state_path, desired)
+
             ack = {
                 "type": "asset_ack",
                 "protocol_version": PROTOCOL_VERSION,
