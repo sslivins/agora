@@ -1,0 +1,13 @@
+Origin: Agora
+Label: Agora
+Suite: stable
+Codename: stable
+Architectures: arm64
+Components: main
+Description: Agora media playback system for Raspberry Pi
+MD5Sum:
+ 136fd7e01fbb0fd35444d9a63895133e              804 main/binary-arm64/Packages
+ 1ee6ce499d7a8e48e802fc9730161f6a              519 main/binary-arm64/Packages.gz
+SHA256:
+ 78f3b9af0e289a5bf04e63b84d5427eafd49429e6a69f909e557f9cd2f0b0408              804 main/binary-arm64/Packages
+ e199b513502f87dcb9593ab53ed97180c6a97b7c4fc4d5ed3de4afb9a4edae42              519 main/binary-arm64/Packages.gz
