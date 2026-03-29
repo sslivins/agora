@@ -2,10 +2,11 @@ openapi: 3.0.3
 info:
   title: Agora
   description: >
-    Media playback system for Raspberry Pi — REST API for asset management,
-    playback control, and status monitoring. Content is uploaded and controlled
-    through this API, while a separate player service handles GStreamer pipelines.
-  version: 0.2.0
+    Media playback system for Raspberry Pi Zero 2 W — REST API for asset management,
+    playback control, CMS integration, and status monitoring. A separate player service
+    handles GStreamer pipelines, and an optional CMS client connects to Agora CMS for
+    centralized scheduling and fleet management.
+  version: 0.5.0
   license:
     name: MIT
 
@@ -27,6 +28,8 @@ tags:
     description: Media playback control
   - name: assets
     description: Asset upload, listing, and management
+  - name: cms
+    description: CMS connection configuration
 
 paths:
   /health:
@@ -49,7 +52,8 @@ paths:
       tags: [status]
       summary: System status
       description: >
-        Returns the current and desired playback states plus an asset count.
+        Returns the current and desired playback states, asset count,
+        and schedule hash (if CMS schedules are cached).
       operationId: getStatus
       responses:
         "200":
@@ -67,7 +71,7 @@ paths:
       summary: Play an asset
       description: >
         Begin playback of a named asset. The asset must already exist on the
-        device (uploaded via `/assets/upload`).
+        device (uploaded via `/assets/upload` or fetched from CMS).
       operationId: play
       requestBody:
         required: true
@@ -109,8 +113,8 @@ paths:
       tags: [playback]
       summary: Show splash screen
       description: >
-        Switch to the splash screen. If a splash asset exists in the splash
-        directory it will be displayed; otherwise the built-in default is used.
+        Switch to the splash screen. If a user-configured splash asset exists
+        it will be displayed; otherwise the built-in default is used.
       operationId: splash
       responses:
         "200":
@@ -207,9 +211,8 @@ paths:
       tags: [assets]
       summary: Set asset as splash screen
       description: >
-        Configure an existing asset (from videos, images, or splash) as the
-        active splash screen. The asset will be shown when playback is stopped
-        or the splash endpoint is called. Does not move or copy the file.
+        Configure an existing asset as the active splash screen. The asset
+        will be shown when playback is stopped or the splash endpoint is called.
       operationId: setSplash
       parameters:
         - name: name
@@ -251,6 +254,57 @@ paths:
                 properties:
                   splash:
                     type: "null"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /cms/config:
+    get:
+      tags: [cms]
+      summary: Get CMS connection status
+      description: >
+        Returns the current CMS connection configuration, service status,
+        and whether the device has registered with the CMS.
+      operationId: getCmsConfig
+      responses:
+        "200":
+          description: CMS configuration and status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CmsConfigResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [cms]
+      summary: Configure CMS connection
+      description: >
+        Set the CMS server address and port. Automatically strips protocol
+        prefixes and restarts the CMS client service. The device will
+        connect and register on the next attempt.
+      operationId: setCmsConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CmsConfigRequest"
+      responses:
+        "200":
+          description: CMS configuration updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  cms_host:
+                    type: string
+                  cms_port:
+                    type: integer
+        "400":
+          description: Server address is required.
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -333,7 +387,7 @@ components:
           example: agora-node
         version:
           type: string
-          example: 0.2.0
+          example: 0.5.0
         uptime_seconds:
           type: number
           format: float
@@ -349,6 +403,10 @@ components:
           $ref: "#/components/schemas/DesiredState"
         asset_count:
           type: integer
+        schedule_hash:
+          type: string
+          nullable: true
+          description: Hash of the cached CMS schedule, if any.
 
     PlayRequest:
       type: object
@@ -385,3 +443,35 @@ components:
         asset_type:
           type: string
           enum: [video, image, splash]
+
+    CmsConfigResponse:
+      type: object
+      properties:
+        cms_host:
+          type: string
+          description: CMS server hostname or IP.
+        cms_port:
+          type: integer
+          description: CMS server port.
+          example: 8080
+        has_auth_token:
+          type: boolean
+          description: Whether the device has registered with the CMS.
+        service_active:
+          type: boolean
+          description: Whether the agora-cms-client systemd service is running.
+        configured:
+          type: boolean
+          description: Whether a CMS host has been set.
+
+    CmsConfigRequest:
+      type: object
+      required: [cms_host]
+      properties:
+        cms_host:
+          type: string
+          description: CMS server hostname or IP address. Protocol prefixes are stripped automatically.
+        cms_port:
+          type: integer
+          description: CMS server port.
+          default: 8080

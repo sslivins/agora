@@ -1,33 +1,113 @@
 # Agora
 
-A media playback system for Raspberry Pi Zero 2 W that plays video and images on a TV, with content managed via a REST API and web UI.
+A media playback system for **Raspberry Pi Zero 2 W** that plays video and images on a TV via HDMI, with content managed through a REST API, web UI, and optional central management via [Agora CMS](https://github.com/sslivins/agora-cms).
+
+## Install on Raspberry Pi Zero 2 W
+
+### Prerequisites
+
+1. Flash **Raspberry Pi OS 64-bit Lite** onto an SD card using [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
+2. In Imager settings, enable SSH and configure Wi-Fi
+3. Boot the Pi and ensure it has network connectivity
+
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sslivins/agora/main/scripts/setup-pi.sh | sudo bash
+```
+
+This adds the Agora apt repository, installs the package, and starts all services. When complete it prints the web UI URL and default credentials.
+
+To upgrade later:
+
+```bash
+sudo apt update && sudo apt upgrade agora
+```
 
 ## Architecture
 
-Two processes communicate through JSON state files on disk:
+Three services communicate through JSON state files on disk and a WebSocket connection to the CMS:
 
-### API Service (systemd)
+### API Service (port 8000)
 
-A FastAPI application running natively via systemd on port 8000. Provides:
+FastAPI application running via systemd. Provides:
 
-- **REST API** (`/api/v1/`) — asset upload/delete/list, playback control (play, stop, splash), status and health endpoints
-- **Web UI** (`/`) — Jinja2-based dashboard for managing assets and playback from a browser
+- **REST API** (`/api/v1/`) — asset upload/delete/list, playback control, status, CMS configuration
+- **Web UI** (`/`) — Jinja2 dashboard for managing assets, playback, and settings from a browser
 - **Auth** — API key header (`X-API-Key`) for programmatic access, signed session cookies for the web UI
 
-### Player Service (systemd)
+### Player Service
 
-A GStreamer-based media player that runs natively via systemd to access hardware:
+GStreamer-based media player running natively via systemd to access hardware:
 
 - Watches `desired.json` via inotify (2s polling fallback)
 - Builds GStreamer pipelines for video (`v4l2h264dec` → `kmssink` + HDMI audio via ALSA) and images (`decodebin` → `imagefreeze` → `kmssink`)
 - Supports looping, automatic splash screen fallback on EOS/error
-- Reports its actual state to `current.json`
+- Reports actual state to `current.json`
+
+### CMS Client Service
+
+WebSocket client that maintains a persistent connection to [Agora CMS](https://github.com/sslivins/agora-cms):
+
+- Registers device by CPU serial number with auth token
+- Receives schedule windows and caches them locally
+- Evaluates schedules locally every 15 seconds
+- Pre-fetches upcoming assets with budget-aware LRU eviction
+- Accepts live commands: play, stop, config updates, reboot
+- Exponential backoff on connection errors (2s → 60s cap)
 
 ### State Machine
 
 ```
 API writes desired.json  →  Player reads & acts  →  Player writes current.json  →  API reads for status
+CMS Client receives schedule → writes desired.json → Player acts
 ```
+
+## Web UI Pages
+
+| Page | Path | Description |
+|------|------|-------------|
+| Dashboard | `/` | Current playback state, cached schedule display |
+| Assets | `/assets` | Upload, list, delete media files, set splash screen |
+| Playback | `/playback` | Manual play/stop/splash controls |
+| Settings | `/settings` | Device info, storage usage, CMS connection config |
+| Login | `/login` | Web authentication |
+
+## API Endpoints
+
+All `/api/v1/` endpoints require authentication (`X-API-Key` header or session cookie) unless noted.
+
+### Status
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/health` | Health check (no auth) — device name, version, uptime |
+| `GET` | `/api/v1/status` | Current/desired state, asset count, schedule hash |
+
+### Playback
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/play` | Play an asset `{"asset": "file.mp4", "loop": true}` |
+| `POST` | `/api/v1/stop` | Stop playback, show splash |
+| `POST` | `/api/v1/splash` | Show splash screen |
+
+### Assets
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/assets` | List all assets |
+| `POST` | `/api/v1/assets/upload` | Upload a media file (max 500 MB) |
+| `DELETE` | `/api/v1/assets/{name}` | Delete an asset |
+| `POST` | `/api/v1/assets/{name}/set-splash` | Set asset as active splash screen |
+| `DELETE` | `/api/v1/assets/splash` | Clear splash override, revert to default |
+
+### CMS Configuration
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/cms/config` | CMS connection status and config |
+| `POST` | `/api/v1/cms/config` | Set CMS server address and port |
 
 ## Directory Structure
 
@@ -36,80 +116,88 @@ API writes desired.json  →  Player reads & acts  →  Player writes current.js
 ├── assets/
 │   ├── videos/        # Uploaded .mp4 files
 │   ├── images/        # Uploaded .jpg/.jpeg/.png files
-│   └── splash/        # Splash screen assets (shown on idle/startup)
+│   └── splash/        # Splash screen assets
 ├── state/
-│   ├── desired.json   # What the player should be doing (written by API)
-│   └── current.json   # What the player is actually doing (written by player)
+│   ├── desired.json   # What the player should do (written by API / CMS client)
+│   ├── current.json   # What the player is doing (written by player)
+│   ├── cms_config.json    # CMS connection settings
+│   ├── cms_auth_token     # Device auth token from CMS
+│   ├── schedule.json      # Cached schedule from CMS
+│   └── assets.json        # Asset manifest (checksums, sizes, LRU)
 ├── logs/
-└── src/               # Source code (player runs from here)
+└── src/               # Source code
 ```
 
 ## Configuration
 
-Config is loaded from `/boot/agora-config.json`, overlaid by `AGORA_` environment variables.
+Loaded from `/boot/agora-config.json`, overlaid by `AGORA_` environment variables:
 
 ```json
 {
     "api_key": "your-secure-api-key",
     "web_username": "admin",
-    "web_password": "your-secure-password",
+    "web_password": "agora",
     "secret_key": "your-signing-secret",
-    "device_name": "breakroom-01"
+    "device_name": "breakroom-01",
+    "cms_url": "ws://192.168.1.100:8080/ws/device"
 }
 ```
 
-See `config/agora-config.example.json` for the template.
-
-## Playback Modes
-
-| Mode | Description |
-|---|---|
-| `play` | Play a specific asset (video or image), optionally looping |
-| `stop` | Stop all playback |
-| `splash` | Show the splash screen (auto-loops if video) |
+Keys are auto-generated on first boot if not set. See `config/agora-config.example.json` for the full template.
 
 ## Supported Formats
 
-- **Video:** `.mp4` (H.264, played via hardware decoder)
+- **Video:** `.mp4` (H.264, hardware-decoded via V4L2)
 - **Images:** `.jpg`, `.jpeg`, `.png`
 
-## API Endpoints
+## CMS Protocol (WebSocket)
 
-All `/api/v1/` endpoints require authentication (`X-API-Key` header or session cookie).
+Protocol version: **1**
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/v1/health` | Health check (no auth required) |
-| `GET` | `/api/v1/status` | Current and desired state, asset count |
-| `POST` | `/api/v1/assets/upload` | Upload a media file (multipart form) |
-| `GET` | `/api/v1/assets` | List all assets |
-| `DELETE` | `/api/v1/assets/{name}` | Delete an asset |
-| `POST` | `/api/v1/play` | Play an asset `{"asset": "file.mp4", "loop": true}` |
-| `POST` | `/api/v1/stop` | Stop playback |
-| `POST` | `/api/v1/splash` | Show splash screen |
+### Device → CMS
 
-## Deployment
+| Type | Description |
+|------|-------------|
+| `register` | Device ID, auth token, firmware version, storage capacity |
+| `status` | Heartbeat: playback state, disk usage, uptime (every 30s) |
+| `fetch_request` | Request an asset from CMS |
+| `asset_ack` | Confirm asset downloaded |
+| `asset_deleted` | Confirm asset removed |
 
-### API (systemd)
+### CMS → Device
+
+| Type | Description |
+|------|-------------|
+| `auth_assigned` | Initial auth token for new device |
+| `sync` | Full schedule window, timezone, default asset |
+| `play` | Immediate playback command |
+| `stop` | Stop playback |
+| `fetch_asset` | Download URL + checksum + size |
+| `delete_asset` | Remove local asset |
+| `config` | Update splash, password, API key, device name |
+| `reboot` | Reboot device |
+
+## Development
+
+### Requirements
+
+- **API:** FastAPI, uvicorn, Jinja2, itsdangerous, pydantic-settings (`requirements-api.txt`)
+- **Player:** GStreamer 1.0 with GI bindings, inotify-simple (`requirements-player.txt`)
+- **CMS Client:** websockets, aiohttp, pydantic (`requirements-cms-client.txt`)
+- **Tests:** pytest, pytest-asyncio, httpx (`requirements-test.txt`)
+
+### Running Tests
 
 ```bash
-sudo cp systemd/agora-api.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now agora-api
+pytest tests/ --tb=short -q
 ```
 
-### Player (systemd)
+### Releasing
 
-```bash
-sudo cp systemd/agora-player.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now agora-player
-```
+The **Create Release** workflow (Actions → Create Release → Run workflow) reads the version from `api/__init__.py`, creates a git tag, builds the `.deb` package, publishes a GitHub Release, and updates the apt repository.
 
-The player runs natively as a systemd service to access GStreamer, KMS, and ALSA hardware directly.
+Bump the version in `api/__init__.py` before running.
 
-## Requirements
+## Related
 
-- **API:** Python 3.11, FastAPI, uvicorn, itsdangerous, pydantic-settings (see `requirements-api.txt`)
-- **Player:** Python 3, GStreamer 1.0 with GI bindings, inotify-simple (see `requirements-player.txt`)
-- **Hardware:** Raspberry Pi Zero 2 W, HDMI-connected display
+- **[Agora CMS](https://github.com/sslivins/agora-cms)** — Central management server for scheduling and fleet control
