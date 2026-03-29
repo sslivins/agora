@@ -36,11 +36,12 @@ mkdir -p "${BUILD_DIR}/etc/systemd/system"
 mkdir -p "${BUILD_DIR}/usr/share/plymouth/themes/splash"
 
 # ── Source code ──
-for dir in api player shared; do
+for dir in api player shared cms_client; do
     cp -r "${REPO_ROOT}/${dir}" "${BUILD_DIR}/opt/agora/src/"
 done
 cp "${REPO_ROOT}/requirements-api.txt" "${BUILD_DIR}/opt/agora/src/"
 cp "${REPO_ROOT}/requirements-player.txt" "${BUILD_DIR}/opt/agora/src/"
+cp "${REPO_ROOT}/requirements-cms-client.txt" "${BUILD_DIR}/opt/agora/src/"
 
 # ── Default splash ──
 if [[ -f "${REPO_ROOT}/config/boot-splash.png" ]]; then
@@ -50,6 +51,7 @@ fi
 # ── Systemd units ──
 cp "${REPO_ROOT}/systemd/agora-api.service" "${BUILD_DIR}/etc/systemd/system/"
 cp "${REPO_ROOT}/systemd/agora-player.service" "${BUILD_DIR}/etc/systemd/system/"
+cp "${REPO_ROOT}/systemd/agora-cms-client.service" "${BUILD_DIR}/etc/systemd/system/"
 
 # ── Plymouth theme ──
 if [[ -f "${REPO_ROOT}/config/boot-splash.png" ]]; then

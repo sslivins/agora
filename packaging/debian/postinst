@@ -37,10 +37,12 @@ fi
 # ── Install Python packages ──
 pip3 install --break-system-packages -q \
     -r "${AGORA_BASE}/src/requirements-api.txt" \
-    -r "${AGORA_BASE}/src/requirements-player.txt" 2>/dev/null \
+    -r "${AGORA_BASE}/src/requirements-player.txt" \
+    -r "${AGORA_BASE}/src/requirements-cms-client.txt" 2>/dev/null \
 || pip3 install -q \
     -r "${AGORA_BASE}/src/requirements-api.txt" \
-    -r "${AGORA_BASE}/src/requirements-player.txt"
+    -r "${AGORA_BASE}/src/requirements-player.txt" \
+    -r "${AGORA_BASE}/src/requirements-cms-client.txt"
 
 # ── Plymouth theme ──
 if command -v plymouth-set-default-theme &>/dev/null; then
@@ -50,8 +52,9 @@ fi
 
 # ── Enable and restart services ──
 systemctl daemon-reload
-systemctl enable agora-player agora-api
+systemctl enable agora-player agora-api agora-cms-client
 if [ "$1" = "configure" ]; then
     systemctl restart agora-player || true
     systemctl restart agora-api || true
+    systemctl restart agora-cms-client || true
 fi

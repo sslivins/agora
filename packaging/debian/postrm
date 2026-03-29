@@ -11,7 +11,7 @@ if [ "$1" = "purge" ]; then
     rm -rf /opt/agora/tmp
 
     # Disable services
-    systemctl disable agora-player agora-api 2>/dev/null || true
+    systemctl disable agora-player agora-api agora-cms-client 2>/dev/null || true
 fi
 
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
