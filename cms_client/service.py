@@ -290,6 +290,8 @@ class CMSClient:
                         await self._handle_config(msg)
                     elif msg_type == "reboot":
                         await self._handle_reboot(ws)
+                    elif msg_type == "upgrade":
+                        await self._handle_upgrade(ws)
                     elif "error" in msg:
                         error_text = msg["error"]
                         logger.error("CMS error: %s", error_text)
@@ -695,6 +697,14 @@ class CMSClient:
             pass
         await asyncio.sleep(1)
         os.system("sudo reboot")
+
+    async def _handle_upgrade(self, ws) -> None:
+        logger.info("Upgrade requested by CMS")
+        try:
+            await ws.send(json.dumps({"type": "upgrade_ack"}))
+        except Exception:
+            pass
+        os.system("sudo apt-get update -qq && sudo apt-get install -y agora && sudo reboot")
 
     # ── Helpers ──
 
