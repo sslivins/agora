@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=mpv
+User=agora
 ExecStart=/usr/bin/python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1 --timeout-keep-alive 300
 WorkingDirectory=/opt/agora/src
 Environment=PYTHONPATH=/opt/agora/src
