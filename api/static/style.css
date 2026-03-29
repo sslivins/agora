@@ -175,10 +175,18 @@ button.danger { background: var(--danger); }
 .text-danger { color: var(--danger); }
 .text-muted { color: var(--text-muted); }
 
-/* Setup page */
+/* Setup/Settings page */
 .form-hint { display: block; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem; }
 .form-status { margin: 0.75rem 0; font-size: 0.9rem; min-height: 1.2em; }
 .help-steps { padding-left: 1.5rem; color: var(--text-muted); }
 .help-steps li { margin-bottom: 0.5rem; }
 .help-steps strong { color: var(--text); }
 .help-steps em { color: var(--warning); font-style: normal; }
+
+/* Now Playing */
+.now-playing { display: flex; align-items: center; gap: 0.75rem; font-size: 1.1rem; }
+.now-playing-asset { font-weight: 500; }
+
+/* Schedule default */
+.schedule-default { margin-top: 1rem; color: var(--text-muted); font-size: 0.9rem; }
+.schedule-default strong { color: var(--text); }

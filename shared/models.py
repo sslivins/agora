@@ -54,3 +54,4 @@ class StatusResponse(BaseModel):
     current_state: CurrentState
     desired_state: DesiredState
     asset_count: int
+    schedule_hash: str = ""
