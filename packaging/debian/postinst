@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-AGORA_USER="mpv"
+AGORA_USER="agora"
 AGORA_BASE="/opt/agora"
 
 # ── Create user if needed ──
@@ -44,11 +44,43 @@ pip3 install --break-system-packages -q \
     -r "${AGORA_BASE}/src/requirements-player.txt" \
     -r "${AGORA_BASE}/src/requirements-cms-client.txt"
 
-# ── Plymouth theme ──
+# ── Plymouth boot splash ──
 if command -v plymouth-set-default-theme &>/dev/null; then
     plymouth-set-default-theme splash 2>/dev/null || true
-    update-initramfs -u 2>/dev/null || true
 fi
+
+# ── Kernel command line: quiet boot + splash ──
+CMDLINE="/boot/firmware/cmdline.txt"
+if [ -f "${CMDLINE}" ]; then
+    changed=false
+    for flag in quiet splash plymouth.ignore-serial-consoles logo.nologo "vt.global_cursor_default=0"; do
+        if ! grep -q "${flag}" "${CMDLINE}"; then
+            sed -i "s/$/ ${flag}/" "${CMDLINE}"
+            changed=true
+        fi
+    done
+    if $changed; then
+        echo "Agora: patched ${CMDLINE} for quiet boot + splash"
+    fi
+fi
+
+# ── Boot config: HDMI force + overscan ──
+BOOT_CFG="/boot/firmware/config.txt"
+if [ -f "${BOOT_CFG}" ]; then
+    for setting in disable_fw_kms_setup=1 disable_overscan=1 hdmi_force_hotplug=1 hdmi_force_edid_audio=1; do
+        key="${setting%%=*}"
+        if ! grep -q "^${key}=" "${BOOT_CFG}"; then
+            echo "${setting}" >> "${BOOT_CFG}"
+            echo "Agora: added ${setting} to ${BOOT_CFG}"
+        fi
+    done
+fi
+
+# ── Disable console login on HDMI (tty1) ──
+systemctl disable getty@tty1 2>/dev/null || true
+
+# ── Rebuild initramfs with new splash theme ──
+update-initramfs -u 2>/dev/null || true
 
 # ── Enable and restart services ──
 systemctl daemon-reload
