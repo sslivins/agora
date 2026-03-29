@@ -271,6 +271,8 @@ class CMSClient:
                         await self._handle_delete_asset(msg, ws)
                     elif msg_type == "config":
                         await self._handle_config(msg)
+                    elif msg_type == "reboot":
+                        await self._handle_reboot(ws)
                     elif "error" in msg:
                         logger.error("CMS error: %s", msg["error"])
                         return
@@ -651,6 +653,15 @@ class CMSClient:
             cfg["api_key"] = new_key
             atomic_write(boot_config, json.dumps(cfg, indent=2))
             logger.info("API key updated")
+
+    async def _handle_reboot(self, ws) -> None:
+        logger.info("Reboot requested by CMS")
+        try:
+            await ws.send(json.dumps({"type": "reboot_ack"}))
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+        os.system("sudo reboot")
 
     # ── Helpers ──
 

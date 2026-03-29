@@ -33,7 +33,9 @@ class AgoraPlayer:
 
     IMAGE_PIPELINE = (
         'filesrc location="{path}" ! '
-        "decodebin ! videoconvert ! imagefreeze ! kmssink sync=false"
+        "decodebin ! videoconvert ! videoscale add-borders=true ! "
+        "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1 ! "
+        "imagefreeze ! kmssink sync=false"
     )
 
     DEFAULT_SPLASH_CONFIG = "splash/default.png"
