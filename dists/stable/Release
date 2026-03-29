@@ -1,13 +1,24 @@
-Origin: Agora
+Origin: sslivins
 Label: Agora
 Suite: stable
 Codename: stable
 Architectures: arm64
 Components: main
 Description: Agora media playback system for Raspberry Pi
+Date: Sun, 29 Mar 2026 20:56:35 +0000
 MD5Sum:
- 136fd7e01fbb0fd35444d9a63895133e              804 main/binary-arm64/Packages
- 1ee6ce499d7a8e48e802fc9730161f6a              519 main/binary-arm64/Packages.gz
+ 9dfe8286b49de6d63fbef86833e076c3              195 Release
+ 8487bc1ee46f637265babeb0eeec3d30              805 main/binary-arm64/Packages
+ 347eb6dc6d8236c6a64c458e3c2ea153              520 main/binary-arm64/Packages.gz
+SHA1:
+ 4ff5576a60ed1eedaa85fda5ce695864d6be4192              195 Release
+ 2c7e4ef414361e8b71f168b24a66e296c872334d              805 main/binary-arm64/Packages
+ 2d1f1289d9f695e4f00084cbb29bee10d8207e05              520 main/binary-arm64/Packages.gz
 SHA256:
- 78f3b9af0e289a5bf04e63b84d5427eafd49429e6a69f909e557f9cd2f0b0408              804 main/binary-arm64/Packages
- e199b513502f87dcb9593ab53ed97180c6a97b7c4fc4d5ed3de4afb9a4edae42              519 main/binary-arm64/Packages.gz
+ e0f14bb495635f77fa87143bc118c90b479f311e95240d241735f762164f96bc              195 Release
+ 08698c86fc9ceaa7ab7eba411a42bdbc855344bdccffe9fff443e55ca91a6b6c              805 main/binary-arm64/Packages
+ 207336369c0a4d0e9e0136b41324ffbfc04bc7659976f091c8c86e2a2ef5b834              520 main/binary-arm64/Packages.gz
+SHA512:
+ 3bc739e205470807fb9e7b859f6374ce2d792b57f8be627a4e82b5faf81863a2b28ba86a88b93d3679d51af9757bca5f246092e6e99513b57078cbab002a2cb5              195 Release
+ 2ef83f7d1a97ac85a49b1d0e36cc4b9c86157c5cf0db9f46c2a38144c314335a137d060360a459063fa896f43ea12a155a1f48cddd64e464d303526d2807e79c              805 main/binary-arm64/Packages
+ 116ecd0994455c4c48d37a70647719d8f001f02e35b65e2c39d86651c1ae59eacf3545fc662d9790c5f9cc967ae7aa6b13f1d076e5e93444221e937de91d2b7c              520 main/binary-arm64/Packages.gz
