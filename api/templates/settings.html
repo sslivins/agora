@@ -45,9 +45,12 @@
     <div class="stats-grid cms-status-bar" id="cms-status">
         <div class="stat">
             <div class="stat-label">Connection</div>
-            <div class="stat-value {% if service_active %}text-success{% elif configured %}text-warning{% else %}text-muted{% endif %}">
-                {% if service_active %}Connected{% elif configured %}Configured{% else %}Not configured{% endif %}
+            <div class="stat-value {% if service_error %}text-danger{% elif service_active %}text-success{% elif configured %}text-warning{% else %}text-muted{% endif %}">
+                {% if service_error %}Error{% elif service_active %}Connected{% elif configured %}Configured{% else %}Not configured{% endif %}
             </div>
+            {% if service_error %}
+            <div class="stat-detail text-danger">{{ service_error }}</div>
+            {% endif %}
         </div>
         <div class="stat">
             <div class="stat-label">Registered</div>

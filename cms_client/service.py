@@ -274,8 +274,17 @@ class CMSClient:
                     elif msg_type == "reboot":
                         await self._handle_reboot(ws)
                     elif "error" in msg:
-                        logger.error("CMS error: %s", msg["error"])
-                        return
+                        error_text = msg["error"]
+                        logger.error("CMS error: %s", error_text)
+                        if "credentials" in error_text.lower():
+                            logger.warning(
+                                "Auth rejected — clearing stored token. "
+                                "If this device was re-flashed, use 'Reset Auth' "
+                                "on the CMS Devices page for device %s",
+                                self.device_id,
+                            )
+                            _save_auth_token(self.settings.auth_token_path, "")
+                        raise ConnectionError(f"CMS error: {error_text}")
                     else:
                         logger.warning("Unknown CMS message type: %s", msg_type)
             finally:

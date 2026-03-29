@@ -169,6 +169,7 @@ async def settings_page(
         pass
 
     service_active = False
+    service_error = ""
     try:
         result = subprocess.run(
             ["systemctl", "is-active", "agora-cms-client"],
@@ -177,6 +178,24 @@ async def settings_page(
         service_active = result.stdout.strip() == "active"
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
+
+    # Check recent CMS client logs for connection errors
+    if service_active:
+        try:
+            result = subprocess.run(
+                ["journalctl", "-u", "agora-cms-client", "--no-pager",
+                 "-n", "20", "--output=cat", "--since=-60s"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in reversed(result.stdout.strip().splitlines()):
+                if "CMS error:" in line:
+                    service_error = line.split("CMS error:", 1)[1].strip()
+                    break
+                if "reconnecting in" in line:
+                    service_error = "Reconnecting..."
+                    break
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
 
     has_auth_token = settings.auth_token_path.exists()
     configured = bool(cms_host)
@@ -209,6 +228,7 @@ async def settings_page(
             "cms_port": cms_port,
             "configured": configured,
             "service_active": service_active,
+            "service_error": service_error,
             "has_auth_token": has_auth_token,
             "device_name": settings.device_name,
             "device_type": device_type,
