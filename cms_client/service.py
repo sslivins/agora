@@ -404,7 +404,8 @@ class CMSClient:
                 logger.exception("Error in fetch loop")
 
     async def _check_and_fetch_missing(self) -> None:
-        """Scan schedule for upcoming assets not on disk and request them."""
+        """Scan schedule for upcoming assets not on disk and request them.
+        Also re-fetches assets whose local checksum doesn't match CMS."""
         try:
             data = json.loads(self.settings.schedule_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
@@ -412,6 +413,7 @@ class CMSClient:
 
         schedules = data.get("schedules", [])
         default_asset = data.get("default_asset")
+        default_asset_checksum = data.get("default_asset_checksum")
         tz_name = data.get("timezone", "UTC")
 
         try:
@@ -421,31 +423,35 @@ class CMSClient:
         except Exception:
             local_now = datetime.utcnow()
 
-        # Collect assets needed: active first, then upcoming
-        needed: list[str] = []
+        # Collect assets needed: (name, expected_checksum) — active first, then upcoming
+        needed: list[tuple[str, str | None]] = []
+        seen: set[str] = set()
         for entry in schedules:
             asset = entry.get("asset")
-            if not asset:
+            if not asset or asset in seen:
                 continue
+            checksum = entry.get("asset_checksum")
             if _schedule_matches_now(entry, local_now):
-                if asset not in needed:
-                    needed.insert(0, asset)
+                needed.insert(0, (asset, checksum))
             elif _schedule_starts_within_hours(entry, local_now, FETCH_LOOKAHEAD_HOURS):
-                if asset not in needed:
-                    needed.append(asset)
+                needed.append((asset, checksum))
+            seen.add(asset)
 
-        if default_asset and default_asset not in needed:
-            needed.append(default_asset)
+        if default_asset and default_asset not in seen:
+            needed.append((default_asset, default_asset_checksum))
 
         ws = self._ws
         if not ws:
             return
 
-        for asset_name in needed:
-            if self.asset_manager.has_asset(asset_name):
+        for asset_name, expected_checksum in needed:
+            if self.asset_manager.has_asset(asset_name, expected_checksum):
                 continue
 
-            logger.info("Requesting missing asset: %s", asset_name)
+            if expected_checksum:
+                logger.info("Requesting asset: %s (checksum mismatch or missing)", asset_name)
+            else:
+                logger.info("Requesting missing asset: %s", asset_name)
             try:
                 request_msg = {
                     "type": "fetch_request",
@@ -571,8 +577,8 @@ class CMSClient:
             self.asset_manager.register(asset_name, rel_path, file_size, actual_checksum)
 
             # Re-trigger desired state if player is waiting for this asset
-            desired = read_state(self.settings.desired_state_path)
-            if desired and desired.get("asset") == asset_name:
+            desired = read_state(self.settings.desired_state_path, DesiredState)
+            if desired.asset == asset_name:
                 logger.info("Re-applying desired state for just-downloaded asset: %s", asset_name)
                 write_state(self.settings.desired_state_path, desired)
 

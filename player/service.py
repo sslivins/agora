@@ -31,7 +31,14 @@ class AgoraPlayer:
         'alsasink device="hdmi:CARD=vc4hdmi,DEV=0"'
     )
 
-    IMAGE_PIPELINE = (
+    IMAGE_PIPELINE_JPEG = (
+        'filesrc location="{path}" ! '
+        "jpegparse ! jpegdec ! videoconvert ! videoscale add-borders=true ! "
+        "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1 ! "
+        "imagefreeze ! kmssink sync=false"
+    )
+
+    IMAGE_PIPELINE_OTHER = (
         'filesrc location="{path}" ! '
         "decodebin ! videoconvert ! videoscale add-borders=true ! "
         "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1 ! "
@@ -101,8 +108,10 @@ class AgoraPlayer:
     def _build_pipeline(self, path: Path, is_video: bool) -> Gst.Pipeline:
         if is_video:
             pipeline_str = self.VIDEO_PIPELINE.format(path=path)
+        elif path.suffix.lower() in (".jpg", ".jpeg"):
+            pipeline_str = self.IMAGE_PIPELINE_JPEG.format(path=path)
         else:
-            pipeline_str = self.IMAGE_PIPELINE.format(path=path)
+            pipeline_str = self.IMAGE_PIPELINE_OTHER.format(path=path)
 
         logger.info("Building pipeline: %s", pipeline_str)
         pipeline = Gst.parse_launch(pipeline_str)

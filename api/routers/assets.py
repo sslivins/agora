@@ -1,7 +1,7 @@
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import List
 
@@ -71,9 +71,7 @@ def _list_assets(settings: Settings) -> List[AssetInfo]:
                     AssetInfo(
                         name=f.name,
                         size=stat.st_size,
-                        modified_at=datetime.fromtimestamp(
-                            stat.st_mtime, tz=timezone.utc
-                        ),
+                        modified_at=datetime.fromtimestamp(stat.st_mtime),
                         asset_type=effective_type,
                     )
                 )
@@ -125,7 +123,7 @@ async def upload_asset(
         return AssetInfo(
             name=name,
             size=stat.st_size,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+            modified_at=datetime.fromtimestamp(stat.st_mtime),
             asset_type=atype,
         )
     finally:
