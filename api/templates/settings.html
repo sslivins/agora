@@ -21,8 +21,28 @@
 </section>
 
 <section class="card">
-    <h2>Status</h2>
-    <div class="stats-grid" id="cms-status">
+    <h2>CMS Connection</h2>
+
+    <form id="cms-config-form" onsubmit="return saveCmsConfig(this)">
+        <div class="form-row">
+            <div class="form-group form-group-grow">
+                <label for="cms-host">Server Address</label>
+                <input type="text" id="cms-host" name="cms_host"
+                       placeholder="192.168.1.100"
+                       value="{{ cms_host }}">
+            </div>
+            <div class="form-group form-group-port">
+                <label for="cms-port">Port</label>
+                <input type="number" id="cms-port" name="cms_port"
+                       placeholder="8080" value="{{ cms_port }}" min="1" max="65535">
+            </div>
+        </div>
+        <div id="config-status" class="form-status"></div>
+        <button type="submit" class="btn btn-primary" id="cms-connect-btn"
+                {% if service_active %}disabled{% endif %}>Connect</button>
+    </form>
+
+    <div class="stats-grid cms-status-bar" id="cms-status">
         <div class="stat">
             <div class="stat-label">Connection</div>
             <div class="stat-value {% if service_active %}text-success{% elif configured %}text-warning{% else %}text-muted{% endif %}">
@@ -42,40 +62,33 @@
             </div>
         </div>
     </div>
-</section>
 
-<section class="card">
-    <h2>Configuration</h2>
-    <form id="cms-config-form" onsubmit="return saveCmsConfig(this)">
-        <div class="form-group">
-            <label for="cms-host">CMS Server Address</label>
-            <input type="text" id="cms-host" name="cms_host"
-                   placeholder="192.168.1.100"
-                   value="{{ cms_host }}">
-            <small class="form-hint">IP address or hostname of your Agora CMS server</small>
-        </div>
-        <div class="form-group">
-            <label for="cms-port">Port (optional)</label>
-            <input type="number" id="cms-port" name="cms_port"
-                   placeholder="8080" value="{{ cms_port }}" min="1" max="65535">
-            <small class="form-hint">Default: 8080</small>
-        </div>
-        <div id="config-status" class="form-status"></div>
-        <button type="submit" class="btn btn-primary">Connect</button>
-    </form>
-</section>
-
-<section class="card">
-    <h2>How It Works</h2>
+    <h3 class="help-heading">How It Works</h3>
     <ol class="help-steps">
         <li>Enter your <strong>CMS server address</strong> above and click Connect.</li>
-        <li>This device will connect and appear as <em>Pending</em> in the CMS dashboard.</li>
-        <li><strong>Approve the device</strong> in the CMS — it will receive a secure auth token automatically.</li>
-        <li>On future connections, the device authenticates automatically.</li>
+        <li>This device will connect and appear as <em>Pending</em> in the
+            {% if cms_host %}<a href="http://{{ cms_host }}:{{ cms_port or 8080 }}/" class="cms-link">CMS dashboard</a>{% else %}CMS dashboard{% endif %}.</li>
+        <li><strong>Approve the device</strong> in the CMS to start receiving schedules and content.</li>
     </ol>
 </section>
 
 <script>
+const origHost = document.getElementById("cms-host").value;
+const origPort = document.getElementById("cms-port").value;
+const connectBtn = document.getElementById("cms-connect-btn");
+
+function checkChanged() {
+    const hostChanged = document.getElementById("cms-host").value.trim() !== origHost;
+    const portChanged = document.getElementById("cms-port").value.trim() !== origPort;
+    connectBtn.disabled = !(hostChanged || portChanged) && connectBtn.hasAttribute("data-was-disabled");
+}
+
+if (connectBtn.disabled) {
+    connectBtn.setAttribute("data-was-disabled", "1");
+    document.getElementById("cms-host").addEventListener("input", checkChanged);
+    document.getElementById("cms-port").addEventListener("input", checkChanged);
+}
+
 async function saveCmsConfig(form) {
     const statusEl = document.getElementById("config-status");
     const cmsHost = document.getElementById("cms-host").value.trim();

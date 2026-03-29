@@ -128,6 +128,8 @@ button {
     transition: background 0.2s;
 }
 button:hover { background: var(--accent); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:disabled:hover { background: var(--primary); }
 button.primary { background: var(--accent); }
 button.primary:hover { opacity: 0.85; }
 button.danger { background: var(--danger); }
@@ -178,10 +180,17 @@ button.danger { background: var(--danger); }
 /* Setup/Settings page */
 .form-hint { display: block; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem; }
 .form-status { margin: 0.75rem 0; font-size: 0.9rem; min-height: 1.2em; }
+.form-row { display: flex; gap: 0.75rem; align-items: flex-end; max-width: 400px; }
+.form-group-grow { flex: 1; }
+.form-group-port { width: 90px; flex-shrink: 0; }
+.cms-status-bar { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--primary); }
+.help-heading { font-size: 0.95rem; color: var(--text-muted); margin: 1.25rem 0 0.75rem; padding-top: 1rem; border-top: 1px solid var(--primary); }
 .help-steps { padding-left: 1.5rem; color: var(--text-muted); }
 .help-steps li { margin-bottom: 0.5rem; }
 .help-steps strong { color: var(--text); }
 .help-steps em { color: var(--warning); font-style: normal; }
+.cms-link { color: var(--accent); text-decoration: none; }
+.cms-link:hover { text-decoration: underline; }
 
 /* Now Playing */
 .now-playing { display: flex; align-items: center; gap: 0.75rem; font-size: 1.1rem; }
