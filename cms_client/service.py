@@ -704,7 +704,14 @@ class CMSClient:
             await ws.send(json.dumps({"type": "upgrade_ack"}))
         except Exception:
             pass
-        os.system("sudo apt-get update -qq && sudo apt-get install -y agora && sudo reboot")
+        # Fix any broken dpkg state from a previous interrupted install,
+        # then update and install. Always reboot at the end so the device
+        # comes back online in a known state.
+        os.system(
+            "sudo dpkg --configure -a; "
+            "sudo apt-get update -qq && sudo apt-get install -y agora; "
+            "sudo reboot"
+        )
 
     # ── Helpers ──
 
