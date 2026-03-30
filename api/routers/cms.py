@@ -58,7 +58,11 @@ async def get_cms_config(settings: Settings = Depends(get_settings)):
         pass
 
     # Check if we have an auth token (meaning we've registered)
-    has_auth_token = settings.auth_token_path.exists()
+    has_auth_token = False
+    try:
+        has_auth_token = bool(settings.auth_token_path.read_text().strip())
+    except (FileNotFoundError, OSError):
+        pass
 
     # Read CMS connection status written by the CMS client
     cms_status = _read_cms_status(settings)
@@ -90,7 +94,11 @@ async def get_cms_status(settings: Settings = Depends(get_settings)):
         pass
 
     cms_status = _read_cms_status(settings)
-    has_auth_token = settings.auth_token_path.exists()
+    has_auth_token = False
+    try:
+        has_auth_token = bool(settings.auth_token_path.read_text().strip())
+    except (FileNotFoundError, OSError):
+        pass
 
     return {
         "service_active": service_active,

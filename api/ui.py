@@ -185,7 +185,11 @@ async def settings_page(
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
-    has_auth_token = settings.auth_token_path.exists()
+    has_auth_token = False
+    try:
+        has_auth_token = bool(settings.auth_token_path.read_text().strip())
+    except (FileNotFoundError, OSError):
+        pass
     configured = bool(cms_host)
 
     # Device info

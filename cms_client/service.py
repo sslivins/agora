@@ -199,12 +199,24 @@ class CMSClient:
             pass
         return self.settings.cms_url
 
-    def _write_cms_status(self, state: str, error: str = "", message: str = "") -> None:
-        """Write CMS connection status to a JSON file for the settings UI."""
+    def _write_cms_status(
+        self,
+        state: str,
+        error: str = "",
+        message: str = "",
+        registration: str = "",
+    ) -> None:
+        """Write CMS connection status to a JSON file for the settings UI.
+
+        ``state`` is one of: connected, connecting, disconnected, error.
+        ``registration`` is one of: pending, registered, rejected, or "" (unknown).
+        ``message`` is a user-facing coaching message (e.g. how to fix an error).
+        """
         status = {
             "state": state,
             "error": error,
             "message": message,
+            "registration": registration,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -239,7 +251,11 @@ class CMSClient:
                     attempt += 1
                     delay = min(RECONNECT_BASE * (2 ** (attempt - 1)), RECONNECT_MAX)
                     logger.warning("CMS connection lost (%s), reconnecting in %ds...", e, delay)
-                    self._write_cms_status("reconnecting", error=str(e))
+                    self._write_cms_status(
+                        "disconnected",
+                        error=str(e),
+                        message=f"Connection lost. Retrying in {delay}s\u2026",
+                    )
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     logger.info("CMS client shutting down")
@@ -248,7 +264,11 @@ class CMSClient:
                     attempt += 1
                     delay = min(RECONNECT_BASE * (2 ** (attempt - 1)), RECONNECT_MAX)
                     logger.exception("Unexpected CMS client error, reconnecting in %ds...", delay)
-                    self._write_cms_status("reconnecting", error="Unexpected error")
+                    self._write_cms_status(
+                        "disconnected",
+                        error="Unexpected error",
+                        message=f"An unexpected error occurred. Retrying in {delay}s\u2026",
+                    )
                     await asyncio.sleep(delay)
         finally:
             for task in [eval_task, fetch_task]:
@@ -276,9 +296,10 @@ class CMSClient:
         ) as ws:
             self._ws = ws
             logger.info("WebSocket connected")
-            self._write_cms_status("connected")
 
             auth_token = _read_auth_token(self.settings.auth_token_path)
+            reg = "registered" if auth_token else "pending"
+            self._write_cms_status("connected", registration=reg)
             cap_mb, used_mb = _get_storage_mb(self.settings.assets_dir)
 
             register_msg = {
@@ -332,17 +353,22 @@ class CMSClient:
                             )
                             _save_auth_token(self.settings.auth_token_path, "")
                             self._write_cms_status(
-                                "auth_error",
-                                error="Authentication rejected by CMS",
+                                "error",
+                                error="Authentication rejected",
+                                registration="rejected",
                                 message=(
-                                    "This device's credentials were rejected. "
-                                    "Open the CMS Devices page, find this device, "
-                                    "and click 'Reset Auth'. The device will "
-                                    "reconnect automatically."
+                                    "This device's credentials were rejected by the CMS. "
+                                    "Go to the CMS Devices page, find this device, "
+                                    "and click \u201cAdopt\u201d to re-register it. "
+                                    "The device will reconnect automatically."
                                 ),
                             )
                         else:
-                            self._write_cms_status("error", error=error_text)
+                            self._write_cms_status(
+                                "error",
+                                error=error_text,
+                                message=f"The CMS returned an error: {error_text}",
+                            )
                         raise ConnectionError(f"CMS error: {error_text}")
                     else:
                         logger.warning("Unknown CMS message type: %s", msg_type)
@@ -386,6 +412,7 @@ class CMSClient:
         if token:
             _save_auth_token(self.settings.auth_token_path, token)
             logger.info("Device auth token received and saved")
+            self._write_cms_status("connected", registration="registered")
 
     # ── Sync handling ──
 

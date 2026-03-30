@@ -185,8 +185,9 @@ button.danger { background: var(--danger); }
 .form-group-grow { flex: 1; }
 .form-group-port { width: 90px; flex-shrink: 0; }
 .cms-status-bar { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--primary); }
-.cms-alert { margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.9rem; line-height: 1.4; }
-.cms-alert-danger { background: rgba(239,68,68,0.15); border: 1px solid var(--danger); color: var(--danger); }
+.cms-message { margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.9rem; line-height: 1.5; }
+.cms-message-error { background: rgba(239,68,68,0.12); border: 1px solid var(--danger); color: var(--danger); }
+.cms-message-warn { background: rgba(234,179,8,0.12); border: 1px solid var(--warning); color: var(--warning); }
 .help-heading { font-size: 0.95rem; color: var(--text-muted); margin: 1.25rem 0 0.75rem; padding-top: 1rem; border-top: 1px solid var(--primary); }
 .help-steps { padding-left: 1.5rem; color: var(--text-muted); }
 .help-steps li { margin-bottom: 0.5rem; }
