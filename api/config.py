@@ -54,8 +54,12 @@ class Settings(BaseSettings):
         return self.agora_base / "state"
 
     @property
+    def persist_dir(self) -> Path:
+        return self.agora_base / "persist"
+
+    @property
     def splash_config_path(self) -> Path:
-        return self.state_dir / "splash"
+        return self.persist_dir / "splash"
 
     @property
     def log_dir(self) -> Path:
@@ -71,11 +75,11 @@ class Settings(BaseSettings):
 
     @property
     def auth_token_path(self) -> Path:
-        return self.state_dir / "cms_auth_token"
+        return self.persist_dir / "cms_auth_token"
 
     @property
     def cms_config_path(self) -> Path:
-        return self.state_dir / "cms_config.json"
+        return self.persist_dir / "cms_config.json"
 
     @property
     def cms_status_path(self) -> Path:
@@ -95,6 +99,7 @@ class Settings(BaseSettings):
             self.images_dir,
             self.splash_dir,
             self.state_dir,
+            self.persist_dir,
             self.log_dir,
         ]:
             d.mkdir(parents=True, exist_ok=True)

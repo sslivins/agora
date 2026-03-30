@@ -47,7 +47,7 @@ async def require_auth(
     if api_key:
         # Check CMS-pushed key override first, fall back to boot config
         effective_key = settings.api_key
-        override_path = settings.state_dir / "api_key"
+        override_path = settings.persist_dir / "api_key"
         try:
             override = override_path.read_text().strip()
             if override:

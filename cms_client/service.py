@@ -702,7 +702,7 @@ class CMSClient:
 
         if "api_key" in msg and msg["api_key"]:
             new_key = msg["api_key"]
-            override_path = self.settings.state_dir / "api_key"
+            override_path = self.settings.persist_dir / "api_key"
             atomic_write(override_path, new_key)
             try:
                 os.chmod(override_path, 0o644)

@@ -9,6 +9,31 @@ if ! id "${AGORA_USER}" &>/dev/null; then
     useradd -r -m -s /bin/bash "${AGORA_USER}"
 fi
 
+# ── Create persist directory (flash-backed, survives reboots) ──
+mkdir -p "${AGORA_BASE}/persist"
+chown "${AGORA_USER}:${AGORA_USER}" "${AGORA_BASE}/persist"
+
+# ── Migrate persistent files from old state dir if needed ──
+for file in cms_auth_token cms_config.json splash api_key; do
+    src="${AGORA_BASE}/state/${file}"
+    dst="${AGORA_BASE}/persist/${file}"
+    if [ -f "${src}" ] && [ ! -f "${dst}" ]; then
+        cp -p "${src}" "${dst}"
+        echo "Agora: migrated ${file} from state/ to persist/"
+    fi
+done
+
+# ── Mount state directory as tmpfs (RAM-backed, prevents flash wear) ──
+FSTAB_LINE="tmpfs ${AGORA_BASE}/state tmpfs nodev,nosuid,noexec,size=10m,uid=${AGORA_USER},gid=${AGORA_USER},mode=0755 0 0"
+if ! grep -q "${AGORA_BASE}/state" /etc/fstab 2>/dev/null; then
+    echo "${FSTAB_LINE}" >> /etc/fstab
+    echo "Agora: added tmpfs mount for ${AGORA_BASE}/state"
+fi
+mkdir -p "${AGORA_BASE}/state"
+if ! mountpoint -q "${AGORA_BASE}/state"; then
+    mount "${AGORA_BASE}/state"
+fi
+
 # ── Ensure directory ownership ──
 chown -R "${AGORA_USER}:${AGORA_USER}" "${AGORA_BASE}/assets"
 chown -R "${AGORA_USER}:${AGORA_USER}" "${AGORA_BASE}/state"

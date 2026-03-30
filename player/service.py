@@ -50,10 +50,11 @@ class AgoraPlayer:
     def __init__(self, base_path: str = "/opt/agora"):
         self.base = Path(base_path)
         self.state_dir = self.base / "state"
+        self.persist_dir = self.base / "persist"
         self.assets_dir = self.base / "assets"
         self.desired_path = self.state_dir / "desired.json"
         self.current_path = self.state_dir / "current.json"
-        self.splash_config_path = self.state_dir / "splash"
+        self.splash_config_path = self.persist_dir / "splash"
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self.loop = GLib.MainLoop()

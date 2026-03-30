@@ -21,6 +21,7 @@ class TestSettings:
         assert s.images_dir == tmp_path / "assets" / "images"
         assert s.splash_dir == tmp_path / "assets" / "splash"
         assert s.state_dir == tmp_path / "state"
+        assert s.persist_dir == tmp_path / "persist"
         assert s.log_dir == tmp_path / "logs"
         assert s.desired_state_path == tmp_path / "state" / "desired.json"
         assert s.current_state_path == tmp_path / "state" / "current.json"
@@ -32,7 +33,21 @@ class TestSettings:
         assert s.images_dir.exists()
         assert s.splash_dir.exists()
         assert s.state_dir.exists()
+        assert s.persist_dir.exists()
         assert s.log_dir.exists()
+
+    def test_persistent_paths_on_persist_dir(self, tmp_path):
+        """Auth token, CMS config, splash config, and API key must be on
+        persist_dir (flash) — not on state_dir (tmpfs)."""
+        s = Settings(agora_base=tmp_path)
+        assert s.auth_token_path == tmp_path / "persist" / "cms_auth_token"
+        assert s.cms_config_path == tmp_path / "persist" / "cms_config.json"
+        assert s.splash_config_path == tmp_path / "persist" / "splash"
+        # Ephemeral files stay in state_dir
+        assert s.desired_state_path.parent == s.state_dir
+        assert s.current_state_path.parent == s.state_dir
+        assert s.schedule_path.parent == s.state_dir
+        assert s.manifest_path.parent == s.state_dir
 
     def test_env_override(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AGORA_DEVICE_NAME", "my-pi")
