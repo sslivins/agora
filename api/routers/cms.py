@@ -29,6 +29,14 @@ def _write_cms_config(settings: Settings, config: dict) -> None:
     atomic_write(settings.cms_config_path, json.dumps(config, indent=2))
 
 
+def _read_cms_status(settings: Settings) -> dict:
+    """Read CMS connection status written by the CMS client."""
+    try:
+        return json.loads(settings.cms_status_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def _build_ws_url(host: str, port: int) -> str:
     """Build a WebSocket URL from host and port."""
     return f"ws://{host}:{port}{CMS_WS_PATH}"
@@ -52,6 +60,9 @@ async def get_cms_config(settings: Settings = Depends(get_settings)):
     # Check if we have an auth token (meaning we've registered)
     has_auth_token = settings.auth_token_path.exists()
 
+    # Read CMS connection status written by the CMS client
+    cms_status = _read_cms_status(settings)
+
     cms_host = config.get("cms_host", "")
     cms_port = config.get("cms_port", DEFAULT_CMS_PORT)
 
@@ -61,6 +72,30 @@ async def get_cms_config(settings: Settings = Depends(get_settings)):
         "has_auth_token": has_auth_token,
         "service_active": service_active,
         "configured": bool(cms_host),
+        "cms_status": cms_status,
+    }
+
+
+@router.get("/status")
+async def get_cms_status(settings: Settings = Depends(get_settings)):
+    """Return CMS connection status for live polling."""
+    service_active = False
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "agora-cms-client"],
+            capture_output=True, text=True, timeout=5,
+        )
+        service_active = result.stdout.strip() == "active"
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    cms_status = _read_cms_status(settings)
+    has_auth_token = settings.auth_token_path.exists()
+
+    return {
+        "service_active": service_active,
+        "has_auth_token": has_auth_token,
+        "cms_status": cms_status,
     }
 
 

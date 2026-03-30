@@ -188,6 +188,19 @@ class CMSClient:
             pass
         return self.settings.cms_url
 
+    def _write_cms_status(self, state: str, error: str = "", message: str = "") -> None:
+        """Write CMS connection status to a JSON file for the settings UI."""
+        status = {
+            "state": state,
+            "error": error,
+            "message": message,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            atomic_write(self.settings.cms_status_path, json.dumps(status, indent=2))
+        except Exception:
+            logger.debug("Failed to write CMS status file", exc_info=True)
+
     async def run(self) -> None:
         """Main loop — connect, communicate, reconnect on failure."""
         cms_url = self._get_cms_url()
@@ -215,6 +228,7 @@ class CMSClient:
                     attempt += 1
                     delay = min(RECONNECT_BASE * (2 ** (attempt - 1)), RECONNECT_MAX)
                     logger.warning("CMS connection lost (%s), reconnecting in %ds...", e, delay)
+                    self._write_cms_status("reconnecting", error=str(e))
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     logger.info("CMS client shutting down")
@@ -223,6 +237,7 @@ class CMSClient:
                     attempt += 1
                     delay = min(RECONNECT_BASE * (2 ** (attempt - 1)), RECONNECT_MAX)
                     logger.exception("Unexpected CMS client error, reconnecting in %ds...", delay)
+                    self._write_cms_status("reconnecting", error="Unexpected error")
                     await asyncio.sleep(delay)
         finally:
             for task in [eval_task, fetch_task]:
@@ -250,6 +265,7 @@ class CMSClient:
         ) as ws:
             self._ws = ws
             logger.info("WebSocket connected")
+            self._write_cms_status("connected")
 
             auth_token = _read_auth_token(self.settings.auth_token_path)
             cap_mb, used_mb = _get_storage_mb(self.settings.assets_dir)
@@ -303,6 +319,18 @@ class CMSClient:
                                 self.device_id,
                             )
                             _save_auth_token(self.settings.auth_token_path, "")
+                            self._write_cms_status(
+                                "auth_error",
+                                error="Authentication rejected by CMS",
+                                message=(
+                                    "This device's credentials were rejected. "
+                                    "Open the CMS Devices page, find this device, "
+                                    "and click 'Reset Auth'. The device will "
+                                    "reconnect automatically."
+                                ),
+                            )
+                        else:
+                            self._write_cms_status("error", error=error_text)
                         raise ConnectionError(f"CMS error: {error_text}")
                     else:
                         logger.warning("Unknown CMS message type: %s", msg_type)
