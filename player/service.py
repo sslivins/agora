@@ -206,6 +206,20 @@ class AgoraPlayer:
         ):
             return
 
+        # Skip pipeline rebuild if the same content is already playing.
+        # A new timestamp alone (e.g. from a CMS re-sync) should not
+        # cause a teardown/rebuild — that creates a visible screen flicker.
+        if (
+            self.current_desired
+            and self.pipeline
+            and desired.mode == self.current_desired.mode
+            and desired.asset == self.current_desired.asset
+            and desired.loop == self.current_desired.loop
+        ):
+            logger.debug("Same content already playing, skipping rebuild")
+            self.current_desired = desired
+            return
+
         logger.info("Applying desired state: %s", desired.model_dump_json())
         self.current_desired = desired
 

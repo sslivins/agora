@@ -386,8 +386,6 @@ class CMSClient:
         except Exception:
             logger.exception("Failed to cache schedule.json")
 
-        # Reset eval state so next evaluation applies immediately
-        self._last_eval_state = None
         self._evaluate_schedule(msg)
 
     def _evaluate_schedule(self, sync_data: dict) -> None:
@@ -413,7 +411,8 @@ class CMSClient:
 
         if winner:
             asset = winner.get("asset", "")
-            state_key = ("play", asset)
+            checksum = winner.get("asset_checksum")
+            state_key = ("play", asset, checksum)
             if self._last_eval_state == state_key:
                 return
             desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=True)
@@ -422,7 +421,8 @@ class CMSClient:
             self._last_eval_state = state_key
             logger.info("Schedule: playing %s (priority %d)", asset, winner.get("priority", 0))
         elif default_asset:
-            state_key = ("default", default_asset)
+            default_checksum = sync_data.get("default_asset_checksum")
+            state_key = ("default", default_asset, default_checksum)
             if self._last_eval_state == state_key:
                 return
             desired = DesiredState(mode=PlaybackMode.PLAY, asset=default_asset, loop=True)
