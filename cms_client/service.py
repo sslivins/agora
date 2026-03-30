@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -84,6 +85,16 @@ def _get_device_type() -> str:
     try:
         return Path("/proc/device-tree/model").read_text().strip().rstrip("\x00")
     except (FileNotFoundError, OSError):
+        return ""
+
+
+def _get_local_ip() -> str:
+    """Return the device's LAN IP address by connecting to a remote endpoint."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
         return ""
 
 
@@ -277,6 +288,7 @@ class CMSClient:
                 "auth_token": auth_token,
                 "firmware_version": self._get_version(),
                 "device_type": _get_device_type(),
+                "ip_address": _get_local_ip(),
                 "storage_capacity_mb": cap_mb,
                 "storage_used_mb": used_mb,
             }
