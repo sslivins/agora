@@ -36,6 +36,11 @@ STATUS_INTERVAL = 30    # seconds between heartbeat status messages
 EVAL_INTERVAL = 15      # seconds between local schedule evaluations
 FETCH_INTERVAL = 60     # seconds between proactive fetch checks
 FETCH_LOOKAHEAD_HOURS = 24  # how far ahead to look for missing assets
+AUTH_REJECTED_RETRY = 300   # seconds to wait before retrying after auth rejection
+
+
+class AuthRejectedError(Exception):
+    """Raised when the CMS rejects this device's credentials."""
 
 
 def _get_device_id() -> str:
@@ -242,6 +247,14 @@ class CMSClient:
                 try:
                     await self._connect_and_run()
                     attempt = 0
+                except AuthRejectedError:
+                    logger.warning(
+                        "Auth rejected by CMS — waiting %ds before retrying. "
+                        "Adopt the device in the CMS to resume.",
+                        AUTH_REJECTED_RETRY,
+                    )
+                    # Don't overwrite the rejection status — keep the coaching message visible
+                    await asyncio.sleep(AUTH_REJECTED_RETRY)
                 except (
                     websockets.ConnectionClosed,
                     websockets.InvalidURI,
@@ -369,7 +382,8 @@ class CMSClient:
                                 error=error_text,
                                 message=f"The CMS returned an error: {error_text}",
                             )
-                        raise ConnectionError(f"CMS error: {error_text}")
+                            raise ConnectionError(f"CMS error: {error_text}")
+                        raise AuthRejectedError(f"CMS rejected credentials for {self.device_id}")
                     else:
                         logger.warning("Unknown CMS message type: %s", msg_type)
             finally:
