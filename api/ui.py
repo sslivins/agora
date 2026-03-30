@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from api import __version__
 from api.auth import (
     WebAuthRequired,
     clear_session,
@@ -224,6 +225,7 @@ async def settings_page(
             "has_auth_token": has_auth_token,
             "device_name": settings.device_name,
             "device_type": device_type,
+            "version": __version__,
             "asset_count": asset_count,
             "storage_total_mb": storage_total_mb,
             "storage_free_mb": storage_free_mb,

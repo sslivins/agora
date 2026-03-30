@@ -8,6 +8,7 @@
     <dl>
         <dt>Name</dt><dd>{{ device_name }}</dd>
         {% if device_type %}<dt>Type</dt><dd>{{ device_type }}</dd>{% endif %}
+        <dt>Version</dt><dd>{{ version }}</dd>
         <dt>Assets</dt><dd>{{ asset_count }}</dd>
         <dt>Storage</dt>
         <dd>
@@ -175,7 +176,19 @@ function updateCmsStatus(data) {
 
     // Message area
     if (message) {
-        msgText.textContent = message;
+        // Linkify "CMS Devices page" if we have a CMS host
+        const cmsHost = document.getElementById("cms-host").value.trim();
+        const cmsPort = document.getElementById("cms-port").value.trim() || "8080";
+        if (cmsHost) {
+            const devicesUrl = `http://${cmsHost}:${cmsPort}/devices`;
+            const linked = message.replace(
+                "CMS Devices page",
+                `<a href="${devicesUrl}" class="cms-link" target="_blank">CMS Devices page</a>`
+            );
+            msgText.innerHTML = linked;
+        } else {
+            msgText.textContent = message;
+        }
         // Red for errors/rejection, yellow for transient issues
         const isError = (st === "error" || registration === "rejected");
         msgEl.className = "cms-message " + (isError ? "cms-message-error" : "cms-message-warn");

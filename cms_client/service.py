@@ -36,7 +36,7 @@ STATUS_INTERVAL = 30    # seconds between heartbeat status messages
 EVAL_INTERVAL = 15      # seconds between local schedule evaluations
 FETCH_INTERVAL = 60     # seconds between proactive fetch checks
 FETCH_LOOKAHEAD_HOURS = 24  # how far ahead to look for missing assets
-AUTH_REJECTED_RETRY = 300   # seconds to wait before retrying after auth rejection
+AUTH_REJECTED_RETRY = 60    # seconds to wait before retrying after auth rejection
 
 
 class AuthRejectedError(Exception):
