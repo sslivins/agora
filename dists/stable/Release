@@ -5,20 +5,20 @@ Codename: stable
 Architectures: arm64
 Components: main
 Description: Agora media playback system for Raspberry Pi
-Date: Mon, 30 Mar 2026 08:20:37 +0000
+Date: Mon, 30 Mar 2026 08:53:29 +0000
 MD5Sum:
- 3bcf5e73ef0d3f35fbd93eccabb32a67              195 Release
- 1a1f52935828887034d8eff2b6e61a27              840 main/binary-arm64/Packages
- 6bead4c19236a67526f56bcfc5fccaf9              534 main/binary-arm64/Packages.gz
+ 3a129489ab853688dd089470e7efa2af              195 Release
+ 50810733740ea5c0be8026f224ad0840              840 main/binary-arm64/Packages
+ 04659e1e9c1c3b9d1eb5471dde4202ac              535 main/binary-arm64/Packages.gz
 SHA1:
- bc407d6e01631b3824f228af01e319655ed68437              195 Release
- 9932a5f22e3935a76820bbe88fa7f2b36178959e              840 main/binary-arm64/Packages
- 8d3da05e970f9fa5171a90334a1ce3f41342943e              534 main/binary-arm64/Packages.gz
+ 90477275739b89c31c14145eccb4e3d97c3a0491              195 Release
+ 926c3f917da7974ac0172bd011fa672347929996              840 main/binary-arm64/Packages
+ c28061dbaa1b1db0d8d6b980d5eed78222c374fb              535 main/binary-arm64/Packages.gz
 SHA256:
- 1c63bd05c08a94c10ce26330d9ff6aac78b0dd552278f1ee8fa8fd71d357c071              195 Release
- 04b50f4f6f6c0cd69b69034307615c4b727b9abcb7dc9a7137218dc45111e086              840 main/binary-arm64/Packages
- ffed8ba2fb6b84cce478d4689d176ce2097cd58f1eb8f86f0e3b37c77309b568              534 main/binary-arm64/Packages.gz
+ 047f5643f577beedb89e977eb7241e1fedb75ab11fcdab6209ccd61454e41be9              195 Release
+ 2ec6b1f94f99f90b738a742abd84a8c425f2cc52a8b6d663b732e3abc70fea9e              840 main/binary-arm64/Packages
+ 0d04f764d6089502371303d2a5b3739d25f8aa0182b2cae1d40752a1b6bfb423              535 main/binary-arm64/Packages.gz
 SHA512:
- c86f058a79be7e88bb5de9ec9288ef3b9d025ca161f538fc47666e7cb5b44f3a7c345c3807ffde0d082933fab06f9c7b089617c774e61b4d84f3a2cf3ccb0576              195 Release
- f03c2c3848abc6acb86da63bd460fb0c1cd50f281712bc7d53511cca046a0e832eca75581cea72bfd75fdc1909956716582255010630bf0f2bce8f7181ad7767              840 main/binary-arm64/Packages
- 3fc53941075da23372bb8f9defd8c4165b9e797af1123255a599ec776ec08e9daa8a6f0171e082446be942c924302fe67df36567341cfc6d329c55d97bc2fab9              534 main/binary-arm64/Packages.gz
+ 94573f93a010856783acd154ce9bae0b942da394b75974332622161c3a8a53cd44c55606d56a57b307f81aafdb40a49b46e8263188e79542346594b07730a599              195 Release
+ 681abf753b51ce158ca893eee1e1fbbbed8258690482d82558d277cb4504ffe031343c81658e13a457aecd16e5c1b9bf7662e3b575defea8649a83ec4310e122              840 main/binary-arm64/Packages
+ 15fcf62a9f475bf67f07402e6d2bf62de2fc8267ef70269b436126bc6ef518b4a7ad9703da4b3ad7e83f2e6279168e432377bfcee0a985f6232f001c07e17f66              535 main/binary-arm64/Packages.gz
