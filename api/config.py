@@ -78,6 +78,10 @@ class Settings(BaseSettings):
         return self.state_dir / "cms_config.json"
 
     @property
+    def cms_status_path(self) -> Path:
+        return self.state_dir / "cms_status.json"
+
+    @property
     def schedule_path(self) -> Path:
         return self.state_dir / "schedule.json"
 

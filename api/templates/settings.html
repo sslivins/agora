@@ -45,26 +45,20 @@
     <div class="stats-grid cms-status-bar" id="cms-status">
         <div class="stat">
             <div class="stat-label">Connection</div>
-            <div class="stat-value {% if service_error %}text-danger{% elif service_active %}text-success{% elif configured %}text-warning{% else %}text-muted{% endif %}">
-                {% if service_error %}Error{% elif service_active %}Connected{% elif configured %}Configured{% else %}Not configured{% endif %}
-            </div>
-            {% if service_error %}
-            <div class="stat-detail text-danger">{{ service_error }}</div>
-            {% endif %}
+            <div class="stat-value" id="cms-conn-value">—</div>
+            <div class="stat-detail" id="cms-conn-detail"></div>
         </div>
         <div class="stat">
             <div class="stat-label">Registered</div>
-            <div class="stat-value {% if has_auth_token %}text-success{% else %}text-muted{% endif %}">
-                {% if has_auth_token %}Yes{% else %}No{% endif %}
-            </div>
+            <div class="stat-value" id="cms-reg-value">—</div>
         </div>
         <div class="stat">
             <div class="stat-label">Service</div>
-            <div class="stat-value {% if service_active %}text-success{% else %}text-muted{% endif %}">
-                {% if service_active %}Running{% else %}Stopped{% endif %}
-            </div>
+            <div class="stat-value" id="cms-svc-value">—</div>
         </div>
     </div>
+
+    <div id="cms-alert" class="cms-alert" style="display: none;"></div>
 
     <h3 class="help-heading">How It Works</h3>
     <ol class="help-steps">
@@ -122,5 +116,85 @@ async function saveCmsConfig(form) {
     }
     return false;
 }
+
+// ── Live CMS status polling ──
+function updateCmsStatus(data) {
+    const connEl = document.getElementById("cms-conn-value");
+    const detailEl = document.getElementById("cms-conn-detail");
+    const regEl = document.getElementById("cms-reg-value");
+    const svcEl = document.getElementById("cms-svc-value");
+    const alertEl = document.getElementById("cms-alert");
+
+    const st = (data.cms_status || {}).state || "";
+    const error = (data.cms_status || {}).error || "";
+    const message = (data.cms_status || {}).message || "";
+
+    // Connection
+    if (st === "auth_error") {
+        connEl.textContent = "Auth Error";
+        connEl.className = "stat-value text-danger";
+        detailEl.textContent = error;
+        detailEl.className = "stat-detail text-danger";
+    } else if (st === "error") {
+        connEl.textContent = "Error";
+        connEl.className = "stat-value text-danger";
+        detailEl.textContent = error;
+        detailEl.className = "stat-detail text-danger";
+    } else if (st === "reconnecting") {
+        connEl.textContent = "Reconnecting";
+        connEl.className = "stat-value text-warning";
+        detailEl.textContent = error;
+        detailEl.className = "stat-detail text-warning";
+    } else if (st === "connected") {
+        connEl.textContent = "Connected";
+        connEl.className = "stat-value text-success";
+        detailEl.textContent = "";
+    } else if (data.service_active) {
+        connEl.textContent = "Starting…";
+        connEl.className = "stat-value text-warning";
+        detailEl.textContent = "";
+    } else {
+        connEl.textContent = "Not configured";
+        connEl.className = "stat-value text-muted";
+        detailEl.textContent = "";
+    }
+
+    // Registered
+    regEl.textContent = data.has_auth_token ? "Yes" : "No";
+    regEl.className = "stat-value " + (data.has_auth_token ? "text-success" : "text-muted");
+
+    // Service
+    svcEl.textContent = data.service_active ? "Running" : "Stopped";
+    svcEl.className = "stat-value " + (data.service_active ? "text-success" : "text-muted");
+
+    // Alert banner for auth errors
+    if (message) {
+        alertEl.textContent = message;
+        alertEl.style.display = "block";
+        alertEl.className = "cms-alert cms-alert-danger";
+    } else {
+        alertEl.style.display = "none";
+    }
+}
+
+async function pollCmsStatus() {
+    try {
+        const res = await apiCall("GET", "/cms/status");
+        if (res && res.ok) {
+            const data = await res.json();
+            updateCmsStatus(data);
+        }
+    } catch (e) { /* ignore */ }
+}
+
+// Initial render from server data
+updateCmsStatus({
+    service_active: {{ "true" if service_active else "false" }},
+    has_auth_token: {{ "true" if has_auth_token else "false" }},
+    cms_status: {{ cms_status | tojson }},
+});
+
+// Poll every 5 seconds
+setInterval(pollCmsStatus, 5000);
 </script>
 {% endblock %}
