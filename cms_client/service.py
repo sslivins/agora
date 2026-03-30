@@ -732,13 +732,17 @@ class CMSClient:
             await ws.send(json.dumps({"type": "upgrade_ack"}))
         except Exception:
             pass
-        # Fix any broken dpkg state from a previous interrupted install,
-        # then update and install. Always reboot at the end so the device
-        # comes back online in a known state.
-        os.system(
-            "sudo dpkg --configure -a; "
-            "sudo apt-get update -qq && sudo apt-get install -y agora; "
-            "sudo reboot"
+        # Run the upgrade in a separate systemd scope so it survives the
+        # CMS client service restart triggered by the package's postinst.
+        # Without this, systemd kills the upgrade commands (same cgroup)
+        # when postinst calls 'systemctl restart agora-cms-client', and
+        # the reboot never happens.
+        subprocess.Popen(
+            ["systemd-run", "--scope",
+             "bash", "-c",
+             "dpkg --configure -a; "
+             "apt-get update -qq && apt-get install -y agora; "
+             "reboot"],
         )
 
     # ── Helpers ──
