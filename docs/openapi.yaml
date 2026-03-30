@@ -6,7 +6,7 @@ info:
     playback control, CMS integration, and status monitoring. A separate player service
     handles GStreamer pipelines, and an optional CMS client connects to Agora CMS for
     centralized scheduling and fleet management.
-  version: 0.8.0
+  version: 0.8.1
   license:
     name: MIT
 
