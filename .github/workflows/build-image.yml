@@ -37,10 +37,15 @@ on:
 permissions:
   contents: write
 
+env:
+  # Pin pi-gen to a known-good arm64 commit (Dec 2025, before the
+  # qemu-user-static → qemu-user-binfmt change that broke cross-builds)
+  PI_GEN_COMMIT: 4997bf4e4e49bc3305eb182a4a08bd023529da04
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -51,46 +56,114 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building image for Agora v$version"
 
-      - name: Set up QEMU for arm64 emulation
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            coreutils quilt parted debootstrap zerofree zip \
+            dosfstools libcap2-bin libarchive-tools grep rsync xz-utils \
+            curl file git kmod bc gpg pigz \
+            qemu-user-static binfmt-support
 
-      - name: Build image with pi-gen
-        uses: usimd/pi-gen-action@v1
-        id: build
-        with:
-          # Base image config
-          image-name: ${{ github.event.inputs.image_name || 'agora-pi' }}
-          release: bookworm
-          pi-gen-version: arm64
+      - name: Set up QEMU binfmt for arm64
+        run: |
+          # Ensure binfmt_misc is mounted
+          sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
 
-          # Skip desktop stages (we want Lite)
-          stage-list: stage0 stage1 stage2 ./pi-gen/stage-agora
+          # Re-enable all binfmt entries (ensures qemu-user-static is active)
+          sudo update-binfmts --enable
 
-          # Enable SSH by default
-          enable-ssh: 1
+          # Verify arm64 emulation works
+          if /usr/libexec/qemu-binfmt/aarch64-binfmt-P --help >/dev/null 2>&1 || \
+             /usr/bin/qemu-aarch64-static --help >/dev/null 2>&1; then
+            echo "QEMU aarch64 binary found"
+          fi
 
-          # Don't set locale/keyboard/timezone — keep defaults
-          locale: en_US.UTF-8
-          keyboard-layout: us
-          timezone: ${{ github.event.inputs.timezone || 'America/New_York' }}
+          # Check binfmt registration
+          if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "binfmt qemu-aarch64 registered:"
+            cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+          else
+            echo "WARNING: qemu-aarch64 not in binfmt_misc, registering manually..."
+            QEMU_BIN=$(which qemu-aarch64-static)
+            echo ":qemu-aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:${QEMU_BIN}:F" | sudo tee /proc/sys/fs/binfmt_misc/register
+          fi
 
-          # Hostname
-          hostname: agora
+      - name: Clone pi-gen
+        run: |
+          git clone https://github.com/RPi-Distro/pi-gen.git /tmp/pi-gen
+          cd /tmp/pi-gen
+          git checkout ${{ env.PI_GEN_COMMIT }}
 
-          # Compression
-          compression: xz
-          compression-level: 9
+      - name: Configure pi-gen
+        run: |
+          IMAGE_NAME="${{ github.event.inputs.image_name || 'agora-pi' }}"
+          TIMEZONE="${{ github.event.inputs.timezone || 'America/New_York' }}"
 
-          # Verbose for debugging
-          verbose-output: true
+          cat > /tmp/pi-gen/config <<EOF
+          IMG_NAME=${IMAGE_NAME}
+          RELEASE=bookworm
+          TARGET_HOSTNAME=agora
+          FIRST_USER_NAME=pi
+          ENABLE_SSH=1
+          LOCALE_DEFAULT=en_US.UTF-8
+          KEYBOARD_KEYMAP=us
+          KEYBOARD_LAYOUT="English (US)"
+          TIMEZONE_DEFAULT=${TIMEZONE}
+          DEPLOY_COMPRESSION=xz
+          COMPRESSION_LEVEL=9
+          EOF
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' /tmp/pi-gen/config
+
+          echo "--- pi-gen config ---"
+          cat /tmp/pi-gen/config
+
+          # Skip desktop stages (3-5) — we want Lite + our stage
+          touch /tmp/pi-gen/stage3/SKIP /tmp/pi-gen/stage4/SKIP /tmp/pi-gen/stage5/SKIP
+          touch /tmp/pi-gen/stage3/SKIP_IMAGES /tmp/pi-gen/stage4/SKIP_IMAGES /tmp/pi-gen/stage5/SKIP_IMAGES
+
+          # Remove default stage2 export (we export from our custom stage instead)
+          rm -f /tmp/pi-gen/stage2/EXPORT_IMAGE /tmp/pi-gen/stage2/EXPORT_NOOBS
+
+          # Copy our custom stage and mark it for export
+          cp -r pi-gen/stage-agora /tmp/pi-gen/stage-agora
+          touch /tmp/pi-gen/stage-agora/EXPORT_IMAGE
+
+          # Create prerun.sh to copy rootfs from previous stage
+          cat > /tmp/pi-gen/stage-agora/prerun.sh <<'PRERUN'
+          #!/bin/bash -e
+          if [ ! -d "${ROOTFS_DIR}" ]; then
+            copy_previous
+          fi
+          PRERUN
+          sed -i 's/^          //' /tmp/pi-gen/stage-agora/prerun.sh
+          chmod +x /tmp/pi-gen/stage-agora/prerun.sh
+
+      - name: Build image
+        run: |
+          cd /tmp/pi-gen
+          chmod +x build-docker.sh
+          ./build-docker.sh
+
+      - name: Find built image
+        id: find-image
+        run: |
+          IMAGE_PATH=$(find /tmp/pi-gen/deploy -name '*.img.xz' -o -name '*.img.gz' -o -name '*.img.zip' -o -name '*.img' | head -1)
+          if [ -z "$IMAGE_PATH" ]; then
+            echo "ERROR: No image found in /tmp/pi-gen/deploy/"
+            ls -laR /tmp/pi-gen/deploy/ || true
+            exit 1
+          fi
+          echo "image-path=$IMAGE_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found image: $IMAGE_PATH"
 
       - name: Upload image as artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.image_name || 'agora-pi' }}-v${{ steps.version.outputs.version }}
-          path: ${{ steps.build.outputs.image-path }}
+          path: ${{ steps.find-image.outputs.image-path }}
           retention-days: 30
 
       - name: Attach image to latest release
@@ -101,7 +174,7 @@ jobs:
           TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
           if [ -n "$TAG" ]; then
             echo "Uploading image to release $TAG"
-            gh release upload "$TAG" "${{ steps.build.outputs.image-path }}" --clobber
+            gh release upload "$TAG" "${{ steps.find-image.outputs.image-path }}" --clobber
           else
             echo "No release found — image available as workflow artifact only"
           fi
