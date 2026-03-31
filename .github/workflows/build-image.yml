@@ -1,0 +1,76 @@
+name: Build Pi Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: "Image filename (without extension)"
+        required: false
+        default: "agora-pi"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building image for Agora v$version"
+
+      - name: Build image with pi-gen
+        uses: usimd/pi-gen-action@v1
+        id: build
+        with:
+          # Base image config
+          image-name: ${{ github.event.inputs.image_name || 'agora-pi' }}
+          release: bookworm
+          target-architecture: arm64
+
+          # Skip desktop stages (we want Lite)
+          stage-list: stage0 stage1 stage2 ./pi-gen/stage-agora
+
+          # Enable SSH by default
+          enable-ssh: 1
+
+          # Don't set locale/keyboard/timezone — keep defaults
+          locale: en_US.UTF-8
+          keyboard-layout: us
+          timezone: UTC
+
+          # Hostname
+          hostname: agora
+
+          # Compression
+          compression: xz
+          compression-level: 9
+
+          # Verbose for debugging
+          verbose-output: true
+
+      - name: Upload image as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.image_name || 'agora-pi' }}-v${{ steps.version.outputs.version }}
+          path: ${{ steps.build.outputs.image-path }}
+          retention-days: 30
+
+      - name: Attach image to latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Find the latest release
+          TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          if [ -n "$TAG" ]; then
+            echo "Uploading image to release $TAG"
+            gh release upload "$TAG" "${{ steps.build.outputs.image-path }}" --clobber
+          else
+            echo "No release found — image available as workflow artifact only"
+          fi
