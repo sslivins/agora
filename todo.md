@@ -79,6 +79,7 @@
 - [x] Factory reset button on settings page
 - [x] systemd service (agora-provision.service, runs before API/player/CMS client)
 - [ ] mDNS via avahi for agora-XXXX.local discovery
+- [x] Auto-discover CMS via mDNS (agora-cms.local) during provisioning
 - [ ] Install script updates (dnsmasq, NetworkManager packages)
 
 ## Infrastructure

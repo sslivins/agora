@@ -6,6 +6,7 @@ Allows the user to configure Wi-Fi, CMS address, and device name.
 
 import json
 import logging
+import socket
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,6 +27,8 @@ logger = logging.getLogger("agora.provision")
 PROVISION_DIR = Path(__file__).parent
 PERSIST_DIR = Path("/opt/agora/persist")
 STATE_DIR = Path("/opt/agora/state")
+CMS_MDNS_HOST = "agora-cms.local"
+CMS_DEFAULT_PORT = 8080
 
 app = FastAPI(title="Agora Setup")
 
@@ -72,6 +75,23 @@ async def wifi_status():
     return {"connected": connected, "ssid": ssid}
 
 
+@app.get("/api/cms/discover")
+async def cms_discover():
+    """Try to discover the CMS via mDNS (agora-cms.local).
+
+    Only works when connected to Wi-Fi (not in AP mode).
+    """
+    try:
+        socket.getaddrinfo(CMS_MDNS_HOST, CMS_DEFAULT_PORT, socket.AF_INET)
+        return {
+            "found": True,
+            "host": CMS_MDNS_HOST,
+            "port": CMS_DEFAULT_PORT,
+        }
+    except socket.gaierror:
+        return {"found": False}
+
+
 @app.post("/api/provision")
 async def provision(request: Request):
     """Apply provisioning configuration: connect to Wi-Fi and save settings."""
@@ -93,7 +113,17 @@ async def provision(request: Request):
     if not success:
         return {"success": False, "error": f"Wi-Fi connection failed: {message}"}
 
-    # Step 2: Save CMS config if provided
+    # Step 2: Auto-discover CMS via mDNS if not provided
+    if not cms_host:
+        try:
+            socket.getaddrinfo(CMS_MDNS_HOST, CMS_DEFAULT_PORT, socket.AF_INET)
+            cms_host = CMS_MDNS_HOST
+            cms_port = CMS_DEFAULT_PORT
+            logger.info("Auto-discovered CMS at %s:%d", cms_host, cms_port)
+        except socket.gaierror:
+            pass
+
+    # Step 3: Save CMS config if available
     if cms_host:
         # Strip protocol prefixes
         for prefix in ("ws://", "wss://", "http://", "https://"):
@@ -119,7 +149,7 @@ async def provision(request: Request):
         tmp.write_text(json.dumps(cms_config, indent=2))
         tmp.replace(cms_config_path)
 
-    # Step 3: Save device name if provided
+    # Step 4: Save device name if provided
     if device_name:
         device_name_path = PERSIST_DIR / "device_name"
         device_name_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,7 +157,7 @@ async def provision(request: Request):
         tmp.write_text(device_name)
         tmp.replace(device_name_path)
 
-    # Step 4: Mark provisioning complete
+    # Step 5: Mark provisioning complete
     provision_flag = PERSIST_DIR / "provisioned"
     provision_flag.parent.mkdir(parents=True, exist_ok=True)
     provision_flag.write_text("1")
@@ -137,4 +167,7 @@ async def provision(request: Request):
         wifi_ssid, cms_host or "(none)", cms_port, device_name or "(auto)",
     )
 
-    return {"success": True, "message": "Device configured successfully"}
+    result = {"success": True, "message": "Device configured successfully"}
+    if cms_host:
+        result["cms_discovered"] = f"{cms_host}:{cms_port}"
+    return result
