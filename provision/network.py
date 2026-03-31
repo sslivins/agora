@@ -178,24 +178,50 @@ def start_ap(ssid: str, password: str | None = None) -> bool:
     # Stop any existing hotspot
     stop_ap()
 
-    cmd = [
-        "nmcli", "device", "wifi", "hotspot",
-        "ifname", iface,
-        "ssid", ssid,
-        "band", "bg",
-        "channel", "6",
-    ]
     if password:
-        cmd.extend(["password", password])
+        # WPA-protected hotspot via nmcli shortcut
+        cmd = [
+            "nmcli", "device", "wifi", "hotspot",
+            "ifname", iface,
+            "ssid", ssid,
+            "band", "bg",
+            "channel", "6",
+            "password", password,
+        ]
+    else:
+        # Open (no password) AP — must use connection add since nmcli hotspot
+        # auto-generates a WPA password when none is specified
+        cmd = [
+            "nmcli", "connection", "add",
+            "type", "wifi",
+            "ifname", iface,
+            "con-name", "Hotspot",
+            "autoconnect", "no",
+            "ssid", ssid,
+            "wifi.band", "bg",
+            "wifi.channel", "6",
+            "wifi.mode", "ap",
+            "ipv4.method", "shared",
+            "ipv6.method", "disabled",
+        ]
 
     try:
         result = _run(cmd, timeout=15)
-        if result.returncode == 0:
-            logger.info("AP started: %s", ssid)
-            return True
-        else:
+        if result.returncode != 0:
             logger.error("Failed to start AP: %s", result.stderr.strip())
             return False
+
+        # If we added a connection (open AP), we still need to bring it up
+        if not password:
+            up_result = _run(
+                ["nmcli", "connection", "up", "Hotspot"], timeout=15,
+            )
+            if up_result.returncode != 0:
+                logger.error("Failed to activate AP: %s", up_result.stderr.strip())
+                return False
+
+        logger.info("AP started: %s (open=%s)", ssid, not password)
+        return True
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         logger.error("Failed to start AP: %s", e)
         return False
