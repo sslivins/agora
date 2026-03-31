@@ -27,27 +27,27 @@ systemctl disable agora-player 2>/dev/null || true
 # ── DEBUG: Show boot messages on console (remove quiet/splash) ──
 sed -i 's/ quiet//g; s/ splash//g' /boot/firmware/cmdline.txt 2>/dev/null || true
 
-# ── Unblock WiFi radio (rfkill soft-blocks it by default on Pi OS) ──
-rfkill unblock wifi 2>/dev/null || true
+# ── Unblock WiFi radio (Pi OS soft-blocks it via rfkill + NM state file) ──
+# 1. Write NM state file with WiFi enabled (NM honors this over rfkill)
+mkdir -p /var/lib/NetworkManager
+cat > /var/lib/NetworkManager/NetworkManager.state <<'NMSTATE'
+[main]
+NetworkingEnabled=true
+WirelessEnabled=true
+WWANEnabled=true
+NMSTATE
 
-# Ensure WiFi is unblocked on every boot via NetworkManager dispatcher
-mkdir -p /etc/NetworkManager/dispatcher.d
-cat > /etc/NetworkManager/dispatcher.d/pre-up.d/10-unblock-wifi <<'RFKEOF'
-#!/bin/bash
-rfkill unblock wifi
-RFKEOF
-chmod +x /etc/NetworkManager/dispatcher.d/pre-up.d/10-unblock-wifi
-
-# Also create a one-shot service that runs before NM to unblock wifi
+# 2. Create a service that unblocks rfkill AFTER /dev/rfkill exists but BEFORE NM
 cat > /etc/systemd/system/rfkill-unblock-wifi.service <<'RFKSVC'
 [Unit]
 Description=Unblock WiFi radio
-DefaultDependencies=no
+After=systemd-udevd.service systemd-rfkill.service
 Before=NetworkManager.service
-After=systemd-rfkill.service
+Wants=systemd-udevd.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/rfkill ] && exit 0; sleep 0.5; done; exit 0'
 ExecStart=/usr/sbin/rfkill unblock wifi
 RemainAfterExit=yes
 
@@ -55,6 +55,9 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 RFKSVC
 systemctl enable rfkill-unblock-wifi
+
+# 3. Delete systemd-rfkill saved state so it doesn't restore the block on boot
+rm -f /var/lib/systemd/rfkill/*
 
 # ── DEBUG: USB gadget removed — USB port stays in host mode for Ethernet dongle ──
 mkdir -p /etc/NetworkManager/system-connections
@@ -102,6 +105,7 @@ ip addr > "$LOGDIR/ip-addr.txt" 2>&1
 systemctl list-units --failed > "$LOGDIR/failed-units.txt" 2>&1
 dmesg > "$LOGDIR/dmesg.txt" 2>&1
 echo "Debug dump complete at $(date)" > "$LOGDIR/done.txt"
+sync
 DUMPEOF
 chmod +x /usr/local/bin/agora-debug-dump.sh
 
