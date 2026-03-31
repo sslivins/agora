@@ -7,6 +7,10 @@ on:
         description: "Image filename (without extension)"
         required: false
         default: "agora-pi"
+      timezone:
+        description: "Timezone (e.g. America/New_York, Europe/London, Etc/UTC)"
+        required: false
+        default: "America/New_York"
 
 permissions:
   contents: write
@@ -32,7 +36,7 @@ jobs:
           # Base image config
           image-name: ${{ github.event.inputs.image_name || 'agora-pi' }}
           release: bookworm
-          target-architecture: arm64
+          pi-gen-version: arm64
 
           # Skip desktop stages (we want Lite)
           stage-list: stage0 stage1 stage2 ./pi-gen/stage-agora
@@ -43,7 +47,7 @@ jobs:
           # Don't set locale/keyboard/timezone — keep defaults
           locale: en_US.UTF-8
           keyboard-layout: us
-          timezone: UTC
+          timezone: ${{ github.event.inputs.timezone || 'America/New_York' }}
 
           # Hostname
           hostname: agora
