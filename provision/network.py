@@ -139,24 +139,45 @@ def connect_wifi(ssid: str, password: str) -> tuple[bool, str]:
     if not iface:
         return False, "No Wi-Fi interface found"
 
+    con_name = f"wifi-{ssid}"
+
     # Delete any existing connection profile for this SSID to avoid conflicts
     try:
-        _run(["nmcli", "connection", "delete", ssid], timeout=10)
+        _run(["nmcli", "connection", "delete", con_name], timeout=10)
     except subprocess.SubprocessError:
         pass
 
-    # Connect (this creates a persistent connection profile)
+    # Create a persistent connection profile with explicit security settings
     try:
+        add_cmd = [
+            "nmcli", "connection", "add",
+            "type", "wifi",
+            "con-name", con_name,
+            "ifname", iface,
+            "ssid", ssid,
+            "wifi-sec.key-mgmt", "wpa-psk",
+            "wifi-sec.psk", password,
+            "connection.autoconnect", "yes",
+            "connection.autoconnect-priority", "10",
+        ]
+        result = _run(add_cmd, timeout=15)
+        if result.returncode != 0:
+            return False, result.stderr.strip() or "Failed to create connection"
+
+        # Activate the connection
         result = _run([
-            "nmcli", "device", "wifi", "connect", ssid,
-            "password", password, "ifname", iface,
+            "nmcli", "connection", "up", con_name,
         ], timeout=30)
 
         if result.returncode == 0:
             return True, "Connected successfully"
         else:
             stderr = result.stderr.strip()
-            # Extract useful error message
+            # Clean up failed connection
+            try:
+                _run(["nmcli", "connection", "delete", con_name], timeout=10)
+            except subprocess.SubprocessError:
+                pass
             if "Secrets were required" in stderr or "No suitable" in stderr:
                 return False, "Incorrect password"
             if "No network with SSID" in stderr:
