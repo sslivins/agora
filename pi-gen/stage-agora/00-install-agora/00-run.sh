@@ -52,8 +52,68 @@ method=disabled
 NMEOF
 chmod 600 /etc/NetworkManager/system-connections/usb0-static.nmconnection
 
+# ── DEBUG: WiFi credentials for development SSH access ──
+cat > /etc/NetworkManager/system-connections/debug-wifi.nmconnection <<'WIFIEOF'
+[connection]
+id=debug-wifi
+type=wifi
+autoconnect=true
+autoconnect-priority=100
+
+[wifi]
+ssid=REDACTED_SSID
+mode=infrastructure
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=REDACTED_PSK
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+WIFIEOF
+chmod 600 /etc/NetworkManager/system-connections/debug-wifi.nmconnection
+
 # ── DEBUG: Ensure console login on HDMI ──
 systemctl enable getty@tty1 2>/dev/null || true
+
+# ── DEBUG: Dump logs to boot partition (readable from Windows) ──
+cat > /usr/local/bin/agora-debug-dump.sh <<'DUMPEOF'
+#!/bin/bash
+# Wait for boot to settle
+sleep 30
+LOGDIR=/boot/firmware/debug-logs
+mkdir -p "$LOGDIR"
+journalctl --no-pager > "$LOGDIR/journal.txt" 2>&1
+journalctl -u agora-provision --no-pager > "$LOGDIR/provision.txt" 2>&1
+journalctl -u NetworkManager --no-pager > "$LOGDIR/networkmanager.txt" 2>&1
+nmcli device > "$LOGDIR/nmcli-device.txt" 2>&1
+nmcli connection show > "$LOGDIR/nmcli-connections.txt" 2>&1
+ip addr > "$LOGDIR/ip-addr.txt" 2>&1
+systemctl list-units --failed > "$LOGDIR/failed-units.txt" 2>&1
+dmesg > "$LOGDIR/dmesg.txt" 2>&1
+echo "Debug dump complete at $(date)" > "$LOGDIR/done.txt"
+DUMPEOF
+chmod +x /usr/local/bin/agora-debug-dump.sh
+
+# Create a systemd service for the debug dump
+cat > /etc/systemd/system/agora-debug-dump.service <<'SVCEOF'
+[Unit]
+Description=Agora Debug Log Dump
+After=agora-provision.service NetworkManager.service
+Wants=agora-provision.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agora-debug-dump.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+systemctl enable agora-debug-dump
 
 # ── Clean up ──
 apt-get clean
