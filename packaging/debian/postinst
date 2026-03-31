@@ -9,6 +9,9 @@ if ! id "${AGORA_USER}" &>/dev/null; then
     useradd -r -m -s /bin/bash "${AGORA_USER}"
 fi
 
+# ── Ensure user can manage network (for factory reset Wi-Fi wipe) ──
+usermod -aG netdev "${AGORA_USER}" 2>/dev/null || true
+
 # ── Create persist directory (flash-backed, survives reboots) ──
 mkdir -p "${AGORA_BASE}/persist"
 chown "${AGORA_USER}:${AGORA_USER}" "${AGORA_BASE}/persist"
@@ -107,10 +110,63 @@ systemctl disable getty@tty1 2>/dev/null || true
 # ── Rebuild initramfs with new splash theme ──
 update-initramfs -u 2>/dev/null || true
 
+# ── Switch from dhcpcd to NetworkManager (required for captive portal) ──
+if systemctl is-enabled dhcpcd 2>/dev/null | grep -q "enabled"; then
+    echo "Agora: switching network management from dhcpcd to NetworkManager"
+    systemctl disable dhcpcd 2>/dev/null || true
+    systemctl stop dhcpcd 2>/dev/null || true
+fi
+
+# Tell NetworkManager to manage all interfaces (Pi OS marks wlan0 unmanaged by default)
+NM_CONF="/etc/NetworkManager/conf.d/agora.conf"
+if [ ! -f "${NM_CONF}" ]; then
+    mkdir -p /etc/NetworkManager/conf.d
+    cat > "${NM_CONF}" <<'NM_EOF'
+[device]
+wifi.scan-rand-mac-address=no
+
+[ifupdown]
+managed=true
+NM_EOF
+    echo "Agora: configured NetworkManager to manage all interfaces"
+fi
+
+# Migrate existing wpa_supplicant Wi-Fi credentials to NetworkManager
+WPA_CONF="/etc/wpa_supplicant/wpa_supplicant.conf"
+if [ -f "${WPA_CONF}" ] && command -v nmcli &>/dev/null; then
+    # Extract SSID and PSK from wpa_supplicant
+    WPA_SSID=$(grep -oP 'ssid="\K[^"]+' "${WPA_CONF}" 2>/dev/null | head -1)
+    WPA_PSK=$(grep -oP 'psk="\K[^"]+' "${WPA_CONF}" 2>/dev/null | head -1)
+    if [ -n "${WPA_SSID}" ] && [ -n "${WPA_PSK}" ]; then
+        # Only add if not already known to NetworkManager
+        if ! nmcli -t connection show "${WPA_SSID}" &>/dev/null; then
+            nmcli connection add type wifi con-name "${WPA_SSID}" ssid "${WPA_SSID}" \
+                wifi-sec.key-mgmt wpa-psk wifi-sec.psk "${WPA_PSK}" \
+                connection.autoconnect yes 2>/dev/null || true
+            echo "Agora: migrated Wi-Fi credentials for '${WPA_SSID}' to NetworkManager"
+            # Mark device as provisioned since it already has Wi-Fi
+            mkdir -p "${AGORA_BASE}/persist"
+            echo "1" > "${AGORA_BASE}/persist/provisioned"
+        fi
+    fi
+fi
+
+# Disable wpa_supplicant (NetworkManager runs its own instance internally)
+systemctl disable wpa_supplicant 2>/dev/null || true
+
+systemctl enable NetworkManager 2>/dev/null || true
+systemctl restart NetworkManager 2>/dev/null || true
+
 # ── Enable and restart services ──
 systemctl daemon-reload
-systemctl enable agora-player agora-api agora-cms-client
+systemctl enable agora-player agora-api agora-cms-client agora-provision
+
+# ── Ensure dnsmasq does not start by default (managed by provision service) ──
+systemctl disable dnsmasq 2>/dev/null || true
+systemctl stop dnsmasq 2>/dev/null || true
+
 if [ "$1" = "configure" ]; then
+    systemctl restart agora-provision || true
     systemctl restart agora-player || true
     systemctl restart agora-api || true
     systemctl restart agora-cms-client || true

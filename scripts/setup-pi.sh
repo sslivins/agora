@@ -35,11 +35,15 @@ apt-get install -y agora
 sleep 3
 echo ""
 info "=== Service Status ==="
+systemctl is-active agora-provision && info "agora-provision: running" || warn "agora-provision: not running"
 systemctl is-active agora-player && info "agora-player: running" || warn "agora-player: not running"
 systemctl is-active agora-api && info "agora-api: running" || warn "agora-api: not running"
 
 echo ""
 info "=== Setup Complete ==="
+info "If this is a fresh device, connect to the Agora-XXXX Wi-Fi network"
+info "to configure Wi-Fi and CMS settings via the captive portal."
+info ""
 info "Web UI:  http://$(hostname -I | awk '{print $1}'):8000"
 info "Login:   admin / agora"
 info "Config:  /boot/agora-config.json"
