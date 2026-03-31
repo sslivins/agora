@@ -27,30 +27,8 @@ systemctl disable agora-player 2>/dev/null || true
 # ── DEBUG: Show boot messages on console (remove quiet/splash) ──
 sed -i 's/ quiet//g; s/ splash//g' /boot/firmware/cmdline.txt 2>/dev/null || true
 
-# ── DEBUG: USB gadget Ethernet — SSH over USB cable, no dongle needed ──
-# Add dwc2 overlay to config.txt
-if ! grep -q 'dtoverlay=dwc2' /boot/firmware/config.txt; then
-  echo 'dtoverlay=dwc2' >> /boot/firmware/config.txt
-fi
-# Load modules via kernel cmdline (more reliable than /etc/modules)
-sed -i 's/$/ modules-load=dwc2,g_ether/' /boot/firmware/cmdline.txt
-# Configure static IP on usb0 so we know where to SSH
+# ── DEBUG: USB gadget removed — USB port stays in host mode for Ethernet dongle ──
 mkdir -p /etc/NetworkManager/system-connections
-cat > /etc/NetworkManager/system-connections/usb0-static.nmconnection <<'NMEOF'
-[connection]
-id=usb0-static
-type=ethernet
-interface-name=usb0
-autoconnect=true
-
-[ipv4]
-method=manual
-addresses=10.42.0.2/24
-
-[ipv6]
-method=disabled
-NMEOF
-chmod 600 /etc/NetworkManager/system-connections/usb0-static.nmconnection
 
 # ── DEBUG: WiFi credentials for development SSH access ──
 cat > /etc/NetworkManager/system-connections/debug-wifi.nmconnection <<'WIFIEOF'
