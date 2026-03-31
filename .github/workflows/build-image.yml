@@ -38,9 +38,9 @@ permissions:
   contents: write
 
 env:
-  # Pin pi-gen to a known-good arm64 commit (Dec 2025, before the
-  # qemu-user-static → qemu-user-binfmt change that broke cross-builds)
-  PI_GEN_COMMIT: 4997bf4e4e49bc3305eb182a4a08bd023529da04
+  # Pin pi-gen to latest arm64 branch commit (Mar 17, 2026)
+  # Has updated Debian signing keys needed for bookworm
+  PI_GEN_COMMIT: d01290946bae8acba172d99c8d4aa3fb335fcf6d
 
 jobs:
   build:
@@ -117,7 +117,7 @@ jobs:
           # Build config — explicit STAGE_LIST with correct ordering
           cat > /tmp/pi-gen/config <<EOF
           IMG_NAME=${IMAGE_NAME}
-          RELEASE=bookworm
+          RELEASE=trixie
           TARGET_HOSTNAME=agora
           FIRST_USER_NAME=pi
           ENABLE_SSH=1
@@ -128,6 +128,7 @@ jobs:
           DEPLOY_COMPRESSION=xz
           COMPRESSION_LEVEL=9
           STAGE_LIST="stage0 stage1 stage2 stage-agora"
+          ENABLE_CLOUD_INIT=0
           EOF
 
           # Remove leading whitespace from heredoc
@@ -140,6 +141,14 @@ jobs:
         run: |
           cd /tmp/pi-gen
           chmod +x build-docker.sh
+
+          # Patch build-docker.sh: the Mar 2026 pi-gen switched from
+          # qemu-user-static to qemu-user-binfmt, but the static variant
+          # is what works reliably in Docker containers on GHA runners.
+          sed -i 's/qemu-aarch64)/qemu-aarch64-static)/' build-docker.sh
+          sed -i 's/qemu-user-binfmt/qemu-user-static/g' build-docker.sh
+          sed -i 's/which qemu-aarch64 /which qemu-aarch64-static /' build-docker.sh
+
           ./build-docker.sh
 
       - name: Find built image
