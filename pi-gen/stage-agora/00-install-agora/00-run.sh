@@ -32,9 +32,8 @@ sed -i 's/ quiet//g; s/ splash//g' /boot/firmware/cmdline.txt 2>/dev/null || tru
 if ! grep -q 'dtoverlay=dwc2' /boot/firmware/config.txt; then
   echo 'dtoverlay=dwc2' >> /boot/firmware/config.txt
 fi
-# Load g_ether module at boot
-echo 'dwc2' >> /etc/modules
-echo 'g_ether' >> /etc/modules
+# Load modules via kernel cmdline (more reliable than /etc/modules)
+sed -i 's/$/ modules-load=dwc2,g_ether/' /boot/firmware/cmdline.txt
 # Configure static IP on usb0 so we know where to SSH
 mkdir -p /etc/NetworkManager/system-connections
 cat > /etc/NetworkManager/system-connections/usb0-static.nmconnection <<'NMEOF'
