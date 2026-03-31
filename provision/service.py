@@ -108,10 +108,12 @@ async def _run_portal(shutdown_event: asyncio.Event, timeout: int | None = None)
 def _enter_ap_mode(ssid: str) -> bool:
     """Start AP mode and DNS redirect. Returns True on success."""
     logger.info("Starting AP mode: %s", ssid)
+    # Install DNS redirect BEFORE starting AP — iOS probes instantly on connect
+    install_dns_redirect()
     if not start_ap(ssid):
         logger.error("Failed to start AP mode")
+        remove_dns_redirect()
         return False
-    install_dns_redirect()
     return True
 
 
