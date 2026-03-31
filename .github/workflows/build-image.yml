@@ -8,9 +8,31 @@ on:
         required: false
         default: "agora-pi"
       timezone:
-        description: "Timezone (e.g. America/New_York, Europe/London, Etc/UTC)"
+        description: "Timezone"
         required: false
+        type: choice
         default: "America/New_York"
+        options:
+          - "America/New_York"
+          - "America/Chicago"
+          - "America/Denver"
+          - "America/Los_Angeles"
+          - "America/Anchorage"
+          - "Pacific/Honolulu"
+          - "America/Toronto"
+          - "America/Vancouver"
+          - "America/Sao_Paulo"
+          - "Europe/London"
+          - "Europe/Paris"
+          - "Europe/Berlin"
+          - "Europe/Moscow"
+          - "Asia/Tokyo"
+          - "Asia/Shanghai"
+          - "Asia/Kolkata"
+          - "Asia/Dubai"
+          - "Australia/Sydney"
+          - "Pacific/Auckland"
+          - "Etc/UTC"
 
 permissions:
   contents: write
@@ -28,6 +50,11 @@ jobs:
           version=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building image for Agora v$version"
+
+      - name: Set up QEMU for arm64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Build image with pi-gen
         uses: usimd/pi-gen-action@v1
