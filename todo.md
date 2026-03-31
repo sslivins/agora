@@ -69,6 +69,19 @@
 - [ ] Volume control via API
 - [ ] Multi-device management (control multiple Pis from one UI)
 
+## Captive Portal Provisioning
+- [x] Provisioning FastAPI service (provision/)
+- [x] NetworkManager Wi-Fi helpers (scan, connect, AP mode)
+- [x] Captive portal setup page (branded UI)
+- [x] dnsmasq DNS redirect for captive portal detection
+- [x] Boot flow: unprovisioned → AP mode; provisioned → Wi-Fi retry → AP fallback
+- [x] Factory reset endpoint (wipes assets, Wi-Fi, config, reboots)
+- [x] Factory reset button on settings page
+- [x] systemd service (agora-provision.service, runs before API/player/CMS client)
+- [ ] mDNS via avahi for agora-XXXX.local discovery
+- [x] Auto-discover CMS via mDNS (agora-cms.local) during provisioning
+- [ ] Install script updates (dnsmasq, NetworkManager packages)
+
 ## Infrastructure
 - [ ] CI/CD pipeline (GitHub Actions: lint, test)
 - [ ] Automated deployment script (scp + systemctl restart)

@@ -218,4 +218,41 @@ updateCmsStatus({
 // Poll every 5 seconds
 setInterval(pollCmsStatus, 5000);
 </script>
+
+<section class="card">
+    <h2 style="color: var(--danger);">Factory Reset</h2>
+    <p class="text-muted" style="font-size: 0.9rem; margin-bottom: 0.75rem;">
+        Reset this device to its out-of-box state. This will erase all assets, Wi-Fi settings,
+        CMS configuration, and reboot the device into setup mode.
+    </p>
+    <button class="danger" id="factory-reset-btn" onclick="factoryReset()">Factory Reset</button>
+    <div id="reset-status" class="form-status"></div>
+</section>
+
+<script>
+async function factoryReset() {
+    if (!confirm("Are you sure you want to factory reset this device? All data will be erased and the device will reboot.")) {
+        return;
+    }
+    if (!confirm("This cannot be undone. The device will need to be set up again via the captive portal. Continue?")) {
+        return;
+    }
+
+    const btn = document.getElementById("factory-reset-btn");
+    const statusEl = document.getElementById("reset-status");
+    btn.disabled = true;
+    statusEl.textContent = "Resetting…";
+    statusEl.className = "form-status text-warning";
+
+    const res = await apiCall("POST", "/system/factory-reset");
+    if (res && res.ok) {
+        statusEl.textContent = "Factory reset complete. Device is rebooting…";
+        statusEl.className = "form-status text-success";
+    } else {
+        statusEl.textContent = "Factory reset failed.";
+        statusEl.className = "form-status text-danger";
+        btn.disabled = false;
+    }
+}
+</script>
 {% endblock %}

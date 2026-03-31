@@ -1,0 +1,194 @@
+:root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --primary: #0f3460;
+    --accent: #e94560;
+    --text: #eee;
+    --text-muted: #999;
+    --success: #2ecc71;
+    --warning: #f39c12;
+    --danger: #e74c3c;
+    --radius: 8px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 2rem 1rem;
+}
+
+.setup-container {
+    width: 100%;
+    max-width: 440px;
+    margin-top: 2vh;
+}
+
+.brand {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+.brand h1 {
+    font-size: 2.5rem;
+    color: var(--accent);
+    font-weight: 700;
+    letter-spacing: -0.5px;
+}
+.brand p {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    margin-top: 0.25rem;
+}
+
+.card {
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+}
+.card h2 {
+    font-size: 1rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 1rem;
+}
+
+label {
+    display: block;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin-bottom: 0.25rem;
+    margin-top: 0.75rem;
+}
+label:first-child { margin-top: 0; }
+
+input, select {
+    width: 100%;
+    font: inherit;
+    padding: 0.6rem 0.75rem;
+    border-radius: var(--radius);
+    border: 1px solid var(--primary);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.95rem;
+}
+input:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+input::placeholder { color: var(--text-muted); opacity: 0.6; }
+
+.form-hint {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+.form-row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-end;
+}
+.form-row .grow { flex: 1; }
+.form-row .port { width: 90px; flex-shrink: 0; }
+
+.wifi-select-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-end;
+}
+.wifi-select-row select { flex: 1; }
+.wifi-select-row button {
+    flex-shrink: 0;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.9rem;
+}
+
+button {
+    font: inherit;
+    padding: 0.6rem 1.25rem;
+    border-radius: var(--radius);
+    border: none;
+    background: var(--primary);
+    color: var(--text);
+    cursor: pointer;
+    transition: background 0.2s;
+    font-size: 0.95rem;
+}
+button:hover { background: var(--accent); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:disabled:hover { background: var(--primary); }
+
+.btn-primary {
+    background: var(--accent);
+    width: 100%;
+    padding: 0.75rem;
+    font-size: 1rem;
+    font-weight: 600;
+    margin-top: 1.5rem;
+}
+.btn-primary:hover { opacity: 0.9; }
+
+.btn-scan {
+    background: var(--primary);
+    white-space: nowrap;
+}
+
+/* Signal strength indicator */
+.signal { font-size: 0.8rem; color: var(--text-muted); }
+.signal-good { color: var(--success); }
+.signal-fair { color: var(--warning); }
+.signal-weak { color: var(--danger); }
+
+/* Status messages */
+.status {
+    margin-top: 1rem;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+    display: none;
+}
+.status.success {
+    display: block;
+    background: rgba(46, 204, 113, 0.12);
+    border: 1px solid var(--success);
+    color: var(--success);
+}
+.status.error {
+    display: block;
+    background: rgba(231, 76, 60, 0.12);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+}
+.status.info {
+    display: block;
+    background: rgba(243, 156, 18, 0.12);
+    border: 1px solid var(--warning);
+    color: var(--warning);
+}
+
+/* Spinner */
+.spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--text-muted);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 0.5rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Lock icon for secured networks */
+.lock::after { content: " 🔒"; font-size: 0.75rem; }

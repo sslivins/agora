@@ -1,0 +1,22 @@
+[Unit]
+Description=Agora Provisioning (Captive Portal)
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=agora-api.service agora-player.service agora-cms-client.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/agora/src/provision/service.py
+WorkingDirectory=/opt/agora/src
+Environment=PYTHONPATH=/opt/agora/src
+Environment=AGORA_BASE=/opt/agora
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Needs root for port 80 and NetworkManager control
+User=root
+
+[Install]
+WantedBy=multi-user.target

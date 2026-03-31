@@ -1,6 +1,6 @@
 [Unit]
 Description=Agora API Service
-After=network-online.target
+After=network-online.target agora-provision.service
 Wants=network-online.target
 
 [Service]
