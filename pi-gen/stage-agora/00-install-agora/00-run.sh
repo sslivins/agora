@@ -59,32 +59,7 @@ systemctl enable rfkill-unblock-wifi
 # 3. Delete systemd-rfkill saved state so it doesn't restore the block on boot
 rm -f /var/lib/systemd/rfkill/*
 
-# ── DEBUG: USB gadget removed — USB port stays in host mode for Ethernet dongle ──
 mkdir -p /etc/NetworkManager/system-connections
-
-# ── DEBUG: WiFi credentials for development SSH access ──
-cat > /etc/NetworkManager/system-connections/debug-wifi.nmconnection <<'WIFIEOF'
-[connection]
-id=debug-wifi
-type=wifi
-autoconnect=true
-autoconnect-priority=100
-
-[wifi]
-ssid=y'all 2.4ghz
-mode=infrastructure
-
-[wifi-security]
-key-mgmt=wpa-psk
-psk=bricklebush
-
-[ipv4]
-method=auto
-
-[ipv6]
-method=auto
-WIFIEOF
-chmod 600 /etc/NetworkManager/system-connections/debug-wifi.nmconnection
 
 # ── DEBUG: Ensure console login on HDMI ──
 systemctl enable getty@tty1 2>/dev/null || true

@@ -42,15 +42,38 @@ def _read_portal_html() -> str:
     return (PROVISION_DIR / "templates" / "setup.html").read_text()
 
 
+@app.get("/hotspot-detect.html")
+async def apple_captive_detect():
+    """iOS/macOS captive portal detection.
+
+    Apple checks http://captive.apple.com/hotspot-detect.html and expects
+    '<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
+    when there is no captive portal. Return anything else to trigger the CNA.
+    """
+    return HTMLResponse(
+        '<HTML><HEAD><TITLE>Agora Setup</TITLE></HEAD><BODY>'
+        '<script>window.location="http://10.42.0.1/"</script></BODY></HTML>',
+        status_code=200,
+    )
+
+
 @app.get("/generate_204")
 @app.get("/gen_204")
-@app.get("/hotspot-detect.html")
+async def android_captive_detect():
+    """Android captive portal detection.
+
+    Android checks connectivity URLs and expects a 204. Returning a 302
+    redirect triggers the sign-in notification.
+    """
+    return RedirectResponse("/", status_code=302)
+
+
 @app.get("/ncsi.txt")
 @app.get("/connecttest.txt")
 @app.get("/redirect")
 @app.get("/canonical.html")
-async def captive_portal_redirect():
-    """Handle captive portal detection from Android, iOS, Windows, etc."""
+async def other_captive_detect():
+    """Windows/other captive portal detection."""
     return RedirectResponse("/", status_code=302)
 
 

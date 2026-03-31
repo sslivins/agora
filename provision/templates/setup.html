@@ -146,9 +146,11 @@
                 submitBtn.disabled = false;
             }
         } catch (err) {
-            statusEl.className = "status error";
-            statusEl.textContent = "Connection lost — the device may be switching networks. Try connecting to your Wi-Fi and accessing the device directly.";
-            submitBtn.disabled = false;
+            // The AP shuts down when the device switches to client mode,
+            // so losing the connection is the expected success signal.
+            statusEl.className = "status success";
+            statusEl.textContent = "Setup complete! The device is connecting to your Wi-Fi network. You can close this page and reconnect to your regular Wi-Fi.";
+            submitBtn.textContent = "Done";
         }
 
         return false;
