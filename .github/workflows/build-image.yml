@@ -45,7 +45,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
@@ -126,7 +126,7 @@ jobs:
           KEYBOARD_LAYOUT="English (US)"
           TIMEZONE_DEFAULT=${TIMEZONE}
           DEPLOY_COMPRESSION=xz
-          COMPRESSION_LEVEL=9
+          COMPRESSION_LEVEL=1
           STAGE_LIST="stage0 stage1 stage2 stage-agora"
           ENABLE_CLOUD_INIT=0
           EOF
@@ -149,7 +149,19 @@ jobs:
           sed -i 's/qemu-user-binfmt/qemu-user-static/g' build-docker.sh
           sed -i 's/which qemu-aarch64 /which qemu-aarch64-static /' build-docker.sh
 
+          # Keepalive: print timestamp every 5 min so GHA knows the build is alive
+          # (Docker can buffer output for long periods during QEMU emulation)
+          while true; do
+            sleep 300
+            echo "$(date -u '+%H:%M:%S') [keepalive] build still running..."
+          done &
+          KEEPALIVE_PID=$!
+
           ./build-docker.sh
+          BUILD_EXIT=$?
+
+          kill $KEEPALIVE_PID 2>/dev/null || true
+          exit $BUILD_EXIT
 
       - name: Find built image
         id: find-image
