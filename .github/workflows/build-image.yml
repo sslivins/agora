@@ -3,10 +3,6 @@ name: Build Pi Image
 on:
   workflow_dispatch:
     inputs:
-      image_name:
-        description: "Image filename (without extension)"
-        required: false
-        default: "agora-pi"
       timezone:
         description: "Timezone"
         required: false
@@ -72,7 +68,6 @@ jobs:
 
       - name: Configure pi-gen
         run: |
-          IMAGE_NAME="${{ github.event.inputs.image_name || 'agora-pi' }}"
           TIMEZONE="${{ github.event.inputs.timezone || 'America/New_York' }}"
 
           # Copy our custom stage into pi-gen tree
@@ -91,7 +86,7 @@ jobs:
 
           # Build config — explicit STAGE_LIST with correct ordering
           cat > /tmp/pi-gen/config <<EOF
-          IMG_NAME=${IMAGE_NAME}
+          IMG_NAME=agora-pi
           RELEASE=trixie
           TARGET_HOSTNAME=agora
           FIRST_USER_NAME=pi
@@ -132,22 +127,30 @@ jobs:
           kill $KEEPALIVE_PID 2>/dev/null || true
           exit $BUILD_EXIT
 
-      - name: Find built image
+      - name: Find and rename built image
         id: find-image
         run: |
-          IMAGE_PATH=$(find /tmp/pi-gen/deploy -name '*.img.xz' -o -name '*.img.gz' -o -name '*.img.zip' -o -name '*.img' | head -1)
-          if [ -z "$IMAGE_PATH" ]; then
+          SRC_PATH=$(find /tmp/pi-gen/deploy -name '*.img.xz' -o -name '*.img.gz' -o -name '*.img.zip' -o -name '*.img' | head -1)
+          if [ -z "$SRC_PATH" ]; then
             echo "ERROR: No image found in /tmp/pi-gen/deploy/"
             ls -laR /tmp/pi-gen/deploy/ || true
             exit 1
           fi
-          echo "image-path=$IMAGE_PATH" >> "$GITHUB_OUTPUT"
-          echo "Found image: $IMAGE_PATH"
+          echo "Found image: $SRC_PATH"
+
+          # Rename to version-based name: agora-v0.9.0-pi-zero2w.img.xz
+          VERSION="${{ steps.version.outputs.version }}"
+          EXT="${SRC_PATH#*.img}"
+          FINAL_NAME="agora-v${VERSION}-pi-zero2w.img${EXT}"
+          FINAL_PATH="/tmp/pi-gen/deploy/${FINAL_NAME}"
+          mv "$SRC_PATH" "$FINAL_PATH"
+          echo "Renamed to: $FINAL_NAME"
+          echo "image-path=$FINAL_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload image as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.image_name || 'agora-pi' }}-v${{ steps.version.outputs.version }}
+          name: agora-v${{ steps.version.outputs.version }}-pi-zero2w
           path: ${{ steps.find-image.outputs.image-path }}
           retention-days: 30
 
