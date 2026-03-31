@@ -6,7 +6,7 @@ info:
     playback control, CMS integration, and status monitoring. A separate player service
     handles GStreamer pipelines, and an optional CMS client connects to Agora CMS for
     centralized scheduling and fleet management.
-  version: 0.8.3
+  version: 0.9.0
   license:
     name: MIT
 
@@ -30,6 +30,8 @@ tags:
     description: Asset upload, listing, and management
   - name: cms
     description: CMS connection configuration
+  - name: system
+    description: System operations (factory reset)
 
 paths:
   /health:
@@ -305,6 +307,32 @@ paths:
                     type: integer
         "400":
           description: Server address is required.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /system/factory-reset:
+    post:
+      tags: [system]
+      summary: Factory reset the device
+      description: >
+        Perform a full factory reset: wipe all assets, Wi-Fi settings,
+        CMS configuration, and reboot the device into captive portal
+        setup mode.
+      operationId: factoryReset
+      responses:
+        "200":
+          description: Factory reset initiated. Device will reboot.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  message:
+                    type: string
+                    example: Factory reset complete. Device is rebooting.
         "401":
           $ref: "#/components/responses/Unauthorized"
 

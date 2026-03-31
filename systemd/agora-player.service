@@ -1,6 +1,6 @@
 [Unit]
 Description=Agora Media Player
-After=multi-user.target
+After=multi-user.target agora-provision.service
 Wants=network-online.target
 
 [Service]

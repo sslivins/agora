@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agora Setup</title>
+    <link rel="stylesheet" href="/static/setup.css">
+</head>
+<body>
+    <div class="setup-container">
+        <div class="brand">
+            <h1>Agora</h1>
+            <p>Device Setup</p>
+        </div>
+
+        <form id="setup-form" onsubmit="return submitSetup(event)">
+            <!-- Wi-Fi -->
+            <div class="card">
+                <h2>Wi-Fi Network</h2>
+                <label for="wifi-ssid">Network</label>
+                <div class="wifi-select-row">
+                    <select id="wifi-ssid" required>
+                        <option value="">Scanning…</option>
+                    </select>
+                    <button type="button" class="btn-scan" onclick="scanNetworks()" id="scan-btn">Scan</button>
+                </div>
+
+                <label for="wifi-password">Password</label>
+                <input type="password" id="wifi-password" placeholder="Enter Wi-Fi password">
+            </div>
+
+            <!-- CMS -->
+            <div class="card">
+                <h2>CMS Server <span style="font-size: 0.75rem; text-transform: none; font-weight: normal;">(optional)</span></h2>
+                <div class="form-row">
+                    <div class="grow">
+                        <label for="cms-host">Server Address</label>
+                        <input type="text" id="cms-host" placeholder="192.168.1.100">
+                    </div>
+                    <div class="port">
+                        <label for="cms-port">Port</label>
+                        <input type="number" id="cms-port" placeholder="8080" min="1" max="65535">
+                    </div>
+                </div>
+                <span class="form-hint">Leave blank to configure later in device settings.</span>
+            </div>
+
+            <!-- Device Name -->
+            <div class="card">
+                <h2>Device Name <span style="font-size: 0.75rem; text-transform: none; font-weight: normal;">(optional)</span></h2>
+                <label for="device-name">Name</label>
+                <input type="text" id="device-name" placeholder="e.g. lobby-display-01">
+                <span class="form-hint">A friendly name to identify this device.</span>
+            </div>
+
+            <div id="status" class="status"></div>
+
+            <button type="submit" class="btn-primary" id="submit-btn">Set Up Device</button>
+        </form>
+    </div>
+
+    <script>
+    /* ── Wi-Fi Scan ── */
+    async function scanNetworks() {
+        const select = document.getElementById("wifi-ssid");
+        const scanBtn = document.getElementById("scan-btn");
+
+        scanBtn.disabled = true;
+        scanBtn.textContent = "…";
+        select.innerHTML = '<option value="">Scanning…</option>';
+
+        try {
+            const res = await fetch("/api/wifi/scan");
+            const data = await res.json();
+
+            select.innerHTML = "";
+            if (data.networks.length === 0) {
+                select.innerHTML = '<option value="">No networks found</option>';
+            } else {
+                select.innerHTML = '<option value="">Select a network…</option>';
+                for (const net of data.networks) {
+                    const opt = document.createElement("option");
+                    opt.value = net.ssid;
+
+                    let signalIcon;
+                    if (net.signal >= 70) signalIcon = "▰▰▰";
+                    else if (net.signal >= 40) signalIcon = "▰▰▱";
+                    else signalIcon = "▰▱▱";
+
+                    const lock = net.security ? " 🔒" : "";
+                    opt.textContent = net.ssid + " " + signalIcon + lock;
+                    select.appendChild(opt);
+                }
+            }
+        } catch (e) {
+            select.innerHTML = '<option value="">Scan failed — try again</option>';
+        }
+
+        scanBtn.disabled = false;
+        scanBtn.textContent = "Scan";
+    }
+
+    /* ── Provision Submit ── */
+    async function submitSetup(e) {
+        e.preventDefault();
+        const statusEl = document.getElementById("status");
+        const submitBtn = document.getElementById("submit-btn");
+
+        const wifiSsid = document.getElementById("wifi-ssid").value;
+        if (!wifiSsid) {
+            statusEl.className = "status error";
+            statusEl.textContent = "Please select a Wi-Fi network.";
+            return false;
+        }
+
+        submitBtn.disabled = true;
+        statusEl.className = "status info";
+        statusEl.innerHTML = '<span class="spinner"></span>Connecting to Wi-Fi…';
+
+        try {
+            const res = await fetch("/api/provision", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    wifi_ssid: wifiSsid,
+                    wifi_password: document.getElementById("wifi-password").value,
+                    cms_host: document.getElementById("cms-host").value.trim(),
+                    cms_port: parseInt(document.getElementById("cms-port").value) || 8080,
+                    device_name: document.getElementById("device-name").value.trim(),
+                }),
+            });
+            const data = await res.json();
+
+            if (data.success) {
+                statusEl.className = "status success";
+                statusEl.textContent = "Setup complete! The device is now connecting to your network. This page will close shortly.";
+                submitBtn.textContent = "Done";
+            } else {
+                statusEl.className = "status error";
+                statusEl.textContent = data.error || "Setup failed.";
+                submitBtn.disabled = false;
+            }
+        } catch (err) {
+            statusEl.className = "status error";
+            statusEl.textContent = "Connection lost — the device may be switching networks. Try connecting to your Wi-Fi and accessing the device directly.";
+            submitBtn.disabled = false;
+        }
+
+        return false;
+    }
+
+    /* ── Auto-scan on page load ── */
+    scanNetworks();
+    </script>
+</body>
+</html>
