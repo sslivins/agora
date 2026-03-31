@@ -27,6 +27,35 @@ systemctl disable agora-player 2>/dev/null || true
 # ── DEBUG: Show boot messages on console (remove quiet/splash) ──
 sed -i 's/ quiet//g; s/ splash//g' /boot/firmware/cmdline.txt 2>/dev/null || true
 
+# ── Unblock WiFi radio (rfkill soft-blocks it by default on Pi OS) ──
+rfkill unblock wifi 2>/dev/null || true
+
+# Ensure WiFi is unblocked on every boot via NetworkManager dispatcher
+mkdir -p /etc/NetworkManager/dispatcher.d
+cat > /etc/NetworkManager/dispatcher.d/pre-up.d/10-unblock-wifi <<'RFKEOF'
+#!/bin/bash
+rfkill unblock wifi
+RFKEOF
+chmod +x /etc/NetworkManager/dispatcher.d/pre-up.d/10-unblock-wifi
+
+# Also create a one-shot service that runs before NM to unblock wifi
+cat > /etc/systemd/system/rfkill-unblock-wifi.service <<'RFKSVC'
+[Unit]
+Description=Unblock WiFi radio
+DefaultDependencies=no
+Before=NetworkManager.service
+After=systemd-rfkill.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/rfkill unblock wifi
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+RFKSVC
+systemctl enable rfkill-unblock-wifi
+
 # ── DEBUG: USB gadget removed — USB port stays in host mode for Ethernet dongle ──
 mkdir -p /etc/NetworkManager/system-connections
 
