@@ -21,12 +21,6 @@ rm -f /etc/xdg/autostart/piwiz.desktop 2>/dev/null || true
 # ── Enable SSH (disabled by default on Pi OS) ──
 systemctl enable ssh
 
-# ── DEBUG: Disable player so console stays visible on HDMI ──
-systemctl disable agora-player 2>/dev/null || true
-
-# ── DEBUG: Show boot messages on console (remove quiet/splash) ──
-sed -i 's/ quiet//g; s/ splash//g' /boot/firmware/cmdline.txt 2>/dev/null || true
-
 # ── Unblock WiFi radio (Pi OS soft-blocks it via rfkill + NM state file) ──
 # 1. Write NM state file with WiFi enabled (NM honors this over rfkill)
 mkdir -p /var/lib/NetworkManager
@@ -60,46 +54,6 @@ systemctl enable rfkill-unblock-wifi
 rm -f /var/lib/systemd/rfkill/*
 
 mkdir -p /etc/NetworkManager/system-connections
-
-# ── DEBUG: Ensure console login on HDMI ──
-systemctl enable getty@tty1 2>/dev/null || true
-
-# ── DEBUG: Dump logs to boot partition (readable from Windows) ──
-cat > /usr/local/bin/agora-debug-dump.sh <<'DUMPEOF'
-#!/bin/bash
-# Wait for boot to settle
-sleep 30
-LOGDIR=/boot/firmware/debug-logs
-mkdir -p "$LOGDIR"
-journalctl --no-pager > "$LOGDIR/journal.txt" 2>&1
-journalctl -u agora-provision --no-pager > "$LOGDIR/provision.txt" 2>&1
-journalctl -u NetworkManager --no-pager > "$LOGDIR/networkmanager.txt" 2>&1
-nmcli device > "$LOGDIR/nmcli-device.txt" 2>&1
-nmcli connection show > "$LOGDIR/nmcli-connections.txt" 2>&1
-ip addr > "$LOGDIR/ip-addr.txt" 2>&1
-systemctl list-units --failed > "$LOGDIR/failed-units.txt" 2>&1
-dmesg > "$LOGDIR/dmesg.txt" 2>&1
-echo "Debug dump complete at $(date)" > "$LOGDIR/done.txt"
-sync
-DUMPEOF
-chmod +x /usr/local/bin/agora-debug-dump.sh
-
-# Create a systemd service for the debug dump
-cat > /etc/systemd/system/agora-debug-dump.service <<'SVCEOF'
-[Unit]
-Description=Agora Debug Log Dump
-After=agora-provision.service NetworkManager.service
-Wants=agora-provision.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/agora-debug-dump.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-systemctl enable agora-debug-dump
 
 # ── Clean up ──
 apt-get clean
