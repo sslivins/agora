@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 500 * 1024 * 1024  # 500 MB
 
     # Device
-    device_name: str = "agora-node"
+    device_name: str = ""
 
     # Splash
     default_splash: str = "splash/default.png"
@@ -114,4 +114,22 @@ def load_settings() -> Settings:
             overrides = json.loads(boot_config.read_text())
         except (json.JSONDecodeError, OSError):
             pass
-    return Settings(**overrides)
+
+    # Check persist file (set via captive portal provisioning)
+    persist_name = Path("/opt/agora/persist/device_name")
+    if not overrides.get("device_name"):
+        try:
+            name = persist_name.read_text().strip()
+            if name:
+                overrides["device_name"] = name
+        except (FileNotFoundError, OSError):
+            pass
+
+    settings = Settings(**overrides)
+
+    # Generate unique default if still empty
+    if not settings.device_name:
+        from shared.identity import get_device_serial_suffix
+        settings.device_name = f"agora-node-{get_device_serial_suffix(4)}"
+
+    return settings

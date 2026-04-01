@@ -45,19 +45,11 @@ class AuthRejectedError(Exception):
 
 def _get_device_id() -> str:
     """Read the Pi CPU serial number as device identity."""
-    try:
-        with open("/sys/firmware/devicetree/base/serial-number") as f:
-            return f.read().strip().strip("\x00")
-    except OSError:
-        pass
-    try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("Serial"):
-                return line.split(":")[1].strip()
-    except OSError:
-        pass
-    logger.error("Cannot determine device serial number")
-    return "unknown"
+    from shared.identity import get_device_serial
+    serial = get_device_serial()
+    if serial == "unknown":
+        logger.error("Cannot determine device serial number")
+    return serial
 
 
 def _get_storage_mb(path: Path) -> tuple[int, int]:
@@ -315,12 +307,16 @@ class CMSClient:
             self._write_cms_status("connected", registration=reg)
             cap_mb, used_mb = _get_storage_mb(self.settings.assets_dir)
 
+            # Name is "custom" if the user explicitly set it via captive portal
+            name_is_custom = self.settings.persist_dir.joinpath("device_name").exists()
             register_msg = {
                 "type": "register",
                 "protocol_version": PROTOCOL_VERSION,
                 "device_id": self.device_id,
                 "auth_token": auth_token,
                 "firmware_version": self._get_version(),
+                "device_name": self.settings.device_name,
+                "device_name_custom": name_is_custom,
                 "device_type": _get_device_type(),
                 "ip_address": _get_local_ip(),
                 "storage_capacity_mb": cap_mb,
