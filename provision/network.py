@@ -15,22 +15,7 @@ class WifiNetwork:
     security: str  # e.g. "WPA2", "WPA3", "OWE", ""
 
 
-def get_device_serial_suffix(length: int = 4) -> str:
-    """Return last N hex chars of the Pi serial number for unique SSID."""
-    try:
-        with open("/sys/firmware/devicetree/base/serial-number") as f:
-            serial = f.read().strip().strip("\x00")
-            return serial[-length:].upper()
-    except OSError:
-        pass
-    try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("Serial"):
-                serial = line.split(":")[1].strip()
-                return serial[-length:].upper()
-    except OSError:
-        pass
-    return "0000"
+from shared.identity import get_device_serial_suffix  # noqa: E402 — re-export
 
 
 def _run(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:

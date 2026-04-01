@@ -54,7 +54,7 @@ if [ ! -f "${BOOT_CONFIG}" ]; then
     "web_username": "admin",
     "web_password": "agora",
     "secret_key": "${SECRET_KEY}",
-    "device_name": "$(hostname)",
+    "device_name": "",
     "default_splash": "splash/default.png"
 }
 EOF

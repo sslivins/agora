@@ -11,7 +11,7 @@ class TestSettings:
         assert s.web_username == "admin"
         assert s.web_password == "agora"
         assert s.max_upload_bytes == 500 * 1024 * 1024
-        assert s.device_name == "agora-node"
+        assert s.device_name == ""
         assert s.cms_url == ""
 
     def test_derived_paths(self, tmp_path):
