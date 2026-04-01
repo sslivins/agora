@@ -410,6 +410,8 @@ class CMSClient:
                     "uptime_seconds": int(time.monotonic()),
                     "storage_used_mb": used_mb,
                     "cpu_temp_c": _get_cpu_temp(),
+                    "error": current_data.get("error"),
+                    "error_timestamp": current_data.get("updated_at") if current_data.get("error") else None,
                 }
                 await ws.send(json.dumps(status_msg))
             except websockets.ConnectionClosed:
