@@ -19,14 +19,14 @@
                 <h2>Wi-Fi Network</h2>
                 <label for="wifi-ssid">Network</label>
                 <div class="wifi-select-row">
-                    <select id="wifi-ssid" required>
+                    <select id="wifi-ssid" required autofocus>
                         <option value="">Scanning…</option>
                     </select>
                     <button type="button" class="btn-scan" onclick="scanNetworks()" id="scan-btn">Scan</button>
                 </div>
 
                 <label for="wifi-password">Password</label>
-                <input type="password" id="wifi-password" placeholder="Enter Wi-Fi password">
+                <input type="password" id="wifi-password" placeholder="Enter Wi-Fi password" autocomplete="off" data-1p-ignore data-lpignore="true">
             </div>
 
             <!-- CMS -->
