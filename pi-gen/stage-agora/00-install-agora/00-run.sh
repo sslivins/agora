@@ -55,6 +55,13 @@ rm -f /var/lib/systemd/rfkill/*
 
 mkdir -p /etc/NetworkManager/system-connections
 
+# ── Fix HDMI display output for KMS driver ──
+# disable_fw_kms_setup=1 (pi-gen default) prevents firmware from passing display
+# mode info to the vc4-kms-v3d kernel driver, causing kmssink to fail.
+sed -i 's/^disable_fw_kms_setup=1/disable_fw_kms_setup=0/' /boot/firmware/config.txt 2>/dev/null || true
+# Force HDMI connector detection with 1080p mode on kernel cmdline
+sed -i 's/rootwait/rootwait video=HDMI-A-1:1920x1080@60D/' /boot/firmware/cmdline.txt 2>/dev/null || true
+
 # ── Clean up ──
 apt-get clean
 rm -rf /var/lib/apt/lists/*
