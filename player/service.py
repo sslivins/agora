@@ -31,6 +31,12 @@ class AgoraPlayer:
         'alsasink device="hdmi:CARD=vc4hdmi,DEV=0"'
     )
 
+    VIDEO_PIPELINE_NO_AUDIO = (
+        'filesrc location="{path}" ! '
+        "qtdemux name=dmux "
+        "dmux.video_0 ! queue ! h264parse ! v4l2h264dec ! kmssink sync=false"
+    )
+
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
         "jpegparse ! jpegdec ! videoconvert ! videoscale add-borders=true ! "
@@ -101,6 +107,20 @@ class AgoraPlayer:
 
     # ── Pipeline management ──
 
+    @staticmethod
+    def _has_audio(path: Path) -> bool:
+        """Return True if the video file contains an audio stream."""
+        gi.require_version("GstPbutils", "1.0")
+        from gi.repository import GstPbutils
+
+        try:
+            discoverer = GstPbutils.Discoverer.new(5 * Gst.SECOND)
+            info = discoverer.discover_uri(path.as_uri())
+            return len(info.get_audio_streams()) > 0
+        except Exception:
+            # If discovery fails, assume audio exists (safer default)
+            return True
+
     def _teardown(self) -> None:
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
@@ -108,7 +128,11 @@ class AgoraPlayer:
 
     def _build_pipeline(self, path: Path, is_video: bool) -> Gst.Pipeline:
         if is_video:
-            pipeline_str = self.VIDEO_PIPELINE.format(path=path)
+            if self._has_audio(path):
+                pipeline_str = self.VIDEO_PIPELINE.format(path=path)
+            else:
+                logger.info("No audio track detected, using video-only pipeline")
+                pipeline_str = self.VIDEO_PIPELINE_NO_AUDIO.format(path=path)
         elif path.suffix.lower() in (".jpg", ".jpeg"):
             pipeline_str = self.IMAGE_PIPELINE_JPEG.format(path=path)
         else:
@@ -243,6 +267,35 @@ class AgoraPlayer:
             self.pipeline = self._build_pipeline(path, is_video)
             self.pipeline.set_state(Gst.State.PLAYING)
             self._update_current(mode=PlaybackMode.PLAY, asset=desired.asset)
+            # Schedule a health check to verify the pipeline actually started
+            GLib.timeout_add_seconds(
+                5, self._check_pipeline_health, desired.asset,
+            )
+
+    def _check_pipeline_health(self, asset_name: str) -> bool:
+        """Verify the pipeline reached PLAYING state. Returns False (no repeat)."""
+        if not self.pipeline:
+            return False
+        # Only check if we're still supposed to be playing this asset
+        if (
+            not self.current_desired
+            or self.current_desired.asset != asset_name
+            or self.current_desired.mode != PlaybackMode.PLAY
+        ):
+            return False
+
+        _, state, _ = self.pipeline.get_state(0)
+        if state != Gst.State.PLAYING:
+            logger.error(
+                "Pipeline health check failed for %s: state is %s (expected PLAYING)",
+                asset_name, state.value_nick if state else "NULL",
+            )
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=asset_name,
+                error=f"Pipeline failed to reach PLAYING state ({state.value_nick if state else 'NULL'})",
+            )
+        return False
 
     # ── State file watcher ──
 
