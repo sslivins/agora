@@ -389,34 +389,38 @@ class CMSClient:
                 except asyncio.CancelledError:
                     pass
 
+    async def _send_status(self) -> None:
+        """Build and send a single status heartbeat."""
+        try:
+            current_data = json.loads(self.settings.current_state_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            current_data = {}
+
+        _, used_mb = _get_storage_mb(self.settings.assets_dir)
+
+        status_msg = {
+            "type": "status",
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "mode": current_data.get("mode", "splash"),
+            "asset": current_data.get("asset"),
+            "pipeline_state": current_data.get("pipeline_state", "NULL"),
+            "started_at": current_data.get("started_at"),
+            "playback_position_ms": current_data.get("playback_position_ms"),
+            "uptime_seconds": int(time.monotonic()),
+            "storage_used_mb": used_mb,
+            "cpu_temp_c": _get_cpu_temp(),
+            "error": current_data.get("error"),
+            "error_timestamp": current_data.get("updated_at") if current_data.get("error") else None,
+        }
+        await self._ws.send(json.dumps(status_msg))
+
     async def _status_loop(self, ws) -> None:
         """Send periodic status heartbeats."""
         while True:
             await asyncio.sleep(STATUS_INTERVAL)
             try:
-                try:
-                    current_data = json.loads(self.settings.current_state_path.read_text())
-                except (FileNotFoundError, json.JSONDecodeError):
-                    current_data = {}
-
-                _, used_mb = _get_storage_mb(self.settings.assets_dir)
-
-                status_msg = {
-                    "type": "status",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "device_id": self.device_id,
-                    "mode": current_data.get("mode", "splash"),
-                    "asset": current_data.get("asset"),
-                    "pipeline_state": current_data.get("pipeline_state", "NULL"),
-                    "started_at": current_data.get("started_at"),
-                    "playback_position_ms": current_data.get("playback_position_ms"),
-                    "uptime_seconds": int(time.monotonic()),
-                    "storage_used_mb": used_mb,
-                    "cpu_temp_c": _get_cpu_temp(),
-                    "error": current_data.get("error"),
-                    "error_timestamp": current_data.get("updated_at") if current_data.get("error") else None,
-                }
-                await ws.send(json.dumps(status_msg))
+                await self._send_status()
             except websockets.ConnectionClosed:
                 raise
             except Exception:
@@ -432,7 +436,7 @@ class CMSClient:
     # ── Sync handling ──
 
     async def _handle_sync(self, msg: dict) -> None:
-        """CMS sent full schedule sync — cache and evaluate."""
+        """CMS sent full schedule sync — cache, evaluate, and report status."""
         logger.info("Received sync from CMS (%d schedules)", len(msg.get("schedules", [])))
 
         try:
@@ -440,7 +444,17 @@ class CMSClient:
         except Exception:
             logger.exception("Failed to cache schedule.json")
 
+        prev_state = self._last_eval_state
         self._evaluate_schedule(msg)
+
+        # If the schedule evaluation changed desired state, send an immediate
+        # status so the CMS dashboard updates without waiting for the next heartbeat.
+        if self._last_eval_state != prev_state:
+            await asyncio.sleep(2)  # brief delay for player to start
+            try:
+                await self._send_status()
+            except Exception:
+                logger.debug("Failed to send post-sync status", exc_info=True)
 
     def _evaluate_schedule(self, sync_data: dict) -> None:
         """Evaluate the cached schedule and update desired state."""
