@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -174,8 +175,27 @@ class AgoraPlayer:
         bus.add_signal_watch()
         bus.connect("message::eos", self._on_eos)
         bus.connect("message::error", self._on_error)
+        bus.connect("message::state-changed", self._on_state_changed)
 
         return pipeline
+
+    def _on_state_changed(self, bus, message) -> None:
+        """Track pipeline state transitions and update current.json."""
+        # Only react to pipeline-level state changes, not individual elements
+        if message.src != self.pipeline:
+            return
+        old, new, _pending = message.parse_state_changed()
+        new_name = new.value_nick.upper()
+        logger.debug("Pipeline state: %s -> %s", old.value_nick, new_name)
+
+        if new == Gst.State.PLAYING and self.current_desired:
+            started = datetime.now(timezone.utc)
+            mode = self.current_desired.mode
+            asset = self.current_desired.asset
+            self._update_current(
+                mode=mode, asset=asset, started_at=started,
+            )
+            logger.info("Pipeline reached PLAYING for %s", asset)
 
     def _on_eos(self, bus, message) -> None:
         logger.info("EOS received")
@@ -225,6 +245,7 @@ class AgoraPlayer:
         mode: PlaybackMode = PlaybackMode.STOP,
         asset: Optional[str] = None,
         error: Optional[str] = None,
+        started_at: Optional[datetime] = None,
     ) -> None:
         pipeline_state = "NULL"
         if self.pipeline:
@@ -238,6 +259,7 @@ class AgoraPlayer:
             mode=mode,
             asset=asset,
             loop=self.current_desired.loop if self.current_desired else False,
+            started_at=started_at,
             pipeline_state=pipeline_state,
             error=error,
         )
@@ -319,11 +341,11 @@ class AgoraPlayer:
                 "Pipeline health check failed for %s: state is %s (expected PLAYING)",
                 asset_name, state.value_nick if state else "NULL",
             )
+            self._teardown()
             self._update_current(
-                mode=PlaybackMode.PLAY,
-                asset=asset_name,
                 error=f"Pipeline failed to reach PLAYING state ({state.value_nick if state else 'NULL'})",
             )
+            GLib.timeout_add_seconds(3, self._show_splash)
         return False
 
     # ── State file watcher ──

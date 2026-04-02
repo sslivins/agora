@@ -74,9 +74,10 @@ class TestPipelineSelection:
 class TestPipelineHealthCheck:
     """Verify _check_pipeline_health reports errors when pipeline fails to start."""
 
-    def test_reports_error_when_not_playing(self, player, tmp_path):
-        """Pipeline stuck in PAUSED should report an error."""
-        with patch("player.service.Gst") as mock_gst:
+    def test_reports_error_and_recovers_when_not_playing(self, player, tmp_path):
+        """Pipeline stuck in PAUSED should report an error and recover to splash."""
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib:
             mock_gst.State.PLAYING = "PLAYING"
 
             mock_state = MagicMock()
@@ -90,12 +91,15 @@ class TestPipelineHealthCheck:
                 mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
             )
 
-            with patch.object(player, "_update_current") as mock_update:
+            with patch.object(player, "_update_current") as mock_update, \
+                 patch.object(player, "_show_splash"):
                 player._check_pipeline_health("test.mp4")
                 mock_update.assert_called_once()
                 call_kwargs = mock_update.call_args[1]
                 assert call_kwargs["error"] is not None
                 assert "PLAYING" in call_kwargs["error"]
+                # Should schedule splash recovery
+                mock_glib.timeout_add_seconds.assert_called_once()
 
     def test_no_error_when_pipeline_is_playing(self, player, tmp_path):
         """Pipeline in PLAYING state should not report an error."""
@@ -212,3 +216,76 @@ class TestHasAudio:
             mock_gst.parse_launch.side_effect = Exception("pipeline error")
 
             assert player._has_audio(Path("/fake/video.mp4")) is True
+
+
+class TestStateChanged:
+    """Verify _on_state_changed updates current.json with accurate pipeline state."""
+
+    def test_updates_state_when_pipeline_reaches_playing(self, player):
+        """When pipeline reaches PLAYING, current.json should reflect that with started_at."""
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.PLAYING = "PLAYING"
+
+            mock_pipeline = MagicMock()
+            player.pipeline = mock_pipeline
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+            )
+
+            # Build a mock bus message from the pipeline itself
+            mock_message = MagicMock()
+            mock_message.src = mock_pipeline
+            new_state = MagicMock()
+            new_state.value_nick = "playing"
+            old_state = MagicMock()
+            old_state.value_nick = "paused"
+            mock_message.parse_state_changed.return_value = (old_state, new_state, None)
+
+            # new state == Gst.State.PLAYING
+            new_state.__eq__ = lambda self, other: other == "PLAYING"
+
+            with patch.object(player, "_update_current") as mock_update:
+                player._on_state_changed(None, mock_message)
+                mock_update.assert_called_once()
+                call_kwargs = mock_update.call_args[1]
+                assert call_kwargs["mode"] == PlaybackMode.PLAY
+                assert call_kwargs["asset"] == "test.mp4"
+                assert call_kwargs["started_at"] is not None
+
+    def test_ignores_element_state_changes(self, player):
+        """State changes from child elements (not the pipeline) should be ignored."""
+        mock_pipeline = MagicMock()
+        player.pipeline = mock_pipeline
+
+        mock_message = MagicMock()
+        mock_message.src = MagicMock()  # Different object than pipeline
+
+        with patch.object(player, "_update_current") as mock_update:
+            player._on_state_changed(None, mock_message)
+            mock_update.assert_not_called()
+
+    def test_ignores_non_playing_transitions(self, player):
+        """Transitions to states other than PLAYING should not update current.json."""
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.PLAYING = "PLAYING"
+
+            mock_pipeline = MagicMock()
+            player.pipeline = mock_pipeline
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+            )
+
+            mock_message = MagicMock()
+            mock_message.src = mock_pipeline
+            new_state = MagicMock()
+            new_state.value_nick = "paused"
+            old_state = MagicMock()
+            old_state.value_nick = "ready"
+            mock_message.parse_state_changed.return_value = (old_state, new_state, None)
+
+            # new state != Gst.State.PLAYING
+            new_state.__eq__ = lambda self, other: False
+
+            with patch.object(player, "_update_current") as mock_update:
+                player._on_state_changed(None, mock_message)
+                mock_update.assert_not_called()
