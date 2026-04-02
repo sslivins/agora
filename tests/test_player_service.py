@@ -289,3 +289,67 @@ class TestStateChanged:
             with patch.object(player, "_update_current") as mock_update:
                 player._on_state_changed(None, mock_message)
                 mock_update.assert_not_called()
+
+
+class TestPlaybackPosition:
+    """Verify playback position querying and periodic updates."""
+
+    def test_query_position_ms_returns_milliseconds(self, player):
+        """Position in nanoseconds should be converted to milliseconds."""
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.Format.TIME = "TIME"
+            mock_pipeline = MagicMock()
+            # 5 seconds = 5_000_000_000 nanoseconds
+            mock_pipeline.query_position.return_value = (True, 5_000_000_000)
+            player.pipeline = mock_pipeline
+
+            assert player._query_position_ms() == 5000
+
+    def test_query_position_ms_returns_none_when_no_pipeline(self, player):
+        """Should return None when no pipeline exists."""
+        player.pipeline = None
+        assert player._query_position_ms() is None
+
+    def test_query_position_ms_returns_none_on_failure(self, player):
+        """Should return None when query fails."""
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.Format.TIME = "TIME"
+            mock_pipeline = MagicMock()
+            mock_pipeline.query_position.return_value = (False, -1)
+            player.pipeline = mock_pipeline
+
+            assert player._query_position_ms() is None
+
+    def test_update_position_stops_when_not_playing(self, player):
+        """Timer should stop (return False) when not in PLAY mode."""
+        player.pipeline = MagicMock()
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.SPLASH, asset=None, loop=False
+        )
+        assert player._update_position() is False
+
+    def test_update_position_writes_to_state_file(self, player, tmp_path):
+        """Timer should update playback_position_ms in current.json."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.PLAY, asset="test.mp4",
+            pipeline_state="PLAYING", playback_position_ms=1000,
+        )
+        write_state(state_file, initial)
+
+        player.pipeline = MagicMock()
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(player, "_query_position_ms", return_value=5000):
+            result = player._update_position()
+
+        assert result is True
+        import json
+        data = json.loads(state_file.read_text())
+        assert data["playback_position_ms"] == 5000

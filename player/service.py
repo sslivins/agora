@@ -240,6 +240,18 @@ class AgoraPlayer:
 
     # ── State management ──
 
+    def _query_position_ms(self) -> Optional[int]:
+        """Query current playback position from the GStreamer pipeline."""
+        if not self.pipeline:
+            return None
+        try:
+            ok, pos = self.pipeline.query_position(Gst.Format.TIME)
+            if ok and pos >= 0:
+                return pos // 1_000_000  # nanoseconds → milliseconds
+        except Exception:
+            pass
+        return None
+
     def _update_current(
         self,
         mode: PlaybackMode = PlaybackMode.STOP,
@@ -260,10 +272,30 @@ class AgoraPlayer:
             asset=asset,
             loop=self.current_desired.loop if self.current_desired else False,
             started_at=started_at,
+            playback_position_ms=self._query_position_ms(),
             pipeline_state=pipeline_state,
             error=error,
         )
         write_state(self.current_path, state)
+
+    def _update_position(self) -> bool:
+        """Periodic callback to update playback position in current.json."""
+        if (
+            not self.pipeline
+            or not self.current_desired
+            or self.current_desired.mode != PlaybackMode.PLAY
+        ):
+            return False  # Stop the timer
+        try:
+            current = read_state(self.current_path, CurrentState)
+            pos = self._query_position_ms()
+            if pos is not None and current.playback_position_ms != pos:
+                current.playback_position_ms = pos
+                current.updated_at = datetime.now(timezone.utc)
+                write_state(self.current_path, current)
+        except Exception:
+            logger.debug("Failed to update playback position")
+        return True  # Keep the timer running
 
     def apply_desired(self) -> None:
         """Read desired state and apply it to the player."""
@@ -322,6 +354,8 @@ class AgoraPlayer:
             GLib.timeout_add_seconds(
                 5, self._check_pipeline_health, desired.asset,
             )
+            # Periodic position updates for CMS status reporting
+            GLib.timeout_add_seconds(10, self._update_position)
 
     def _check_pipeline_health(self, asset_name: str) -> bool:
         """Verify the pipeline reached PLAYING state. Returns False (no repeat)."""

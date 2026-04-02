@@ -25,6 +25,7 @@ class CurrentState(BaseModel):
     asset: Optional[str] = None
     loop: bool = False
     started_at: Optional[datetime] = None
+    playback_position_ms: Optional[int] = None
     pipeline_state: str = "NULL"
     error: Optional[str] = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
