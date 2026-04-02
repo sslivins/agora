@@ -1,7 +1,7 @@
 """Tests for player service — pipeline selection logic."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch, PropertyMock, call
 
 import pytest
 
@@ -126,3 +126,89 @@ class TestPipelineHealthCheck:
         with patch.object(player, "_update_current") as mock_update:
             player._check_pipeline_health("test.mp4")
             mock_update.assert_not_called()
+
+
+class TestHasAudio:
+    """Verify _has_audio detects audio streams via qtdemux pad inspection."""
+
+    def _make_player(self):
+        """Create a minimal player instance for _has_audio testing."""
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import player.service as svc
+            importlib.reload(svc)
+            return svc.AgoraPlayer.__new__(svc.AgoraPlayer), svc
+
+    def test_returns_true_when_audio_pad_found(self):
+        player, svc = self._make_player()
+
+        mock_pipe = MagicMock()
+        mock_dmux = MagicMock()
+        mock_pipe.get_by_name.return_value = mock_dmux
+
+        # Capture the signal handlers when dmux.connect() is called
+        handlers = {}
+        def capture_connect(signal_name, handler):
+            handlers[signal_name] = handler
+        mock_dmux.connect.side_effect = capture_connect
+
+        mock_ctx = MagicMock()
+        def fire_pads(*_args, **_kwargs):
+            # Simulate qtdemux discovering pads
+            mock_pad = MagicMock()
+            mock_pad.get_name.return_value = "video_0"
+            handlers["pad-added"](mock_dmux, mock_pad)
+            mock_pad2 = MagicMock()
+            mock_pad2.get_name.return_value = "audio_0"
+            handlers["pad-added"](mock_dmux, mock_pad2)
+            handlers["no-more-pads"](mock_dmux)
+            return True
+        mock_ctx.iteration.side_effect = fire_pads
+
+        with patch.object(svc, "Gst") as mock_gst, \
+             patch.object(svc, "GLib") as mock_glib:
+            mock_gst.parse_launch.return_value = mock_pipe
+            mock_glib.MainContext.default.return_value = mock_ctx
+
+            assert player._has_audio(Path("/fake/video.mp4")) is True
+            mock_pipe.set_state.assert_any_call(mock_gst.State.NULL)
+
+    def test_returns_false_when_no_audio_pad(self):
+        player, svc = self._make_player()
+
+        mock_pipe = MagicMock()
+        mock_dmux = MagicMock()
+        mock_pipe.get_by_name.return_value = mock_dmux
+
+        handlers = {}
+        def capture_connect(signal_name, handler):
+            handlers[signal_name] = handler
+        mock_dmux.connect.side_effect = capture_connect
+
+        mock_ctx = MagicMock()
+        def fire_pads(*_args, **_kwargs):
+            mock_pad = MagicMock()
+            mock_pad.get_name.return_value = "video_0"
+            handlers["pad-added"](mock_dmux, mock_pad)
+            handlers["no-more-pads"](mock_dmux)
+            return True
+        mock_ctx.iteration.side_effect = fire_pads
+
+        with patch.object(svc, "Gst") as mock_gst, \
+             patch.object(svc, "GLib") as mock_glib:
+            mock_gst.parse_launch.return_value = mock_pipe
+            mock_glib.MainContext.default.return_value = mock_ctx
+
+            assert player._has_audio(Path("/fake/video.mp4")) is False
+
+    def test_returns_true_on_exception(self):
+        """If qtdemux fails, assume audio exists as a safe default."""
+        player, svc = self._make_player()
+
+        with patch.object(svc, "Gst") as mock_gst:
+            mock_gst.parse_launch.side_effect = Exception("pipeline error")
+
+            assert player._has_audio(Path("/fake/video.mp4")) is True

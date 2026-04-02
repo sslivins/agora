@@ -109,16 +109,45 @@ class AgoraPlayer:
 
     @staticmethod
     def _has_audio(path: Path) -> bool:
-        """Return True if the video file contains an audio stream."""
-        gi.require_version("GstPbutils", "1.0")
-        from gi.repository import GstPbutils
+        """Return True if the video file contains an audio stream.
+
+        Uses qtdemux to inspect container pads instead of GstPbutils Discoverer,
+        which allocates a v4l2 hardware decoder and exhausts the single decoder
+        slot on Pi Zero 2W, causing 'Failed to allocate required memory' errors.
+        """
+        import time
 
         try:
-            discoverer = GstPbutils.Discoverer.new(5 * Gst.SECOND)
-            info = discoverer.discover_uri(path.as_uri())
-            return len(info.get_audio_streams()) > 0
+            pipe = Gst.parse_launch(
+                f'filesrc location="{path}" ! qtdemux name=dmux'
+            )
+            dmux = pipe.get_by_name("dmux")
+
+            found_audio = [False]
+            no_more = [False]
+
+            def on_pad_added(_element, pad):
+                if "audio" in pad.get_name():
+                    found_audio[0] = True
+
+            def on_no_more_pads(_element):
+                no_more[0] = True
+
+            dmux.connect("pad-added", on_pad_added)
+            dmux.connect("no-more-pads", on_no_more_pads)
+
+            pipe.set_state(Gst.State.PAUSED)
+
+            start = time.monotonic()
+            ctx = GLib.MainContext.default()
+            while not no_more[0] and (time.monotonic() - start) < 3:
+                ctx.iteration(False)
+                time.sleep(0.01)
+
+            pipe.set_state(Gst.State.NULL)
+            return found_audio[0]
         except Exception:
-            # If discovery fails, assume audio exists (safer default)
+            logger.warning("Audio detection failed, assuming audio present")
             return True
 
     def _teardown(self) -> None:
