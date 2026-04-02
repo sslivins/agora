@@ -444,6 +444,16 @@ class CMSClient:
         except Exception:
             logger.exception("Failed to cache schedule.json")
 
+        # Persist the CMS-assigned splash so the player uses it on reboot
+        splash = msg.get("splash")
+        try:
+            if splash:
+                atomic_write(self.settings.splash_config_path, splash)
+            elif self.settings.splash_config_path.is_file():
+                self.settings.splash_config_path.unlink()
+        except Exception:
+            logger.debug("Failed to update splash config", exc_info=True)
+
         prev_state = self._last_eval_state
         self._evaluate_schedule(msg)
 
