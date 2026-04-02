@@ -1,3 +1,4 @@
+# ── Static splash image (centered) ──
 image = Image("splash.png");
 
 screen_width = Window.GetWidth();
@@ -11,3 +12,38 @@ y = (screen_height - image_height) / 2;
 
 sprite = Sprite(image);
 sprite.SetPosition(x, y, 0);
+
+# ── Animated spinner (centered, below splash image) ──
+SPINNER_FRAMES = 12;
+
+spinner = [];
+for (i = 0; i < SPINNER_FRAMES; i++) {
+    if (i < 10)
+        spinner[i] = Image("spinner-0" + i + ".png");
+    else
+        spinner[i] = Image("spinner-" + i + ".png");
+}
+
+spinner_sprite = Sprite();
+spinner_w = spinner[0].GetWidth();
+spinner_h = spinner[0].GetHeight();
+
+# Position: horizontally centered, 40 px below the splash image
+spinner_x = (screen_width - spinner_w) / 2;
+spinner_y = y + image_height + 40;
+
+# If that would be off-screen, put it at 85% of screen height
+if (spinner_y + spinner_h > screen_height)
+    spinner_y = screen_height * 0.85;
+
+spinner_sprite.SetPosition(spinner_x, spinner_y, 1);
+
+frame = 0;
+fun refresh_callback() {
+    global.frame++;
+    # Advance one spinner frame every 3 refreshes (~4 fps at Plymouth's ~15 Hz)
+    idx = Math.Int(global.frame / 3) % SPINNER_FRAMES;
+    spinner_sprite.SetImage(spinner[idx]);
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);

@@ -64,6 +64,8 @@ cp "${REPO_ROOT}/packaging/plymouth/splash.plymouth" \
    "${BUILD_DIR}/usr/share/plymouth/themes/splash/"
 cp "${REPO_ROOT}/packaging/plymouth/splash.script" \
    "${BUILD_DIR}/usr/share/plymouth/themes/splash/"
+cp "${REPO_ROOT}/packaging/plymouth/spinner-"*.png \
+   "${BUILD_DIR}/usr/share/plymouth/themes/splash/"
 
 # ── DEBIAN control files ──
 sed "s/@@VERSION@@/${VERSION}/g" "${SCRIPT_DIR}/debian/control.in" \

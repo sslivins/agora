@@ -81,7 +81,7 @@ fi
 CMDLINE="/boot/firmware/cmdline.txt"
 if [ -f "${CMDLINE}" ]; then
     changed=false
-    for flag in quiet splash plymouth.ignore-serial-consoles logo.nologo "vt.global_cursor_default=0"; do
+    for flag in quiet splash plymouth.ignore-serial-consoles logo.nologo "vt.global_cursor_default=0" "loglevel=0"; do
         if ! grep -q "${flag}" "${CMDLINE}"; then
             sed -i "s/$/ ${flag}/" "${CMDLINE}"
             changed=true
