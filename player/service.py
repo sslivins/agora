@@ -66,6 +66,7 @@ class AgoraPlayer:
         self.pipeline: Optional[Gst.Pipeline] = None
         self.loop = GLib.MainLoop()
         self.current_desired: Optional[DesiredState] = None
+        self._loops_completed: int = 0
         self._running = True
 
         Gst.init(None)
@@ -200,6 +201,18 @@ class AgoraPlayer:
     def _on_eos(self, bus, message) -> None:
         logger.info("EOS received")
         if self.current_desired and self.current_desired.loop:
+            self._loops_completed += 1
+            # Finite loop count: stop after N loops
+            if (
+                self.current_desired.loop_count is not None
+                and self._loops_completed >= self.current_desired.loop_count
+            ):
+                logger.info(
+                    "Completed %d/%d loops, switching to splash",
+                    self._loops_completed, self.current_desired.loop_count,
+                )
+                self._show_splash()
+                return
             # Seamless loop: seek to beginning
             self.pipeline.seek_simple(
                 Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
@@ -271,6 +284,8 @@ class AgoraPlayer:
             mode=mode,
             asset=asset,
             loop=self.current_desired.loop if self.current_desired else False,
+            loop_count=self.current_desired.loop_count if self.current_desired else None,
+            loops_completed=self._loops_completed,
             started_at=started_at,
             playback_position_ms=self._query_position_ms(),
             pipeline_state=pipeline_state,
@@ -323,6 +338,7 @@ class AgoraPlayer:
             and desired.mode == self.current_desired.mode
             and desired.asset == self.current_desired.asset
             and desired.loop == self.current_desired.loop
+            and desired.loop_count == self.current_desired.loop_count
         ):
             logger.debug("Same content already playing, skipping rebuild")
             self.current_desired = desired
@@ -348,6 +364,7 @@ class AgoraPlayer:
             self._teardown()
             is_video = path.suffix.lower() == ".mp4"
             self.pipeline = self._build_pipeline(path, is_video)
+            self._loops_completed = 0
             self.pipeline.set_state(Gst.State.PLAYING)
             self._update_current(mode=PlaybackMode.PLAY, asset=desired.asset)
             # Schedule a health check to verify the pipeline actually started

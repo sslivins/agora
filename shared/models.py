@@ -17,6 +17,7 @@ class DesiredState(BaseModel):
     mode: PlaybackMode = PlaybackMode.SPLASH
     asset: Optional[str] = None
     loop: bool = False
+    loop_count: Optional[int] = None  # None = infinite, N = play exactly N times
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -24,6 +25,8 @@ class CurrentState(BaseModel):
     mode: PlaybackMode = PlaybackMode.SPLASH
     asset: Optional[str] = None
     loop: bool = False
+    loop_count: Optional[int] = None
+    loops_completed: int = 0
     started_at: Optional[datetime] = None
     playback_position_ms: Optional[int] = None
     pipeline_state: str = "NULL"

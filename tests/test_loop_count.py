@@ -1,0 +1,347 @@
+"""Tests for loop_count feature — device side.
+
+Covers:
+- DesiredState / CurrentState model serialization with loop_count
+- Player _on_eos counting and stopping at loop_count
+- Player apply_desired reset of loop counter
+- CMS client _handle_play and _evaluate_schedule passing loop_count
+"""
+
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from shared.models import CurrentState, DesiredState, PlaybackMode
+
+
+# ── Model tests ──
+
+
+class TestDesiredStateLoopCount:
+    def test_default_none(self):
+        state = DesiredState()
+        assert state.loop_count is None
+
+    def test_explicit_count(self):
+        state = DesiredState(mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5)
+        assert state.loop_count == 5
+
+    def test_serialization_roundtrip(self):
+        state = DesiredState(mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=3)
+        restored = DesiredState.model_validate_json(state.model_dump_json())
+        assert restored.loop_count == 3
+
+    def test_none_means_infinite(self):
+        state = DesiredState(mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=None)
+        data = state.model_dump(mode="json")
+        assert data["loop_count"] is None
+
+
+class TestCurrentStateLoopCount:
+    def test_defaults(self):
+        state = CurrentState()
+        assert state.loop_count is None
+        assert state.loops_completed == 0
+
+    def test_with_values(self):
+        state = CurrentState(loop_count=5, loops_completed=3)
+        assert state.loop_count == 5
+        assert state.loops_completed == 3
+
+    def test_serialization_roundtrip(self):
+        state = CurrentState(loop_count=10, loops_completed=7)
+        restored = CurrentState.model_validate_json(state.model_dump_json())
+        assert restored.loop_count == 10
+        assert restored.loops_completed == 7
+
+
+# ── Player tests ──
+
+
+@pytest.fixture
+def player():
+    """Create an AgoraPlayer instance with mocked GStreamer."""
+    with patch.dict("sys.modules", {
+        "gi": MagicMock(),
+        "gi.repository": MagicMock(),
+    }):
+        import importlib
+        import player.service as svc
+        importlib.reload(svc)
+
+        p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
+        p.pipeline = None
+        p.current_desired = None
+        p._loops_completed = 0
+        yield p
+
+
+class TestOnEosLoopCount:
+    def test_finite_loops_counts_and_stops(self, player):
+        """After reaching loop_count EOS events, player should show splash."""
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=3,
+        )
+        mock_pipeline = MagicMock()
+        player.pipeline = mock_pipeline
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch.object(player, "_show_splash") as mock_splash:
+            mock_gst.Format.TIME = "TIME"
+            mock_gst.SeekFlags.FLUSH = 1
+            mock_gst.SeekFlags.KEY_UNIT = 2
+
+            # First 2 EOS: should seek to 0 (loop)
+            player._on_eos(None, None)
+            assert player._loops_completed == 1
+            mock_pipeline.seek_simple.assert_called_once()
+            mock_splash.assert_not_called()
+
+            mock_pipeline.reset_mock()
+            player._on_eos(None, None)
+            assert player._loops_completed == 2
+            mock_pipeline.seek_simple.assert_called_once()
+            mock_splash.assert_not_called()
+
+            # Third EOS: should stop and show splash
+            mock_pipeline.reset_mock()
+            player._on_eos(None, None)
+            assert player._loops_completed == 3
+            mock_pipeline.seek_simple.assert_not_called()
+            mock_splash.assert_called_once()
+
+    def test_infinite_loops_never_stops(self, player):
+        """With loop_count=None, player loops indefinitely."""
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=None,
+        )
+        mock_pipeline = MagicMock()
+        player.pipeline = mock_pipeline
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch.object(player, "_show_splash") as mock_splash:
+            mock_gst.Format.TIME = "TIME"
+            mock_gst.SeekFlags.FLUSH = 1
+            mock_gst.SeekFlags.KEY_UNIT = 2
+
+            for i in range(10):
+                player._on_eos(None, None)
+                assert player._loops_completed == i + 1
+                mock_splash.assert_not_called()
+
+            assert mock_pipeline.seek_simple.call_count == 10
+
+    def test_loop_count_one_stops_after_first_play(self, player):
+        """loop_count=1 means play once then stop."""
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=1,
+        )
+        player.pipeline = MagicMock()
+
+        with patch("player.service.Gst"), \
+             patch.object(player, "_show_splash") as mock_splash:
+            player._on_eos(None, None)
+            assert player._loops_completed == 1
+            mock_splash.assert_called_once()
+
+
+class TestApplyDesiredResetsLoopCounter:
+    def test_counter_resets_on_new_playback(self, player, tmp_path):
+        """Starting new playback should reset _loops_completed to 0."""
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib, \
+             patch.object(player, "_has_audio", return_value=False), \
+             patch.object(player, "_resolve_asset") as mock_resolve, \
+             patch.object(player, "_update_current"):
+            mock_gst.parse_launch.return_value = MagicMock()
+            mock_gst.State.PLAYING = "PLAYING"
+
+            video = tmp_path / "v.mp4"
+            video.touch()
+            mock_resolve.return_value = video
+
+            player.base = tmp_path
+            player.state_dir = tmp_path / "state"
+            player.state_dir.mkdir()
+            player.desired_path = player.state_dir / "desired.json"
+            player.current_path = player.state_dir / "current.json"
+
+            # Simulate having completed some loops previously
+            player._loops_completed = 5
+
+            desired = DesiredState(mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=3)
+            from shared.state import write_state
+            write_state(player.desired_path, desired)
+
+            player.apply_desired()
+            assert player._loops_completed == 0
+
+
+class TestApplyDesiredSkipsRebuildWithLoopCount:
+    def test_same_content_with_same_loop_count_skips_rebuild(self, player, tmp_path):
+        """Same asset + same loop_count should not rebuild pipeline."""
+        desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5,
+        )
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5,
+        )
+        player.pipeline = MagicMock()
+
+        player.state_dir = tmp_path / "state"
+        player.state_dir.mkdir()
+        player.desired_path = player.state_dir / "desired.json"
+        player.current_path = player.state_dir / "current.json"
+
+        from shared.state import write_state
+        write_state(player.desired_path, desired)
+
+        with patch.object(player, "_teardown") as mock_teardown:
+            player.apply_desired()
+            mock_teardown.assert_not_called()
+
+    def test_different_loop_count_triggers_rebuild(self, player, tmp_path):
+        """Changing loop_count for same asset should rebuild pipeline."""
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib"), \
+             patch.object(player, "_has_audio", return_value=False), \
+             patch.object(player, "_resolve_asset") as mock_resolve, \
+             patch.object(player, "_update_current"):
+            mock_gst.parse_launch.return_value = MagicMock()
+            mock_gst.State.PLAYING = "PLAYING"
+
+            video = tmp_path / "v.mp4"
+            video.touch()
+            mock_resolve.return_value = video
+
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5,
+            )
+            player.pipeline = MagicMock()
+            player.base = tmp_path
+            player.state_dir = tmp_path / "state"
+            player.state_dir.mkdir()
+            player.desired_path = player.state_dir / "desired.json"
+            player.current_path = player.state_dir / "current.json"
+
+            desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=10,
+            )
+            from shared.state import write_state
+            write_state(player.desired_path, desired)
+
+            player.apply_desired()
+            assert player._loops_completed == 0
+
+
+# ── CMS client tests ──
+
+
+class TestCMSClientLoopCount:
+    """Test that CMS client passes loop_count from messages to DesiredState."""
+
+    def test_handle_play_passes_loop_count(self, tmp_path):
+        """_handle_play should include loop_count in DesiredState."""
+        import sys
+        sys.modules.setdefault("websockets", MagicMock())
+        sys.modules.setdefault("websockets.asyncio", MagicMock())
+        sys.modules.setdefault("websockets.asyncio.client", MagicMock())
+        sys.modules.setdefault("aiohttp", MagicMock())
+        sys.modules.setdefault("cms_client.asset_manager", MagicMock())
+
+        import importlib
+        import cms_client.service as svc
+        importlib.reload(svc)
+
+        desired_path = tmp_path / "desired.json"
+
+        # Minimal mock for _handle_play
+        client = svc.CMSClient.__new__(svc.CMSClient)
+        client.settings = MagicMock()
+        client.settings.desired_state_path = desired_path
+        client._last_eval_state = None
+
+        import asyncio
+        msg = {"type": "play", "asset": "v.mp4", "loop": True, "loop_count": 7}
+        asyncio.get_event_loop().run_until_complete(client._handle_play(msg))
+
+        import json
+        data = json.loads(desired_path.read_text())
+        assert data["loop_count"] == 7
+
+    def test_handle_play_no_loop_count(self, tmp_path):
+        """_handle_play without loop_count should set it to None."""
+        import sys
+        sys.modules.setdefault("websockets", MagicMock())
+        sys.modules.setdefault("websockets.asyncio", MagicMock())
+        sys.modules.setdefault("websockets.asyncio.client", MagicMock())
+        sys.modules.setdefault("aiohttp", MagicMock())
+        sys.modules.setdefault("cms_client.asset_manager", MagicMock())
+
+        import importlib
+        import cms_client.service as svc
+        importlib.reload(svc)
+
+        desired_path = tmp_path / "desired.json"
+
+        client = svc.CMSClient.__new__(svc.CMSClient)
+        client.settings = MagicMock()
+        client.settings.desired_state_path = desired_path
+        client._last_eval_state = None
+
+        import asyncio
+        msg = {"type": "play", "asset": "v.mp4", "loop": True}
+        asyncio.get_event_loop().run_until_complete(client._handle_play(msg))
+
+        import json
+        data = json.loads(desired_path.read_text())
+        assert data["loop_count"] is None
+
+    def test_evaluate_schedule_passes_loop_count(self, tmp_path):
+        """_evaluate_schedule should include loop_count from winning schedule."""
+        import sys
+        sys.modules.setdefault("websockets", MagicMock())
+        sys.modules.setdefault("websockets.asyncio", MagicMock())
+        sys.modules.setdefault("websockets.asyncio.client", MagicMock())
+        sys.modules.setdefault("aiohttp", MagicMock())
+        sys.modules.setdefault("cms_client.asset_manager", MagicMock())
+
+        import importlib
+        import cms_client.service as svc
+        importlib.reload(svc)
+
+        desired_path = tmp_path / "desired.json"
+
+        client = svc.CMSClient.__new__(svc.CMSClient)
+        client.settings = MagicMock()
+        client.settings.desired_state_path = desired_path
+        client._last_eval_state = None
+        client.asset_manager = MagicMock()
+
+        sync_data = {
+            "timezone": "UTC",
+            "schedules": [{
+                "id": "s1",
+                "name": "Test",
+                "asset": "v.mp4",
+                "asset_checksum": "abc",
+                "start_time": "00:00",
+                "end_time": "23:59",
+                "start_date": None,
+                "end_date": None,
+                "days_of_week": None,
+                "priority": 0,
+                "loop_count": 4,
+            }],
+            "default_asset": None,
+        }
+
+        client._evaluate_schedule(sync_data)
+
+        import json
+        data = json.loads(desired_path.read_text())
+        assert data["loop_count"] == 4
+        assert data["mode"] == "play"
+        assert data["asset"] == "v.mp4"

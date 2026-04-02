@@ -490,14 +490,15 @@ class CMSClient:
         if winner:
             asset = winner.get("asset", "")
             checksum = winner.get("asset_checksum")
-            state_key = ("play", asset, checksum)
+            loop_count = winner.get("loop_count")
+            state_key = ("play", asset, checksum, loop_count)
             if self._last_eval_state == state_key:
                 return
-            desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=True)
+            desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=True, loop_count=loop_count)
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(asset)
             self._last_eval_state = state_key
-            logger.info("Schedule: playing %s (priority %d)", asset, winner.get("priority", 0))
+            logger.info("Schedule: playing %s (priority %d, loop_count=%s)", asset, winner.get("priority", 0), loop_count)
         elif default_asset:
             default_checksum = sync_data.get("default_asset_checksum")
             state_key = ("default", default_asset, default_checksum)
@@ -605,10 +606,11 @@ class CMSClient:
     async def _handle_play(self, msg: dict) -> None:
         asset = msg.get("asset", "")
         loop = msg.get("loop", True)
-        desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=loop)
+        loop_count = msg.get("loop_count")
+        desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=loop, loop_count=loop_count)
         write_state(self.settings.desired_state_path, desired)
         self._last_eval_state = None
-        logger.info("CMS play command: %s (loop=%s)", asset, loop)
+        logger.info("CMS play command: %s (loop=%s, loop_count=%s)", asset, loop, loop_count)
 
     async def _handle_stop(self) -> None:
         desired = DesiredState(mode=PlaybackMode.SPLASH)
