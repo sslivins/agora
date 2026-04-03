@@ -36,7 +36,7 @@ STATUS_INTERVAL = 30    # seconds between heartbeat status messages
 EVAL_INTERVAL = 15      # seconds between local schedule evaluations
 FETCH_INTERVAL = 60     # seconds between proactive fetch checks
 FETCH_LOOKAHEAD_HOURS = 24  # how far ahead to look for missing assets
-AUTH_REJECTED_RETRY = 60    # seconds to wait before retrying after auth rejection
+AUTH_REJECTED_RETRY = 10    # seconds to wait before retrying after auth rejection
 
 
 class AuthRejectedError(Exception):
@@ -225,8 +225,11 @@ class CMSClient:
         """Main loop — connect, communicate, reconnect on failure."""
         cms_url = self._get_cms_url()
         if not cms_url:
-            logger.info("No cms_url configured, CMS client disabled")
-            return
+            logger.info("No cms_url configured, waiting for CMS discovery…")
+            while not cms_url:
+                await asyncio.sleep(5)
+                cms_url = self._get_cms_url()
+            logger.info("CMS URL discovered: %s", cms_url)
 
         self._running = True
         attempt = 0
