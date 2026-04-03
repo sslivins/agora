@@ -6,10 +6,11 @@ Before=agora-api.service agora-cms-client.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/agora/src/provision/service.py
+ExecStart=/bin/bash -c 'exec /usr/bin/python3 -u /opt/agora/src/provision/service.py 2>&1 | tee -a /boot/firmware/provision.log'
 WorkingDirectory=/opt/agora/src
 Environment=PYTHONPATH=/opt/agora/src
 Environment=AGORA_BASE=/opt/agora
+ExecStartPre=/bin/bash -c 'echo "=== provision start $(date) ===" >> /boot/firmware/provision.log'
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

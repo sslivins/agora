@@ -306,8 +306,11 @@ class CMSClient:
             logger.info("WebSocket connected")
 
             auth_token = _read_auth_token(self.settings.auth_token_path)
-            reg = "registered" if auth_token else "pending"
-            self._write_cms_status("connected", registration=reg)
+            # Always start as "pending" — actual status comes from the CMS
+            # sync message (device_status field).  Don't assume "registered"
+            # just because we have a local token; the device may have been
+            # deleted and re-created on the CMS as pending.
+            self._write_cms_status("connected", registration="pending")
             cap_mb, used_mb = _get_storage_mb(self.settings.assets_dir)
 
             # Name is "custom" if the user explicitly set it via captive portal
@@ -434,13 +437,23 @@ class CMSClient:
         if token:
             _save_auth_token(self.settings.auth_token_path, token)
             logger.info("Device auth token received and saved")
-            self._write_cms_status("connected", registration="registered")
+            # Don't write "registered" here — the device may still be
+            # pending on the CMS.  The sync message's device_status field
+            # is the authoritative source.
 
     # ── Sync handling ──
 
     async def _handle_sync(self, msg: dict) -> None:
         """CMS sent full schedule sync — cache, evaluate, and report status."""
         logger.info("Received sync from CMS (%d schedules)", len(msg.get("schedules", [])))
+
+        # Update registration status from authoritative CMS device_status
+        device_status = msg.get("device_status", "")
+        if device_status == "adopted":
+            self._write_cms_status("connected", registration="registered")
+        elif device_status:
+            # pending, orphaned, etc. — keep as "pending" for the OOBE
+            self._write_cms_status("connected", registration="pending")
 
         try:
             atomic_write(self.settings.schedule_path, json.dumps(msg, indent=2))

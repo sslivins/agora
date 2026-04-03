@@ -13,20 +13,22 @@
             <p>Device Setup</p>
         </div>
 
-        <form id="setup-form" onsubmit="return submitSetup(event)">
+        <!-- No <form> tag — iOS CNA WebView has broken native validation.
+             Submit is handled entirely via JS onclick. -->
+        <div id="setup-form">
             <!-- Wi-Fi -->
             <div class="card">
                 <h2>Wi-Fi Network</h2>
                 <label for="wifi-ssid">Network</label>
                 <div class="wifi-select-row">
-                    <select id="wifi-ssid" required autofocus>
+                    <select id="wifi-ssid" autofocus>
                         <option value="">Scanning…</option>
                     </select>
                     <button type="button" class="btn-scan" onclick="scanNetworks()" id="scan-btn">Scan</button>
                 </div>
 
                 <label for="wifi-password">Password</label>
-                <input type="password" id="wifi-password" placeholder="Enter Wi-Fi password" autocomplete="off" data-1p-ignore data-lpignore="true">
+                <input type="password" id="wifi-password" placeholder="Enter Wi-Fi password" autocomplete="one-time-code" data-1p-ignore data-lpignore="true">
             </div>
 
             <!-- CMS -->
@@ -39,7 +41,7 @@
                     </div>
                     <div class="port">
                         <label for="cms-port">Port</label>
-                        <input type="number" id="cms-port" placeholder="8080" min="1" max="65535">
+                        <input type="text" id="cms-port" placeholder="8080">
                     </div>
                 </div>
                 <span class="form-hint">Leave blank to auto-discover via mDNS (agora-cms.local), or enter an address manually.</span>
@@ -55,39 +57,40 @@
 
             <div id="status" class="status"></div>
 
-            <button type="submit" class="btn-primary" id="submit-btn">Set Up Device</button>
-        </form>
+            <button type="button" class="btn-primary" id="submit-btn" onclick="submitSetup()">Set Up Device</button>
+        </div>
     </div>
 
     <script>
     /* ── Wi-Fi Scan ── */
     async function scanNetworks() {
-        const select = document.getElementById("wifi-ssid");
-        const scanBtn = document.getElementById("scan-btn");
+        var select = document.getElementById("wifi-ssid");
+        var scanBtn = document.getElementById("scan-btn");
 
         scanBtn.disabled = true;
         scanBtn.textContent = "…";
         select.innerHTML = '<option value="">Scanning…</option>';
 
         try {
-            const res = await fetch("/api/wifi/scan");
-            const data = await res.json();
+            var res = await fetch("/api/wifi/scan");
+            var data = await res.json();
 
             select.innerHTML = "";
             if (data.networks.length === 0) {
                 select.innerHTML = '<option value="">No networks found</option>';
             } else {
                 select.innerHTML = '<option value="">Select a network…</option>';
-                for (const net of data.networks) {
-                    const opt = document.createElement("option");
+                for (var i = 0; i < data.networks.length; i++) {
+                    var net = data.networks[i];
+                    var opt = document.createElement("option");
                     opt.value = net.ssid;
 
-                    let signalIcon;
+                    var signalIcon;
                     if (net.signal >= 70) signalIcon = "▰▰▰";
                     else if (net.signal >= 40) signalIcon = "▰▰▱";
                     else signalIcon = "▰▱▱";
 
-                    const lock = net.security ? " 🔒" : "";
+                    var lock = net.security ? " 🔒" : "";
                     opt.textContent = net.ssid + " " + signalIcon + lock;
                     select.appendChild(opt);
                 }
@@ -101,45 +104,51 @@
     }
 
     /* ── Provision Submit ── */
-    async function submitSetup(e) {
-        e.preventDefault();
-        const statusEl = document.getElementById("status");
-        const submitBtn = document.getElementById("submit-btn");
+    async function submitSetup() {
+        var statusEl = document.getElementById("status");
+        var submitBtn = document.getElementById("submit-btn");
 
-        const wifiSsid = document.getElementById("wifi-ssid").value;
+        var wifiSsid = document.getElementById("wifi-ssid").value;
         if (!wifiSsid) {
             statusEl.className = "status error";
             statusEl.textContent = "Please select a Wi-Fi network.";
-            return false;
+            return;
         }
 
         submitBtn.disabled = true;
         statusEl.className = "status info";
-        statusEl.innerHTML = '<span class="spinner"></span>Connecting to Wi-Fi…';
+        statusEl.innerHTML = '<span class="spinner"></span>Submitting…';
+
+        var payload = {
+            wifi_ssid: wifiSsid,
+            wifi_password: document.getElementById("wifi-password").value,
+            cms_host: document.getElementById("cms-host").value.trim(),
+            cms_port: parseInt(document.getElementById("cms-port").value) || 8080,
+            device_name: document.getElementById("device-name").value.trim(),
+        };
+
+        // Replace the entire form with a waiting screen immediately.
+        // The AP will shut down as the device switches to client Wi-Fi,
+        // so the phone will lose connection — this avoids the confusing
+        // "jump back to CMS field" behaviour.
+        function showWaitingScreen(message) {
+            document.getElementById("setup-form").innerHTML =
+                '<div class="card" style="text-align:center;padding:2rem 1.5rem">'
+                + '<h2 style="margin-bottom:0.75rem">Setting Up…</h2>'
+                + '<p style="color:#aaa;line-height:1.5">' + message + '</p>'
+                + '</div>';
+        }
 
         try {
-            const res = await fetch("/api/provision", {
+            var res = await fetch("/api/provision", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    wifi_ssid: wifiSsid,
-                    wifi_password: document.getElementById("wifi-password").value,
-                    cms_host: document.getElementById("cms-host").value.trim(),
-                    cms_port: parseInt(document.getElementById("cms-port").value) || 8080,
-                    device_name: document.getElementById("device-name").value.trim(),
-                }),
+                body: JSON.stringify(payload),
             });
-            const data = await res.json();
+            var data = await res.json();
 
             if (data.success) {
-                let msg = "Setup complete! The device is now connecting to your network.";
-                if (data.cms_discovered) {
-                    msg += " CMS auto-discovered at " + data.cms_discovered + ".";
-                }
-                msg += " This page will close shortly.";
-                statusEl.className = "status success";
-                statusEl.textContent = msg;
-                submitBtn.textContent = "Done";
+                showWaitingScreen(data.message);
             } else {
                 statusEl.className = "status error";
                 statusEl.textContent = data.error || "Setup failed.";
@@ -148,12 +157,11 @@
         } catch (err) {
             // The AP shuts down when the device switches to client mode,
             // so losing the connection is the expected success signal.
-            statusEl.className = "status success";
-            statusEl.textContent = "Setup complete! The device is connecting to your Wi-Fi network. You can close this page and reconnect to your regular Wi-Fi.";
-            submitBtn.textContent = "Done";
+            showWaitingScreen(
+                "Setup complete! The device is connecting to your Wi-Fi network. "
+                + "You can close this page."
+            );
         }
-
-        return false;
     }
 
     /* ── Auto-scan on page load ── */

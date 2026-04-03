@@ -66,11 +66,26 @@ fi
 pip3 install --break-system-packages -q \
     -r "${AGORA_BASE}/src/requirements-api.txt" \
     -r "${AGORA_BASE}/src/requirements-player.txt" \
-    -r "${AGORA_BASE}/src/requirements-cms-client.txt" 2>/dev/null \
+    -r "${AGORA_BASE}/src/requirements-cms-client.txt" \
+    qrcode 2>/dev/null \
 || pip3 install -q \
     -r "${AGORA_BASE}/src/requirements-api.txt" \
     -r "${AGORA_BASE}/src/requirements-player.txt" \
-    -r "${AGORA_BASE}/src/requirements-cms-client.txt"
+    -r "${AGORA_BASE}/src/requirements-cms-client.txt" \
+    qrcode
+
+# ── Build RGB565 framebuffer helper ──
+RGB565_SRC="${AGORA_BASE}/src/provision/rgb565.c"
+RGB565_LIB="${AGORA_BASE}/lib/rgb565.so"
+if [ -f "${RGB565_SRC}" ]; then
+    mkdir -p "${AGORA_BASE}/lib"
+    if gcc -O2 -shared -fPIC -o "${RGB565_LIB}" "${RGB565_SRC}" 2>/dev/null; then
+        chown "${AGORA_USER}:${AGORA_USER}" "${RGB565_LIB}"
+        echo "Agora: built RGB565 helper at ${RGB565_LIB}"
+    else
+        echo "Agora: warning — failed to compile RGB565 helper (display may be slower)"
+    fi
+fi
 
 # ── Plymouth boot splash ──
 if command -v plymouth-set-default-theme &>/dev/null; then

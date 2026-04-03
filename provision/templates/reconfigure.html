@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agora — Reconfigure CMS</title>
+    <link rel="stylesheet" href="/static/setup.css">
+</head>
+<body>
+    <div class="setup-container">
+        <div class="brand">
+            <h1>Agora</h1>
+            <p>Reconfigure CMS Server</p>
+        </div>
+
+        <form id="reconfig-form" onsubmit="return submitReconfig(event)">
+            <div class="card">
+                <h2>CMS Server</h2>
+                <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem;">
+                    The device could not connect to the CMS server.
+                    Update the address below and try again.
+                </p>
+                <div class="form-row">
+                    <div class="grow">
+                        <label for="cms-host">Server Address</label>
+                        <input type="text" id="cms-host" placeholder="e.g. agora-cms.local" required>
+                    </div>
+                    <div class="port">
+                        <label for="cms-port">Port</label>
+                        <input type="number" id="cms-port" value="8080" min="1" max="65535">
+                    </div>
+                </div>
+                <span class="form-hint">Enter the hostname or IP address of your CMS server.</span>
+            </div>
+
+            <div id="status" class="status"></div>
+
+            <button type="submit" class="btn-primary" id="submit-btn">Save &amp; Retry</button>
+        </form>
+    </div>
+
+    <script>
+    async function loadConfig() {
+        try {
+            const res = await fetch("/api/cms/config");
+            const data = await res.json();
+            if (data.cms_host) {
+                document.getElementById("cms-host").value = data.cms_host;
+            }
+            if (data.cms_port) {
+                document.getElementById("cms-port").value = data.cms_port;
+            }
+        } catch (e) {
+            /* ignore — fields stay at defaults */
+        }
+    }
+
+    async function submitReconfig(e) {
+        e.preventDefault();
+        const statusEl = document.getElementById("status");
+        const submitBtn = document.getElementById("submit-btn");
+
+        const cmsHost = document.getElementById("cms-host").value.trim();
+        if (!cmsHost) {
+            statusEl.className = "status error";
+            statusEl.textContent = "Please enter a CMS server address.";
+            return false;
+        }
+
+        submitBtn.disabled = true;
+        statusEl.className = "status info";
+        statusEl.innerHTML = '<span class="spinner"></span>Saving configuration…';
+
+        try {
+            const res = await fetch("/api/reconfigure", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    cms_host: cmsHost,
+                    cms_port: parseInt(document.getElementById("cms-port").value) || 8080,
+                }),
+            });
+            const data = await res.json();
+
+            if (data.success) {
+                statusEl.className = "status success";
+                statusEl.textContent = data.message + " — check the TV for progress.";
+                submitBtn.textContent = "Done";
+            } else {
+                statusEl.className = "status error";
+                statusEl.textContent = data.error || "Update failed.";
+                submitBtn.disabled = false;
+            }
+        } catch (err) {
+            statusEl.className = "status success";
+            statusEl.textContent = "Configuration saved! The device is retrying the connection. You can close this page.";
+            submitBtn.textContent = "Done";
+        }
+
+        return false;
+    }
+
+    loadConfig();
+    </script>
+</body>
+</html>

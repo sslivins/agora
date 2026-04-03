@@ -238,13 +238,16 @@ def stop_ap() -> None:
     try:
         # Find and delete hotspot connection
         result = _run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+        logger.info("stop_ap: connections: %s", result.stdout.strip())
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
                 parts = line.split(":")
                 if len(parts) >= 2 and "Hotspot" in parts[0]:
-                    _run(["nmcli", "connection", "delete", parts[0]], timeout=10)
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+                    logger.info("stop_ap: deleting '%s'", parts[0])
+                    dr = _run(["nmcli", "connection", "delete", parts[0]], timeout=10)
+                    logger.info("stop_ap: delete rc=%d stderr=%s", dr.returncode, dr.stderr.strip())
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        logger.error("stop_ap error: %s", exc)
 
 
 def forget_all_wifi() -> None:
@@ -258,3 +261,20 @@ def forget_all_wifi() -> None:
                     _run(["nmcli", "connection", "delete", parts[0]], timeout=10)
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
+
+
+def get_device_ip() -> str | None:
+    """Return the device's IP address on the active Wi-Fi network, or None."""
+    iface = get_wifi_interface()
+    if not iface:
+        return None
+    try:
+        result = _run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", iface])
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(":", 1)
+                if len(parts) == 2 and parts[0].startswith("IP4.ADDRESS"):
+                    return parts[1].split("/")[0]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
