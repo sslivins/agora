@@ -250,7 +250,8 @@ class TestPlayerSkipRebuild:
 
         player.pipeline = MagicMock()
         player.current_desired = DesiredState(
-            mode=PlaybackMode.PLAY, asset="old.jpg", loop=True
+            mode=PlaybackMode.PLAY, asset="old.jpg", loop=True,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
         # Create the new asset
@@ -277,11 +278,12 @@ class TestPlayerSkipRebuild:
 
         player.pipeline = None  # No active pipeline
         player.current_desired = DesiredState(
-            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True
+            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
         new_desired = DesiredState(
-            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True
+            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True,
         )
         write_state(player.desired_path, new_desired)
 
@@ -297,7 +299,8 @@ class TestPlayerSkipRebuild:
         old_pipeline = MagicMock()
         player.pipeline = old_pipeline
         player.current_desired = DesiredState(
-            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True
+            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
         new_desired = DesiredState(mode=PlaybackMode.SPLASH)
@@ -307,3 +310,67 @@ class TestPlayerSkipRebuild:
 
         # Old pipeline should have been torn down (set to NULL via _teardown)
         old_pipeline.set_state.assert_called()
+
+    def test_file_replaced_on_disk_triggers_rebuild(self, tmp_path):
+        """Same filename but new content (different mtime) should rebuild."""
+        player, mock_gst = self._make_player(tmp_path)
+
+        mock_pipeline = MagicMock()
+        mock_gst.parse_launch.return_value = mock_pipeline
+        mock_pipeline.get_bus.return_value = MagicMock()
+        mock_pipeline.get_state.return_value = (
+            None, MagicMock(value_nick="playing"), None,
+        )
+
+        asset_path = tmp_path / "assets" / "images" / "test.jpg"
+        old_mtime = asset_path.stat().st_mtime
+
+        # Simulate pipeline playing the old version
+        player.pipeline = MagicMock()
+        player._current_path = asset_path
+        player._current_mtime = old_mtime
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True,
+        )
+
+        # CMS downloads new content — same filename, new bytes
+        import time
+        time.sleep(0.05)  # ensure mtime differs
+        asset_path.write_bytes(b"new content")
+
+        new_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True,
+        )
+        write_state(player.desired_path, new_desired)
+
+        player.apply_desired()
+
+        # Should rebuild because mtime changed
+        mock_gst.parse_launch.assert_called_once()
+
+    def test_splash_to_play_same_file_skips_rebuild(self, tmp_path):
+        """SPLASH→PLAY for the same image should skip pipeline rebuild."""
+        player, mock_gst = self._make_player(tmp_path)
+
+        asset_path = tmp_path / "assets" / "images" / "test.jpg"
+
+        # Simulate splash playing test.jpg
+        player.pipeline = MagicMock()
+        player._current_path = asset_path
+        player._current_mtime = asset_path.stat().st_mtime
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.SPLASH,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        # CMS pushes PLAY for same file
+        new_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.jpg", loop=True,
+        )
+        write_state(player.desired_path, new_desired)
+
+        player.apply_desired()
+
+        # Should NOT rebuild — same file already on screen
+        player.pipeline.set_state.assert_not_called()
+        assert player.current_desired.mode == PlaybackMode.PLAY
