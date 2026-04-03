@@ -118,6 +118,13 @@ fi
 # ── Disable console login on HDMI (tty1) ──
 systemctl disable getty@tty1 2>/dev/null || true
 
+# ── Plymouth: player controls quit, not systemd ──
+# The player calls `plymouth quit --retain-splash` right before building the first
+# GStreamer pipeline, keeping the boot splash visible until content takes over.
+# These units are "static" so they must be masked, not just disabled.
+systemctl mask plymouth-quit.service 2>/dev/null || true
+systemctl mask plymouth-quit-wait.service 2>/dev/null || true
+
 # ── Rebuild initramfs with new splash theme ──
 update-initramfs -u 2>/dev/null || true
 

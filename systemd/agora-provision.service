@@ -2,7 +2,7 @@
 Description=Agora Provisioning (Captive Portal)
 After=NetworkManager.service
 Wants=NetworkManager.service
-Before=agora-api.service agora-player.service agora-cms-client.service
+Before=agora-api.service agora-cms-client.service
 
 [Service]
 Type=simple

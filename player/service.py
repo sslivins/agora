@@ -52,6 +52,7 @@ class AgoraPlayer:
         "imagefreeze ! kmssink sync=false"
     )
 
+
     DEFAULT_SPLASH_CONFIG = "splash/default.png"
 
     def __init__(self, base_path: str = "/opt/agora"):
@@ -66,7 +67,10 @@ class AgoraPlayer:
         self.pipeline: Optional[Gst.Pipeline] = None
         self.loop = GLib.MainLoop()
         self.current_desired: Optional[DesiredState] = None
+        self._current_path: Optional[Path] = None  # file being played
+        self._current_mtime: Optional[float] = None  # mtime when pipeline was built
         self._loops_completed: int = 0
+        self._plymouth_quit: bool = False
         self._running = True
 
         Gst.init(None)
@@ -156,8 +160,13 @@ class AgoraPlayer:
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
+        self._current_path = None
+        self._current_mtime = None
 
     def _build_pipeline(self, path: Path, is_video: bool) -> Gst.Pipeline:
+        # Quit Plymouth before GStreamer claims the DRM device
+        self._quit_plymouth()
+
         if is_video:
             if self._has_audio(path):
                 pipeline_str = self.VIDEO_PIPELINE.format(path=path)
@@ -237,6 +246,8 @@ class AgoraPlayer:
         splash = self._find_splash()
         if splash:
             is_video = splash.suffix.lower() == ".mp4"
+            self._current_path = splash
+            self._current_mtime = splash.stat().st_mtime
             self.pipeline = self._build_pipeline(splash, is_video)
             self.pipeline.set_state(Gst.State.PLAYING)
             # Loop splash videos
@@ -329,20 +340,24 @@ class AgoraPlayer:
         ):
             return
 
-        # Skip pipeline rebuild if the same content is already playing.
-        # A new timestamp alone (e.g. from a CMS re-sync) should not
-        # cause a teardown/rebuild — that creates a visible screen flicker.
-        if (
-            self.current_desired
-            and self.pipeline
-            and desired.mode == self.current_desired.mode
-            and desired.asset == self.current_desired.asset
-            and desired.loop == self.current_desired.loop
-            and desired.loop_count == self.current_desired.loop_count
-        ):
-            logger.debug("Same content already playing, skipping rebuild")
-            self.current_desired = desired
-            return
+        # Skip pipeline rebuild if the same file is already being displayed.
+        # Covers CMS re-syncs, mode changes (SPLASH→PLAY) for the same image,
+        # and timestamp-only updates.  Avoids a visible black flash.
+        # Compare resolved file path + mtime to detect content changes even if
+        # the filename is reused.
+        if self.pipeline and self._current_path and desired.asset:
+            new_path = self._resolve_asset(desired.asset)
+            if new_path and new_path == self._current_path:
+                # Same path — verify file hasn't been replaced (mtime check)
+                try:
+                    current_mtime = self._current_path.stat().st_mtime
+                except OSError:
+                    current_mtime = None
+                if current_mtime == self._current_mtime:
+                    logger.info("Same file already playing (%s), skipping rebuild", new_path.name)
+                    self.current_desired = desired
+                    self._update_current(mode=desired.mode, asset=desired.asset)
+                    return
 
         logger.info("Applying desired state: %s", desired.model_dump_json())
         self.current_desired = desired
@@ -363,6 +378,8 @@ class AgoraPlayer:
                 return
             self._teardown()
             is_video = path.suffix.lower() == ".mp4"
+            self._current_path = path
+            self._current_mtime = path.stat().st_mtime
             self.pipeline = self._build_pipeline(path, is_video)
             self._loops_completed = 0
             self.pipeline.set_state(Gst.State.PLAYING)
@@ -433,8 +450,8 @@ class AgoraPlayer:
     # ── Main loop ──
 
     @staticmethod
-    def _blank_console() -> None:
-        """Disable VT console and clear framebuffer so nothing bleeds through during transitions."""
+    def _suppress_console() -> None:
+        """Disable VT console so text doesn't bleed through during transitions."""
         try:
             # Unbind VT console from framebuffer
             vtcon = Path("/sys/class/vtconsole/vtcon1/bind")
@@ -452,13 +469,38 @@ class AgoraPlayer:
                         stdout=open(tty_path, "w"),
                         stderr=subprocess.DEVNULL,
                     )
+        except Exception as e:
+            logger.warning("Could not suppress console: %s", e)
 
-            # Clear the framebuffer to black
+    def _quit_plymouth(self) -> None:
+        """Tell Plymouth to quit, retaining its last frame on the framebuffer.
+
+        Called once before the first GStreamer pipeline build so kmssink can
+        claim the DRM device.  The --retain-splash flag keeps the boot splash
+        visible until GStreamer renders its first frame.
+        """
+        if self._plymouth_quit:
+            return
+        self._plymouth_quit = True
+        try:
+            subprocess.run(
+                ["/usr/bin/plymouth", "quit", "--retain-splash"],
+                timeout=5, capture_output=True,
+            )
+            logger.info("Plymouth quit (retained splash)")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug("Plymouth quit skipped: %s", e)
+
+    @staticmethod
+    def _clear_framebuffer() -> None:
+        """Clear the framebuffer to black (used during pipeline transitions)."""
+        try:
             fb_path = Path("/dev/fb0")
             if fb_path.exists():
                 with open(fb_path, "wb") as fb:
                     # 1920x1080 @ 16bpp = 4,147,200 bytes
-                    # Write in chunks to avoid large memory allocation
                     chunk = b"\x00" * 65536
                     total = 1920 * 1080 * 2
                     written = 0
@@ -468,14 +510,14 @@ class AgoraPlayer:
                         written += to_write
                 logger.info("Cleared framebuffer to black")
         except Exception as e:
-            logger.warning("Could not blank console: %s", e)
+            logger.warning("Could not clear framebuffer: %s", e)
 
     def run(self) -> None:
         logger.info("Agora Player starting")
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
-        # Blank the Linux VT console so it doesn't show during transitions
-        self._blank_console()
+        # Suppress VT console text (preserves Plymouth retained splash on framebuffer)
+        self._suppress_console()
 
         # Apply initial state
         self.apply_desired()

@@ -1,7 +1,8 @@
 [Unit]
 Description=Agora Media Player
-After=multi-user.target agora-provision.service
-Wants=network-online.target
+After=opt-agora-state.mount
+Requires=opt-agora-state.mount
+DefaultDependencies=no
 
 [Service]
 Type=simple
