@@ -344,10 +344,15 @@ class AgoraPlayer:
         # Covers CMS re-syncs, mode changes (SPLASH→PLAY) for the same image,
         # and timestamp-only updates.  Avoids a visible black flash.
         # Compare resolved file path + mtime to detect content changes even if
-        # the filename is reused.
+        # the filename is reused.  Also compares loop_count since that affects
+        # video playback behaviour.
         if self.pipeline and self._current_path and desired.asset:
             new_path = self._resolve_asset(desired.asset)
-            if new_path and new_path == self._current_path:
+            cur_loop_count = self.current_desired.loop_count if self.current_desired else None
+            if (
+                new_path and new_path == self._current_path
+                and desired.loop_count == cur_loop_count
+            ):
                 # Same path — verify file hasn't been replaced (mtime check)
                 try:
                     current_mtime = self._current_path.stat().st_mtime

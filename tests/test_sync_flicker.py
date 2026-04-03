@@ -216,8 +216,11 @@ class TestPlayerSkipRebuild:
         should NOT trigger a pipeline teardown/rebuild."""
         player, mock_gst = self._make_player(tmp_path)
 
-        # Simulate an active pipeline
+        # Simulate an active pipeline playing test.jpg
+        asset_path = tmp_path / "assets" / "images" / "test.jpg"
         player.pipeline = MagicMock()
+        player._current_path = asset_path
+        player._current_mtime = asset_path.stat().st_mtime
         player.current_desired = DesiredState(
             mode=PlaybackMode.PLAY, asset="test.jpg", loop=True
         )

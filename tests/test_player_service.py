@@ -23,6 +23,9 @@ def player():
         p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
         p.pipeline = None
         p.current_desired = None
+        p._plymouth_quit = False
+        p._current_path = None
+        p._current_mtime = None
         yield p
 
 

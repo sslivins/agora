@@ -75,6 +75,9 @@ def player():
         p.pipeline = None
         p.current_desired = None
         p._loops_completed = 0
+        p._plymouth_quit = False
+        p._current_path = None
+        p._current_mtime = None
         yield p
 
 
@@ -182,6 +185,13 @@ class TestApplyDesiredResetsLoopCounter:
 class TestApplyDesiredSkipsRebuildWithLoopCount:
     def test_same_content_with_same_loop_count_skips_rebuild(self, player, tmp_path):
         """Same asset + same loop_count should not rebuild pipeline."""
+        # Set up asset directory with a test file
+        player.base = tmp_path
+        player.assets_dir = tmp_path / "assets"
+        (player.assets_dir / "videos").mkdir(parents=True)
+        video = player.assets_dir / "videos" / "v.mp4"
+        video.write_bytes(b"fake")
+
         desired = DesiredState(
             mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5,
         )
@@ -189,6 +199,8 @@ class TestApplyDesiredSkipsRebuildWithLoopCount:
             mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5,
         )
         player.pipeline = MagicMock()
+        player._current_path = video
+        player._current_mtime = video.stat().st_mtime
 
         player.state_dir = tmp_path / "state"
         player.state_dir.mkdir()
@@ -198,7 +210,8 @@ class TestApplyDesiredSkipsRebuildWithLoopCount:
         from shared.state import write_state
         write_state(player.desired_path, desired)
 
-        with patch.object(player, "_teardown") as mock_teardown:
+        with patch.object(player, "_teardown") as mock_teardown, \
+             patch.object(player, "_update_current"):
             player.apply_desired()
             mock_teardown.assert_not_called()
 
@@ -220,6 +233,8 @@ class TestApplyDesiredSkipsRebuildWithLoopCount:
                 mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5,
             )
             player.pipeline = MagicMock()
+            player._current_path = video
+            player._current_mtime = video.stat().st_mtime
             player.base = tmp_path
             player.state_dir = tmp_path / "state"
             player.state_dir.mkdir()
