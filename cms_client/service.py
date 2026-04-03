@@ -717,6 +717,7 @@ class CMSClient:
             desired = read_state(self.settings.desired_state_path, DesiredState)
             if desired.asset == asset_name:
                 logger.info("Re-applying desired state for just-downloaded asset: %s", asset_name)
+                desired.timestamp = datetime.now(timezone.utc)
                 write_state(self.settings.desired_state_path, desired)
 
             ack = {
