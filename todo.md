@@ -89,6 +89,12 @@
 - [ ] Backup/restore configuration
 
 ## Bugs / Polish
-- [ ] Reduce pipeline startup time (~4s gap during transitions)
+- [ ] Reduce pipeline startup time (~5s black gap during transitions and at boot)
+  - GStreamer `kmssink` takes ~5s to initialize the DRM/KMS display plane on Pi Zero 2 W
+  - This is the inherent cost of GStreamer claiming the hardware display — not image decoding or pipeline setup
+  - At boot, Plymouth holds the splash until the player calls `plymouth quit --retain-splash`, then kmssink takes ~5s to claim the DRM plane → black gap
+  - During content transitions, tear-down + rebuild of the GStreamer pipeline triggers the same ~5s DRM re-init
+  - Possible future approaches: keep a single GStreamer pipeline alive and swap the source (avoid DRM release/re-acquire), or use a lightweight DRM/KMS writer outside GStreamer for static images
+  - Framebuffer writes (`/dev/fb0`) are invisible while KMS owns the display planes — not a viable workaround
 - [ ] Handle missing HDMI gracefully (no display connected)
 - [ ] Watchdog: auto-restart player if pipeline hangs
