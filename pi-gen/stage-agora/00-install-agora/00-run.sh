@@ -59,8 +59,9 @@ mkdir -p /etc/NetworkManager/system-connections
 # disable_fw_kms_setup=1 (pi-gen default) prevents firmware from passing display
 # mode info to the vc4-kms-v3d kernel driver, causing kmssink to fail.
 sed -i 's/^disable_fw_kms_setup=1/disable_fw_kms_setup=0/' /boot/firmware/config.txt 2>/dev/null || true
-# Remove console=tty1 — it routes kernel messages to the HDMI display
-sed -i 's/console=tty1 //g; s/ console=tty1//g' /boot/firmware/cmdline.txt 2>/dev/null || true
+# Redirect console=tty1 to tty3 — keeps Plymouth on tty1 while hiding
+# kernel/systemd messages on an off-screen TTY
+sed -i 's/console=tty1/console=tty3/g' /boot/firmware/cmdline.txt 2>/dev/null || true
 # Force HDMI connector detection with 1080p mode on kernel cmdline
 sed -i 's/rootwait/rootwait video=HDMI-A-1:1920x1080@60D/' /boot/firmware/cmdline.txt 2>/dev/null || true
 

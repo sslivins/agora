@@ -81,9 +81,10 @@ fi
 CMDLINE="/boot/firmware/cmdline.txt"
 if [ -f "${CMDLINE}" ]; then
     changed=false
-    # Remove console=tty1 — it routes kernel messages to the HDMI display
+    # Redirect console=tty1 to tty3 — keeps Plymouth on tty1 while hiding
+    # kernel/systemd messages on an off-screen TTY
     if grep -q 'console=tty1' "${CMDLINE}"; then
-        sed -i 's/console=tty1 //g; s/ console=tty1//g' "${CMDLINE}"
+        sed -i 's/console=tty1/console=tty3/g' "${CMDLINE}"
         changed=true
     fi
     for flag in quiet splash plymouth.ignore-serial-consoles logo.nologo "vt.global_cursor_default=0" "loglevel=0"; do
