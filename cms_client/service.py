@@ -33,6 +33,8 @@ RECONNECT_BASE = 2
 RECONNECT_MAX = 60
 
 STATUS_INTERVAL = 30    # seconds between heartbeat status messages
+RAPID_STATUS_INTERVAL = 3  # seconds between status messages after a state change
+RAPID_STATUS_DURATION = 15 # how long rapid status mode lasts
 EVAL_INTERVAL = 15      # seconds between local schedule evaluations
 FETCH_INTERVAL = 60     # seconds between proactive fetch checks
 FETCH_LOOKAHEAD_HOURS = 24  # how far ahead to look for missing assets
@@ -176,6 +178,7 @@ class CMSClient:
         self._running = False
         self._ws = None
         self._last_eval_state: tuple | None = None
+        self._rapid_until: float = 0  # monotonic deadline for rapid status
         self.asset_manager = AssetManager(
             manifest_path=settings.manifest_path,
             assets_dir=settings.assets_dir,
@@ -443,9 +446,17 @@ class CMSClient:
         await self._ws.send(json.dumps(status_msg))
 
     async def _status_loop(self, ws) -> None:
-        """Send periodic status heartbeats."""
+        """Send periodic status heartbeats.
+
+        Uses a shorter interval right after a state change so the CMS
+        dashboard picks up transitions (e.g. starting → playing) quickly.
+        """
         while True:
-            await asyncio.sleep(STATUS_INTERVAL)
+            if time.monotonic() < self._rapid_until:
+                interval = RAPID_STATUS_INTERVAL
+            else:
+                interval = STATUS_INTERVAL
+            await asyncio.sleep(interval)
             try:
                 await self._send_status()
             except websockets.ConnectionClosed:
@@ -499,8 +510,10 @@ class CMSClient:
         self._evaluate_schedule(msg)
 
         # If the schedule evaluation changed desired state, send an immediate
-        # status so the CMS dashboard updates without waiting for the next heartbeat.
+        # status and enter rapid mode so the CMS dashboard picks up the
+        # starting → playing transition quickly.
         if self._last_eval_state != prev_state:
+            self._rapid_until = time.monotonic() + RAPID_STATUS_DURATION
             await asyncio.sleep(2)  # brief delay for player to start
             try:
                 await self._send_status()
@@ -651,12 +664,14 @@ class CMSClient:
         desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=loop, loop_count=loop_count)
         write_state(self.settings.desired_state_path, desired)
         self._last_eval_state = None
+        self._rapid_until = time.monotonic() + RAPID_STATUS_DURATION
         logger.info("CMS play command: %s (loop=%s, loop_count=%s)", asset, loop, loop_count)
 
     async def _handle_stop(self) -> None:
         desired = DesiredState(mode=PlaybackMode.SPLASH)
         write_state(self.settings.desired_state_path, desired)
         self._last_eval_state = None
+        self._rapid_until = time.monotonic() + RAPID_STATUS_DURATION
         logger.info("CMS stop command: showing splash")
 
     # ── Asset management ──
