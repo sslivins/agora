@@ -221,6 +221,27 @@ class CMSClient:
         except Exception:
             logger.debug("Failed to write CMS status file", exc_info=True)
 
+    def _apply_timezone(self, tz_name: str) -> None:
+        """Set the system timezone if it differs from the CMS value."""
+        try:
+            result = subprocess.run(
+                ["timedatectl", "show", "--property=Timezone", "--value"],
+                capture_output=True, text=True, timeout=5,
+            )
+            current_tz = result.stdout.strip()
+            if current_tz == tz_name:
+                return
+            result = subprocess.run(
+                ["sudo", "timedatectl", "set-timezone", tz_name],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                logger.info("System timezone set to %s (was %s)", tz_name, current_tz)
+            else:
+                logger.warning("Failed to set timezone: %s", result.stderr.strip())
+        except Exception:
+            logger.debug("Could not apply timezone", exc_info=True)
+
     async def run(self) -> None:
         """Main loop — connect, communicate, reconnect on failure."""
         cms_url = self._get_cms_url()
@@ -469,6 +490,10 @@ class CMSClient:
                 self.settings.splash_config_path.unlink()
         except Exception:
             logger.debug("Failed to update splash config", exc_info=True)
+
+        tz_name = msg.get("timezone")
+        if tz_name:
+            self._apply_timezone(tz_name)
 
         prev_state = self._last_eval_state
         self._evaluate_schedule(msg)

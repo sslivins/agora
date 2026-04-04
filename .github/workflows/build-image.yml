@@ -2,33 +2,6 @@ name: Build Pi Image
 
 on:
   workflow_dispatch:
-    inputs:
-      timezone:
-        description: "Timezone"
-        required: false
-        type: choice
-        default: "America/New_York"
-        options:
-          - "America/New_York"
-          - "America/Chicago"
-          - "America/Denver"
-          - "America/Los_Angeles"
-          - "America/Anchorage"
-          - "Pacific/Honolulu"
-          - "America/Toronto"
-          - "America/Vancouver"
-          - "America/Sao_Paulo"
-          - "Europe/London"
-          - "Europe/Paris"
-          - "Europe/Berlin"
-          - "Europe/Moscow"
-          - "Asia/Tokyo"
-          - "Asia/Shanghai"
-          - "Asia/Kolkata"
-          - "Asia/Dubai"
-          - "Australia/Sydney"
-          - "Pacific/Auckland"
-          - "Etc/UTC"
 
 permissions:
   contents: write
@@ -68,7 +41,7 @@ jobs:
 
       - name: Configure pi-gen
         run: |
-          TIMEZONE="${{ github.event.inputs.timezone || 'America/New_York' }}"
+          TIMEZONE="Etc/UTC"
 
           # Copy our custom stage into pi-gen tree
           cp -r pi-gen/stage-agora /tmp/pi-gen/stage-agora
