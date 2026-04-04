@@ -255,7 +255,7 @@ class TestPlayerSkipRebuild:
         )
 
         # Create the new asset
-        (tmp_path / "assets" / "images" / "new.jpg").write_bytes(b"fake")
+        (tmp_path / "assets" / "images" / "new.jpg").write_bytes(b"\x00" * 16)
 
         new_desired = DesiredState(
             mode=PlaybackMode.PLAY, asset="new.jpg", loop=True
@@ -286,6 +286,9 @@ class TestPlayerSkipRebuild:
             mode=PlaybackMode.PLAY, asset="test.jpg", loop=True,
         )
         write_state(player.desired_path, new_desired)
+
+        # Ensure the file has enough content for the readability check
+        (tmp_path / "assets" / "images" / "test.jpg").write_bytes(b"\x00" * 16)
 
         player.apply_desired()
 

@@ -356,3 +356,207 @@ class TestPlaybackPosition:
         import json
         data = json.loads(state_file.read_text())
         assert data["playback_position_ms"] == 5000
+
+
+class TestSplashStateConsistency:
+    """Verify _show_splash updates current_desired for both image and video splash."""
+
+    def test_image_splash_updates_current_desired(self, player, tmp_path):
+        """When showing an image splash, current_desired must reflect SPLASH mode.
+
+        Regression: if current_desired is not updated for image splash, a
+        subsequent _on_state_changed callback will use stale desired state and
+        overwrite current.json with the old (failed) PLAY mode, making the CMS
+        think the device is playing when it's actually showing splash.
+        """
+        splash_img = tmp_path / "assets" / "splash" / "default.png"
+        splash_img.parent.mkdir(parents=True)
+        splash_img.touch()
+
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="failed_video.mp4", loop=True
+        )
+
+        with patch.object(player, "_find_splash", return_value=splash_img), \
+             patch.object(player, "_teardown"), \
+             patch.object(player, "_build_pipeline") as mock_build, \
+             patch.object(player, "_update_current"):
+            mock_pipeline = MagicMock()
+            mock_build.return_value = mock_pipeline
+
+            player._show_splash()
+
+            # current_desired must be SPLASH, not the stale PLAY mode
+            assert player.current_desired.mode == PlaybackMode.SPLASH
+            assert player.current_desired.asset is None
+
+    def test_video_splash_updates_current_desired(self, player, tmp_path):
+        """Video splash should also set current_desired to SPLASH with loop=True."""
+        splash_vid = tmp_path / "assets" / "splash" / "default.mp4"
+        splash_vid.parent.mkdir(parents=True)
+        splash_vid.touch()
+
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="failed_video.mp4", loop=True
+        )
+
+        with patch.object(player, "_find_splash", return_value=splash_vid), \
+             patch.object(player, "_teardown"), \
+             patch.object(player, "_build_pipeline") as mock_build, \
+             patch.object(player, "_update_current"):
+            mock_pipeline = MagicMock()
+            mock_build.return_value = mock_pipeline
+
+            player._show_splash()
+
+            assert player.current_desired.mode == PlaybackMode.SPLASH
+            assert player.current_desired.loop is True
+
+
+class TestAssetNotFoundDesiredState:
+    """Verify apply_desired does not clobber current_desired when asset is missing."""
+
+    def test_asset_not_found_preserves_current_desired(self, player, tmp_path):
+        """When an asset is not found, current_desired should NOT be updated.
+
+        Regression: if current_desired is set before asset resolution, the old
+        running pipeline's _on_state_changed callback may use it to write
+        incorrect state to current.json.
+        """
+        player.desired_path = tmp_path / "desired.json"
+        player.current_path = tmp_path / "current.json"
+        player.assets_dir = tmp_path / "assets"
+        player.assets_dir.mkdir()
+        player._loops_completed = 0
+
+        # Previous state: showing splash (with an older timestamp)
+        from datetime import datetime, timezone, timedelta
+        old_desired = DesiredState(
+            mode=PlaybackMode.SPLASH,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        player.current_desired = old_desired
+
+        # New desired state wants to play a non-existent asset (different timestamp)
+        new_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="missing.mp4", loop=True,
+            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        from shared.state import write_state
+        write_state(player.desired_path, new_desired)
+
+        with patch.object(player, "_update_current"), \
+             patch.object(player, "_show_splash"):
+            player.apply_desired()
+
+        # current_desired should still be the old splash state, not the new play state
+        assert player.current_desired.mode == PlaybackMode.SPLASH
+
+
+class TestChecksumValidation:
+    """Verify player validates asset checksum before building pipeline."""
+
+    def test_matching_checksum_allows_playback(self, player, tmp_path):
+        """Player should proceed when file checksum matches expected."""
+        player.desired_path = tmp_path / "desired.json"
+        player.current_path = tmp_path / "current.json"
+        player.assets_dir = tmp_path / "assets"
+        (player.assets_dir / "videos").mkdir(parents=True)
+        player._loops_completed = 0
+        player._plymouth_quit = True
+
+        video = player.assets_dir / "videos" / "test.mp4"
+        content = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 100
+        video.write_bytes(content)
+
+        import hashlib
+        checksum = hashlib.sha256(content).hexdigest()
+
+        from datetime import datetime, timezone
+        desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True,
+            expected_checksum=checksum,
+            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        from shared.state import write_state
+        write_state(player.desired_path, desired)
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib"), \
+             patch.object(player, "_has_audio", return_value=False), \
+             patch.object(player, "_update_current"):
+            mock_gst.parse_launch.return_value = MagicMock()
+            mock_gst.State.PLAYING = "PLAYING"
+
+            player.apply_desired()
+
+            # Pipeline should have been built
+            mock_gst.parse_launch.assert_called_once()
+
+    def test_mismatched_checksum_blocks_playback(self, player, tmp_path):
+        """Player should refuse to play when checksum doesn't match."""
+        player.desired_path = tmp_path / "desired.json"
+        player.current_path = tmp_path / "current.json"
+        player.assets_dir = tmp_path / "assets"
+        (player.assets_dir / "videos").mkdir(parents=True)
+        player._loops_completed = 0
+
+        video = player.assets_dir / "videos" / "bad.mp4"
+        video.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 100)
+
+        from datetime import datetime, timezone
+        desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="bad.mp4", loop=True,
+            expected_checksum="0000000000000000000000000000000000000000000000000000000000000000",
+            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        from shared.state import write_state
+        write_state(player.desired_path, desired)
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch.object(player, "_update_current") as mock_update, \
+             patch.object(player, "_show_splash") as mock_splash:
+            mock_gst.State.PLAYING = "PLAYING"
+
+            player.apply_desired()
+
+            # Pipeline should NOT have been built
+            mock_gst.parse_launch.assert_not_called()
+            # Error should have been reported
+            mock_update.assert_called()
+            call_kwargs = mock_update.call_args[1]
+            assert "Checksum mismatch" in call_kwargs["error"]
+            # Should fall back to splash
+            mock_splash.assert_called_once()
+
+    def test_no_checksum_skips_validation(self, player, tmp_path):
+        """When no expected_checksum is set, skip validation and play."""
+        player.desired_path = tmp_path / "desired.json"
+        player.current_path = tmp_path / "current.json"
+        player.assets_dir = tmp_path / "assets"
+        (player.assets_dir / "videos").mkdir(parents=True)
+        player._loops_completed = 0
+        player._plymouth_quit = True
+
+        video = player.assets_dir / "videos" / "test.mp4"
+        video.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 100)
+
+        from datetime import datetime, timezone
+        desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True,
+            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        from shared.state import write_state
+        write_state(player.desired_path, desired)
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib"), \
+             patch.object(player, "_has_audio", return_value=False), \
+             patch.object(player, "_update_current"):
+            mock_gst.parse_launch.return_value = MagicMock()
+            mock_gst.State.PLAYING = "PLAYING"
+
+            player.apply_desired()
+
+            # Pipeline should still be built
+            mock_gst.parse_launch.assert_called_once()

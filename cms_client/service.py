@@ -21,7 +21,7 @@ import websockets
 
 from api.config import Settings
 from cms_client.asset_manager import AssetManager
-from shared.models import DesiredState, PlaybackMode
+from shared.models import CurrentState, DesiredState, PlaybackMode
 from shared.state import atomic_write, read_state, write_state
 
 logger = logging.getLogger("agora.cms_client")
@@ -526,6 +526,20 @@ class CMSClient:
         default_asset = sync_data.get("default_asset")
         tz_name = sync_data.get("timezone", "UTC")
 
+        # Check if the player is in an error state — if so, clear the cache
+        # so we re-write desired.json and give the player another chance.
+        if self._last_eval_state is not None:
+            try:
+                current = read_state(self.settings.current_state_path, CurrentState)
+                if current.error:
+                    logger.info(
+                        "Player has error (%s), clearing eval cache to retry",
+                        current.error,
+                    )
+                    self._last_eval_state = None
+            except Exception:
+                pass  # Can't read current.json — proceed normally
+
         try:
             from zoneinfo import ZoneInfo
             now_utc = datetime.now(timezone.utc)
@@ -548,7 +562,7 @@ class CMSClient:
             state_key = ("play", asset, checksum, loop_count)
             if self._last_eval_state == state_key:
                 return
-            desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=True, loop_count=loop_count)
+            desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=True, loop_count=loop_count, expected_checksum=checksum)
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(asset)
             self._last_eval_state = state_key
@@ -558,7 +572,7 @@ class CMSClient:
             state_key = ("default", default_asset, default_checksum)
             if self._last_eval_state == state_key:
                 return
-            desired = DesiredState(mode=PlaybackMode.PLAY, asset=default_asset, loop=True)
+            desired = DesiredState(mode=PlaybackMode.PLAY, asset=default_asset, loop=True, expected_checksum=default_checksum)
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(default_asset)
             self._last_eval_state = state_key
@@ -753,6 +767,8 @@ class CMSClient:
                         async for chunk in resp.content.iter_chunked(65536):
                             f.write(chunk)
                             sha256.update(chunk)
+                        f.flush()
+                        os.fsync(f.fileno())
 
                     actual_checksum = sha256.hexdigest()
                     if expected_checksum and actual_checksum != expected_checksum:
