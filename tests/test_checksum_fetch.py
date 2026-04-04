@@ -179,3 +179,90 @@ class TestChecksumMismatchFetch:
         # Don't write any schedule file
         await cms_client._check_and_fetch_missing()
         cms_client._ws.send.assert_not_called()
+
+
+class TestEvalRecoveryOnPlayerError:
+    """_evaluate_schedule must retry when the player reports an error in current.json."""
+
+    def test_player_error_clears_eval_cache(self, cms_client, tmp_path):
+        """When current.json has an error, eval cache is cleared and desired.json rewritten."""
+        from shared.models import CurrentState
+        from shared.state import write_state
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(exist_ok=True)
+        cms_client.settings.current_state_path = state_dir / "current.json"
+        cms_client.settings.desired_state_path = state_dir / "desired.json"
+        cms_client._last_eval_state = None
+
+        # First eval — should write desired.json and set cache
+        sync_data = _make_schedule_data([_active_entry("video.mp4", "abc123")])
+        cms_client._evaluate_schedule(sync_data)
+        assert cms_client._last_eval_state is not None
+        first_state = cms_client._last_eval_state
+
+        # Second eval with same data — cache hit, should skip
+        cms_client._evaluate_schedule(sync_data)
+        # desired.json should not change timestamp — it's the same write
+
+        # Now simulate a player error in current.json
+        error_state = CurrentState(error="Checksum mismatch: video.mp4")
+        write_state(cms_client.settings.current_state_path, error_state)
+
+        # Read desired.json before re-eval to compare timestamps
+        from shared.models import DesiredState
+        from shared.state import read_state
+        before = read_state(cms_client.settings.desired_state_path, DesiredState)
+
+        # Third eval — should detect error, clear cache, and rewrite desired.json
+        cms_client._evaluate_schedule(sync_data)
+
+        after = read_state(cms_client.settings.desired_state_path, DesiredState)
+        # Timestamp should be different (new write)
+        assert after.timestamp != before.timestamp
+        assert after.asset == "video.mp4"
+        assert after.expected_checksum == "abc123"
+
+    def test_no_player_error_keeps_cache(self, cms_client, tmp_path):
+        """When current.json has no error, eval cache is honored (no rewrite)."""
+        from shared.models import CurrentState, DesiredState
+        from shared.state import read_state, write_state
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(exist_ok=True)
+        cms_client.settings.current_state_path = state_dir / "current.json"
+        cms_client.settings.desired_state_path = state_dir / "desired.json"
+        cms_client._last_eval_state = None
+
+        sync_data = _make_schedule_data([_active_entry("video.mp4", "abc123")])
+        cms_client._evaluate_schedule(sync_data)
+        before = read_state(cms_client.settings.desired_state_path, DesiredState)
+
+        # Write a healthy current.json (no error)
+        healthy_state = CurrentState(mode="play", asset="video.mp4")
+        write_state(cms_client.settings.current_state_path, healthy_state)
+
+        # Re-eval — cache should hold, no rewrite
+        cms_client._evaluate_schedule(sync_data)
+        after = read_state(cms_client.settings.desired_state_path, DesiredState)
+        assert after.timestamp == before.timestamp
+
+    def test_missing_current_json_keeps_cache(self, cms_client, tmp_path):
+        """If current.json doesn't exist yet, don't crash — keep cache."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(exist_ok=True)
+        cms_client.settings.current_state_path = state_dir / "current.json"
+        cms_client.settings.desired_state_path = state_dir / "desired.json"
+        cms_client._last_eval_state = None
+
+        sync_data = _make_schedule_data([_active_entry("video.mp4", "abc123")])
+        cms_client._evaluate_schedule(sync_data)
+
+        from shared.models import DesiredState
+        from shared.state import read_state
+        before = read_state(cms_client.settings.desired_state_path, DesiredState)
+
+        # No current.json exists — re-eval should keep cache
+        cms_client._evaluate_schedule(sync_data)
+        after = read_state(cms_client.settings.desired_state_path, DesiredState)
+        assert after.timestamp == before.timestamp

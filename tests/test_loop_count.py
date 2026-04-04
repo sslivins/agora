@@ -162,7 +162,7 @@ class TestApplyDesiredResetsLoopCounter:
             mock_gst.State.PLAYING = "PLAYING"
 
             video = tmp_path / "v.mp4"
-            video.touch()
+            video.write_bytes(b"\x00" * 16)
             mock_resolve.return_value = video
 
             player.base = tmp_path
@@ -226,7 +226,7 @@ class TestApplyDesiredSkipsRebuildWithLoopCount:
             mock_gst.State.PLAYING = "PLAYING"
 
             video = tmp_path / "v.mp4"
-            video.touch()
+            video.write_bytes(b"\x00" * 16)
             mock_resolve.return_value = video
 
             player.current_desired = DesiredState(

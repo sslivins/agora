@@ -18,6 +18,7 @@ class DesiredState(BaseModel):
     asset: Optional[str] = None
     loop: bool = False
     loop_count: Optional[int] = None  # None = infinite, N = play exactly N times
+    expected_checksum: Optional[str] = None  # SHA-256 from CMS schedule
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

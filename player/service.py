@@ -250,11 +250,10 @@ class AgoraPlayer:
             self._current_mtime = splash.stat().st_mtime
             self.pipeline = self._build_pipeline(splash, is_video)
             self.pipeline.set_state(Gst.State.PLAYING)
-            # Loop splash videos
-            if is_video:
-                self.current_desired = DesiredState(
-                    mode=PlaybackMode.SPLASH, loop=True
-                )
+            # Update desired state so _on_state_changed uses correct mode
+            self.current_desired = DesiredState(
+                mode=PlaybackMode.SPLASH, loop=is_video
+            )
             self._update_current(mode=PlaybackMode.SPLASH, asset=splash.name)
             logger.info("Showing splash: %s", splash.name)
         else:
@@ -365,22 +364,62 @@ class AgoraPlayer:
                     return
 
         logger.info("Applying desired state: %s", desired.model_dump_json())
-        self.current_desired = desired
 
         if desired.mode == PlaybackMode.STOP:
+            self.current_desired = desired
             self._show_splash()
             return
 
         if desired.mode == PlaybackMode.SPLASH:
+            self.current_desired = desired
             self._show_splash()
             return
 
         if desired.mode == PlaybackMode.PLAY and desired.asset:
             path = self._resolve_asset(desired.asset)
             if not path:
-                logger.error("Asset not found: %s", desired.asset)
+                logger.error("Asset not found: %s — showing splash", desired.asset)
                 self._update_current(error=f"Asset not found: {desired.asset}")
+                self._show_splash()
                 return
+            # Verify file is readable, non-empty, and checksum matches
+            try:
+                size = path.stat().st_size
+                if size == 0:
+                    logger.error("Asset is empty (0 bytes): %s — showing splash", desired.asset)
+                    self._update_current(error=f"Asset is empty: {desired.asset}")
+                    self._show_splash()
+                    return
+                with open(path, "rb") as f:
+                    header = f.read(8)
+                if len(header) < 8:
+                    logger.error("Asset too small to be valid: %s — showing splash", desired.asset)
+                    self._update_current(error=f"Asset too small: {desired.asset}")
+                    self._show_splash()
+                    return
+            except OSError as e:
+                logger.error("Asset not readable: %s (%s) — showing splash", desired.asset, e)
+                self._update_current(error=f"Asset not readable: {desired.asset}")
+                self._show_splash()
+                return
+            if desired.expected_checksum:
+                import hashlib
+                sha = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        sha.update(chunk)
+                actual = sha.hexdigest()
+                if actual != desired.expected_checksum:
+                    logger.error(
+                        "Checksum mismatch for %s: expected %s, got %s — showing splash",
+                        desired.asset, desired.expected_checksum, actual,
+                    )
+                    self._update_current(
+                        error=f"Checksum mismatch: {desired.asset}",
+                    )
+                    self._show_splash()
+                    return
+            self.current_desired = desired
             self._teardown()
             is_video = path.suffix.lower() == ".mp4"
             self._current_path = path
