@@ -563,13 +563,17 @@ class AgoraPlayer:
         # Suppress VT console text (preserves Plymouth retained splash on framebuffer)
         self._suppress_console()
 
-        # Apply initial state
+        # Apply initial state (may show splash, which can take seconds)
         self.apply_desired()
 
         # Set up file watcher (inotify preferred, poll fallback)
         if not self._setup_inotify():
             logger.warning("inotify unavailable, falling back to 2s polling")
             GLib.timeout_add_seconds(2, self._poll_state)
+
+        # Re-apply: desired.json may have been written while the initial splash
+        # pipeline was loading (before inotify was watching).
+        self.apply_desired()
 
         # Signal handlers for clean shutdown
         def on_shutdown(signum, frame):

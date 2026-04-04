@@ -560,3 +560,89 @@ class TestChecksumValidation:
 
             # Pipeline should still be built
             mock_gst.parse_launch.assert_called_once()
+
+
+class TestStartupDesiredRace:
+    """Verify desired.json written during splash startup is not missed."""
+
+    def test_desired_written_during_splash_is_applied(self, player, tmp_path):
+        """If desired.json arrives between the first apply_desired() and inotify
+        setup, the player must still process it — not remain stuck in splash.
+
+        Reproduces: device boots, player starts, apply_desired sees no desired.json
+        and shows splash (taking several seconds), CMS writes desired.json during
+        that window, inotify is set up after splash is ready — change is missed.
+        """
+        player.desired_path = tmp_path / "desired.json"
+        player.current_path = tmp_path / "current.json"
+        player.assets_dir = tmp_path / "assets"
+        player.state_dir = tmp_path
+        player.persist_dir = tmp_path / "persist"
+        player.persist_dir.mkdir()
+        player.splash_config_path = player.persist_dir / "splash"
+        (player.assets_dir / "images").mkdir(parents=True)
+        (player.assets_dir / "splash").mkdir(parents=True)
+        player._loops_completed = 0
+        player._plymouth_quit = True
+        player._running = True
+
+        # Create a default splash and the target asset (same image, different paths)
+        splash_img = player.assets_dir / "splash" / "default.png"
+        splash_img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+
+        target_img = player.assets_dir / "images" / "target.png"
+        target_img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200)
+
+        import hashlib
+        checksum = hashlib.sha256(target_img.read_bytes()).hexdigest()
+
+        from datetime import datetime, timezone
+        from shared.state import write_state
+
+        # Track apply_desired calls to simulate writing desired.json after the
+        # first call but before inotify is ready.
+        original_apply = type(player).apply_desired
+        call_count = [0]
+
+        def patched_apply(self_inner):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First call: desired.json doesn't exist yet → shows splash.
+                original_apply(self_inner)
+                # NOW write desired.json (simulates CMS writing during splash).
+                desired = DesiredState(
+                    mode=PlaybackMode.PLAY,
+                    asset="target.png",
+                    loop=True,
+                    expected_checksum=checksum,
+                    timestamp=datetime(2026, 4, 4, 22, 27, 44, tzinfo=timezone.utc),
+                )
+                write_state(player.desired_path, desired)
+            else:
+                original_apply(self_inner)
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib, \
+             patch.object(player, "_has_audio", return_value=False), \
+             patch.object(player, "_quit_plymouth"), \
+             patch("player.service.signal"):
+            mock_pipeline = MagicMock()
+            mock_gst.parse_launch.return_value = mock_pipeline
+            mock_gst.State.PLAYING = "PLAYING"
+            mock_glib.MainLoop.return_value = MagicMock()
+
+            # Make inotify unavailable so we don't need real fs events
+            with patch.object(player, "_setup_inotify", return_value=True):
+                with patch.object(type(player), "apply_desired", patched_apply):
+                    player.loop = MagicMock()
+                    player.run()
+
+        # apply_desired should have been called at least twice
+        assert call_count[0] >= 2, (
+            f"apply_desired called {call_count[0]} time(s); expected >=2 to "
+            f"catch desired.json written during splash startup"
+        )
+        # Player should end up with the play desired state, not splash
+        assert player.current_desired is not None
+        assert player.current_desired.mode == PlaybackMode.PLAY
+        assert player.current_desired.asset == "target.png"
