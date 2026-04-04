@@ -85,6 +85,7 @@ input:focus, select:focus {
     border-color: var(--accent);
 }
 input::placeholder { color: var(--text-muted); opacity: 0.6; }
+input.pw { -webkit-text-security: disc; text-security: disc; }
 
 .form-hint {
     display: block;
