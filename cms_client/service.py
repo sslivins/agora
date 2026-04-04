@@ -859,12 +859,19 @@ class CMSClient:
         # Without this, systemd kills the upgrade commands (same cgroup)
         # when postinst calls 'systemctl restart agora-cms-client', and
         # the reboot never happens.
+        #
+        # Key details:
+        # - Acquire::http::No-Cache bypasses GitHub Pages CDN stale metadata
+        # - Version is compared before/after to only reboot on actual upgrade
         subprocess.Popen(
             ["systemd-run", "--scope",
              "bash", "-c",
              "dpkg --configure -a; "
-             "apt-get update -qq && apt-get install -y agora; "
-             "reboot"],
+             "OLD=$(dpkg-query -W -f='${Version}' agora 2>/dev/null); "
+             "apt-get -o Acquire::http::No-Cache=True update -qq "
+             "&& apt-get install -y agora; "
+             "NEW=$(dpkg-query -W -f='${Version}' agora 2>/dev/null); "
+             '[ "$OLD" != "$NEW" ] && reboot'],
         )
 
     # ── Helpers ──
