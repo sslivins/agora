@@ -27,8 +27,8 @@
                     <button type="button" class="btn-scan" onclick="scanNetworks()" id="scan-btn">Scan</button>
                 </div>
 
-                <label for="wifi-password">Password</label>
-                <input type="password" id="wifi-password" placeholder="Enter Wi-Fi password" autocomplete="one-time-code" data-1p-ignore data-lpignore="true">
+                <label for="wifikey">WiFi Passphrase</label>
+                <input type="text" class="pw" id="wifikey" placeholder="Enter passphrase" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true">
             </div>
 
             <!-- CMS -->
@@ -121,7 +121,7 @@
 
         var payload = {
             wifi_ssid: wifiSsid,
-            wifi_password: document.getElementById("wifi-password").value,
+            wifi_password: document.getElementById("wifikey").value,
             cms_host: document.getElementById("cms-host").value.trim(),
             cms_port: parseInt(document.getElementById("cms-port").value) || 8080,
             device_name: document.getElementById("device-name").value.trim(),
