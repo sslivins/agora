@@ -62,7 +62,7 @@ jobs:
           IMG_NAME=agora-pi
           RELEASE=trixie
           TARGET_HOSTNAME=agora
-          FIRST_USER_NAME=pi
+          FIRST_USER_NAME=agora
           FIRST_USER_PASS=agora
           DISABLE_FIRST_BOOT_USER_RENAME=1
           ENABLE_SSH=1
