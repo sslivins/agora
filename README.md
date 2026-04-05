@@ -4,13 +4,21 @@ A media playback system for **Raspberry Pi Zero 2 W** that plays video and image
 
 ## Install on Raspberry Pi Zero 2 W
 
-### Prerequisites
+### Option 1: Pre-Built Image (Recommended)
 
-1. Flash **Raspberry Pi OS 64-bit Lite** onto an SD card using [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
-2. In Imager settings, enable SSH and configure Wi-Fi
-3. Boot the Pi and ensure it has network connectivity
+Download the latest release image from [GitHub Releases](https://github.com/sslivins/agora/releases) — the file is named `agora-v{version}-pi-zero2w.img.xz`.
 
-### Install
+Flash it to an SD card using [Raspberry Pi Imager](https://www.raspberrypi.com/software/):
+
+1. Open Raspberry Pi Imager
+2. Choose **Use custom** and select the downloaded `.img.xz` file
+3. Select your SD card and write
+
+On first boot the device starts a Wi-Fi access point (**Agora-XXXX**) with a captive-portal web UI for configuring Wi-Fi, device name, and CMS connection. No SSH or manual config needed.
+
+### Option 2: Install on Existing Raspberry Pi OS
+
+Start with **Raspberry Pi OS 64-bit Lite**. In Imager settings, enable SSH and configure Wi-Fi, then:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sslivins/agora/main/scripts/setup-pi.sh | sudo bash
@@ -53,7 +61,7 @@ WebSocket client that maintains a persistent connection to [Agora CMS](https://g
 - Receives schedule windows and caches them locally
 - Evaluates schedules locally every 15 seconds
 - Pre-fetches upcoming assets with budget-aware LRU eviction
-- Accepts live commands: play, stop, config updates, reboot
+- Accepts live commands: play, stop, config updates, reboot, SSH toggle
 - Exponential backoff on connection errors (2s → 60s cap)
 
 ### State Machine
@@ -62,6 +70,16 @@ WebSocket client that maintains a persistent connection to [Agora CMS](https://g
 API writes desired.json  →  Player reads & acts  →  Player writes current.json  →  API reads for status
 CMS Client receives schedule → writes desired.json → Player acts
 ```
+
+### Provisioning (First Boot)
+
+On a fresh image with no Wi-Fi configured, the device enters **AP mode** (access point named `Agora-XXXX`). A captive-portal web UI lets the user:
+
+1. Scan and select a Wi-Fi network
+2. Set a device name
+3. Optionally configure CMS connection
+
+After saving, the device reboots into client mode and connects to the chosen network. If Wi-Fi is lost later, the device cycles between retry and temporary AP mode until connectivity is restored.
 
 ## Web UI Pages
 
@@ -73,41 +91,9 @@ CMS Client receives schedule → writes desired.json → Player acts
 | Settings | `/settings` | Device info, storage usage, CMS connection config |
 | Login | `/login` | Web authentication |
 
-## API Endpoints
+## API
 
-All `/api/v1/` endpoints require authentication (`X-API-Key` header or session cookie) unless noted.
-
-### Status
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/v1/health` | Health check (no auth) — device name, version, uptime |
-| `GET` | `/api/v1/status` | Current/desired state, asset count, schedule hash |
-
-### Playback
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/v1/play` | Play an asset `{"asset": "file.mp4", "loop": true}` |
-| `POST` | `/api/v1/stop` | Stop playback, show splash |
-| `POST` | `/api/v1/splash` | Show splash screen |
-
-### Assets
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/v1/assets` | List all assets |
-| `POST` | `/api/v1/assets/upload` | Upload a media file (max 500 MB) |
-| `DELETE` | `/api/v1/assets/{name}` | Delete an asset |
-| `POST` | `/api/v1/assets/{name}/set-splash` | Set asset as active splash screen |
-| `DELETE` | `/api/v1/assets/splash` | Clear splash override, revert to default |
-
-### CMS Configuration
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/v1/cms/config` | CMS connection status and config |
-| `POST` | `/api/v1/cms/config` | Set CMS server address and port |
+The full REST API is documented in [docs/openapi.yaml](docs/openapi.yaml). You can explore it interactively using the [Swagger Editor](https://editor.swagger.io/?url=https://raw.githubusercontent.com/sslivins/agora/main/docs/openapi.yaml).
 
 ## Directory Structure
 
@@ -159,9 +145,10 @@ Protocol version: **1**
 | Type | Description |
 |------|-------------|
 | `register` | Device ID, auth token, firmware version, storage capacity |
-| `status` | Heartbeat: playback state, disk usage, uptime (every 30s) |
+| `status` | Heartbeat: playback state, disk usage, uptime, CPU temp (every 30s) |
 | `fetch_request` | Request an asset from CMS |
-| `asset_ack` | Confirm asset downloaded |
+| `fetch_failed` | Download failed with reason and budget info |
+| `asset_ack` | Confirm asset downloaded with checksum |
 | `asset_deleted` | Confirm asset removed |
 
 ### CMS → Device
@@ -174,8 +161,9 @@ Protocol version: **1**
 | `stop` | Stop playback |
 | `fetch_asset` | Download URL + checksum + size |
 | `delete_asset` | Remove local asset |
-| `config` | Update splash, password, API key, device name |
+| `config` | Update splash, password, API key, device name, SSH access |
 | `reboot` | Reboot device |
+| `upgrade` | Trigger firmware upgrade |
 
 ## Development
 
@@ -194,7 +182,7 @@ pytest tests/ --tb=short -q
 
 ### Releasing
 
-The **Create Release** workflow (Actions → Create Release → Run workflow) reads the version from `api/__init__.py`, creates a git tag, builds the `.deb` package, publishes a GitHub Release, and updates the apt repository.
+The **Create Release** workflow (Actions → Create Release → Run workflow) reads the version from `api/__init__.py`, creates a git tag, builds the `.deb` package, publishes a GitHub Release with the `.deb` and the Pi image (`agora-v{version}-pi-zero2w.img.xz`), and updates the apt repository.
 
 Bump the version in `api/__init__.py` before running.
 
