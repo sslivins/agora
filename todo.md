@@ -95,3 +95,5 @@
   - Result: pipeline startup dropped from ~5s to <1s
 - [ ] Handle missing HDMI gracefully (no display connected)
 - [ ] Watchdog: auto-restart player if pipeline hangs
+- [ ] HDMI CEC standby after splash timeout — power off TV when in splash mode for N minutes (configurable, e.g. 30min), CEC wake on play command
+- [ ] Splash screen pixel shifting — subtle periodic shift to reduce burn-in on static splash image

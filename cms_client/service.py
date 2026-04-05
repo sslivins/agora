@@ -91,6 +91,27 @@ def _is_ssh_enabled() -> bool | None:
         return None
 
 
+def _is_local_api_enabled(persist_dir: Path) -> bool:
+    """Check if the local REST API is enabled.
+
+    Returns False only if the flag file explicitly contains 'false'.
+    Defaults to True (enabled) when no flag file exists.
+    """
+    flag_path = persist_dir / "local_api_enabled"
+    try:
+        return flag_path.read_text().strip().lower() != "false"
+    except (FileNotFoundError, OSError):
+        return True
+
+
+def _safe_unlink(path: Path) -> None:
+    """Delete a file without raising on missing."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _get_device_type() -> str:
     """Read device model from /proc/device-tree/model (standard on Raspberry Pi)."""
     try:
@@ -392,6 +413,8 @@ class CMSClient:
                         await self._handle_reboot(ws)
                     elif msg_type == "upgrade":
                         await self._handle_upgrade(ws)
+                    elif msg_type == "factory_reset":
+                        await self._handle_factory_reset(ws)
                     elif "error" in msg:
                         error_text = msg["error"]
                         logger.error("CMS error: %s", error_text)
@@ -455,6 +478,7 @@ class CMSClient:
             "error": current_data.get("error"),
             "error_timestamp": current_data.get("updated_at") if current_data.get("error") else None,
             "ssh_enabled": _is_ssh_enabled(),
+            "local_api_enabled": _is_local_api_enabled(self.settings.persist_dir),
         }
         await self._ws.send(json.dumps(status_msg))
 
@@ -938,12 +962,88 @@ class CMSClient:
                 os.system("sudo systemctl disable ssh")
                 logger.info("SSH disabled by CMS")
 
+        if "local_api_enabled" in msg and msg["local_api_enabled"] is not None:
+            enabled = msg["local_api_enabled"]
+            flag_path = self.settings.persist_dir / "local_api_enabled"
+            atomic_write(flag_path, "true" if enabled else "false")
+            try:
+                os.chmod(flag_path, 0o644)
+            except OSError:
+                pass
+            logger.info("Local API %s by CMS", "enabled" if enabled else "disabled")
+
     async def _handle_reboot(self, ws) -> None:
         logger.info("Reboot requested by CMS")
         try:
             await ws.send(json.dumps({"type": "reboot_ack"}))
         except Exception:
             pass
+        await asyncio.sleep(1)
+        os.system("sudo reboot")
+
+    async def _handle_factory_reset(self, ws) -> None:
+        """Factory reset: wipe all data and reboot into AP mode.
+
+        Reuses the same cleanup logic as the REST endpoint in
+        api/routers/system.py but runs from the CMS client context.
+        """
+        logger.warning("Factory reset requested by CMS")
+        try:
+            await ws.send(json.dumps({"type": "factory_reset_ack"}))
+        except Exception:
+            pass
+
+        persist_dir = self.settings.persist_dir
+        state_dir = self.settings.state_dir
+
+        # Remove provisioning flag
+        _safe_unlink(persist_dir / "provisioned")
+
+        # Remove CMS config and auth
+        _safe_unlink(persist_dir / "cms_config.json")
+        _safe_unlink(persist_dir / "cms_auth_token")
+        _safe_unlink(persist_dir / "device_name")
+        _safe_unlink(persist_dir / "api_key")
+        _safe_unlink(persist_dir / "local_api_enabled")
+
+        # Remove state files
+        _safe_unlink(state_dir / "cms_status.json")
+        _safe_unlink(state_dir / "cms_config.json")
+        _safe_unlink(state_dir / "schedule.json")
+        _safe_unlink(state_dir / "assets.json")
+
+        # Wipe assets on disk
+        for subdir in [self.settings.videos_dir, self.settings.images_dir]:
+            if subdir.exists():
+                for f in subdir.iterdir():
+                    if f.is_file():
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+
+        # Forget all saved Wi-Fi connections
+        try:
+            from provision.network import forget_all_wifi
+            forget_all_wifi()
+        except ImportError:
+            try:
+                result = subprocess.run(
+                    ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().splitlines():
+                        parts = line.split(":")
+                        if len(parts) >= 2 and parts[1] == "802-11-wireless":
+                            subprocess.run(
+                                ["nmcli", "connection", "delete", parts[0]],
+                                capture_output=True, timeout=10,
+                            )
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+
+        logger.warning("Factory reset complete — rebooting")
         await asyncio.sleep(1)
         os.system("sudo reboot")
 

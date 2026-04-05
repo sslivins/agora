@@ -2,7 +2,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from api import __version__
@@ -26,6 +26,23 @@ app.state.start_time = time.time()
 # Static files
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+# Block API requests when the local REST API is disabled by CMS
+@app.middleware("http")
+async def check_local_api_enabled(request: Request, call_next):
+    if request.url.path.startswith("/api/"):
+        flag_path = request.app.state.settings.persist_dir / "local_api_enabled"
+        try:
+            disabled = flag_path.read_text().strip().lower() == "false"
+        except (FileNotFoundError, OSError):
+            disabled = False
+        if disabled:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Local API disabled by CMS. Use the CMS to manage this device."},
+            )
+    return await call_next(request)
 
 
 # Redirect to login when web auth is missing
