@@ -79,6 +79,18 @@ def _get_cpu_temp() -> float | None:
     return None
 
 
+def _is_ssh_enabled() -> bool | None:
+    """Check if the SSH service is enabled. Returns True/False or None if unknown."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-enabled", "ssh"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() == "enabled"
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def _get_device_type() -> str:
     """Read device model from /proc/device-tree/model (standard on Raspberry Pi)."""
     try:
@@ -442,6 +454,7 @@ class CMSClient:
             "cpu_temp_c": _get_cpu_temp(),
             "error": current_data.get("error"),
             "error_timestamp": current_data.get("updated_at") if current_data.get("error") else None,
+            "ssh_enabled": _is_ssh_enabled(),
         }
         await self._ws.send(json.dumps(status_msg))
 
