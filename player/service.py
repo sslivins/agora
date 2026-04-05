@@ -27,7 +27,7 @@ class AgoraPlayer:
     VIDEO_PIPELINE = (
         'filesrc location="{path}" ! '
         "qtdemux name=dmux "
-        "dmux.video_0 ! queue ! h264parse ! v4l2h264dec ! kmssink sync=true "
+        "dmux.video_0 ! queue ! h264parse ! v4l2h264dec ! kmssink driver-name=vc4 sync=true "
         "dmux.audio_0 ! queue ! decodebin ! audioconvert ! audioresample ! "
         'alsasink device="hdmi:CARD=vc4hdmi,DEV=0"'
     )
@@ -35,21 +35,21 @@ class AgoraPlayer:
     VIDEO_PIPELINE_NO_AUDIO = (
         'filesrc location="{path}" ! '
         "qtdemux name=dmux "
-        "dmux.video_0 ! queue ! h264parse ! v4l2h264dec ! kmssink sync=false"
+        "dmux.video_0 ! queue ! h264parse ! v4l2h264dec ! kmssink driver-name=vc4 sync=false"
     )
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
         "jpegparse ! jpegdec ! videoconvert ! videoscale add-borders=true ! "
         "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1 ! "
-        "imagefreeze ! kmssink sync=false"
+        "imagefreeze ! kmssink driver-name=vc4 sync=false"
     )
 
     IMAGE_PIPELINE_OTHER = (
         'filesrc location="{path}" ! '
         "decodebin ! videoconvert ! videoscale add-borders=true ! "
         "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1 ! "
-        "imagefreeze ! kmssink sync=false"
+        "imagefreeze ! kmssink driver-name=vc4 sync=false"
     )
 
 
