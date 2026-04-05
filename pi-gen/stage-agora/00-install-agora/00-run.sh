@@ -11,6 +11,9 @@ apt-get update -qq
 # ── Install Agora (pulls in network-manager, dnsmasq, avahi-daemon) ──
 apt-get install -y agora
 
+# ── Disable cloud-init (not needed on embedded Pi, saves ~6s boot time) ──
+touch /etc/cloud/cloud-init.disabled
+
 # ── Ensure device boots into captive portal (no provisioned flag) ──
 rm -f /opt/agora/persist/provisioned
 
