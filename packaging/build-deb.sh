@@ -40,6 +40,8 @@ mkdir -p "${BUILD_DIR}/usr/share/plymouth/themes/splash"
 for dir in api player shared cms_client provision; do
     cp -r "${REPO_ROOT}/${dir}" "${BUILD_DIR}/opt/agora/src/"
 done
+# Remove dev-only tools not needed at runtime
+rm -f "${BUILD_DIR}/opt/agora/src/provision/preview.py"
 cp "${REPO_ROOT}/requirements-api.txt" "${BUILD_DIR}/opt/agora/src/"
 cp "${REPO_ROOT}/requirements-player.txt" "${BUILD_DIR}/opt/agora/src/"
 cp "${REPO_ROOT}/requirements-cms-client.txt" "${BUILD_DIR}/opt/agora/src/"

@@ -112,11 +112,16 @@ async def _run_portal(
     display: ProvisionDisplay | None = None,
     phone_spinner_stop: threading.Event | None = None,
     phone_spinner_thread: threading.Thread | None = None,
+    server_ready: asyncio.Event | None = None,
 ) -> dict | None:
     """Run the captive portal web server.
 
     Returns the provision data dict when the user submits the form,
     or None if shutdown was triggered or the timeout expired.
+
+    If *server_ready* is provided it will be set once uvicorn is listening
+    on the portal port, allowing the caller to delay AP activation until
+    the HTTP server can actually serve captive-portal requests.
     """
     from provision.app import app, portal_events, reset_phone_seen
 
@@ -178,6 +183,16 @@ async def _run_portal(
                 return
 
     serve_task = asyncio.create_task(server.serve())
+
+    # Signal caller once uvicorn is actually listening
+    ready_task = None
+    if server_ready is not None:
+        async def _signal_ready():
+            while not server.started:
+                await asyncio.sleep(0.1)
+            server_ready.set()
+        ready_task = asyncio.create_task(_signal_ready())
+
     watch_tasks = [
         asyncio.create_task(_watch_shutdown()),
         asyncio.create_task(_watch_timeout()),
@@ -188,6 +203,8 @@ async def _run_portal(
     await serve_task
 
     # Cancel watcher tasks — they may be blocking on events that never come
+    if ready_task is not None:
+        ready_task.cancel()
     for t in watch_tasks:
         t.cancel()
     await asyncio.gather(*watch_tasks, return_exceptions=True)
@@ -525,17 +542,18 @@ async def run_service(force_oobe: bool = False) -> None:
         )
         await proc.wait()
 
-        # Welcome screen
-        display.show_welcome()
-        await asyncio.sleep(OOBE_DISPLAY_HOLD)
+        # Welcome screen with animated spinner while we start up
+        welcome_spinner_stop = threading.Event()
+        welcome_spinner_thread = threading.Thread(
+            target=display.animate_welcome,
+            kwargs={"stop_event": welcome_spinner_stop},
+            daemon=True,
+        )
+        welcome_spinner_thread.start()
 
         # ── Phase 1: Wi-Fi provisioning (loops on failure) ───────────
         while not shutdown_event.is_set():
-            if not _enter_ap_mode(ssid):
-                logger.error("Cannot start AP mode — exiting")
-                sys.exit(1)
-
-            # Animated "waiting for phone" screen with spinner
+            # Prepare the phone-connect spinner (started after AP is up)
             phone_spinner_stop = threading.Event()
             phone_spinner_thread = threading.Thread(
                 target=display.animate_connect_phone,
@@ -543,14 +561,37 @@ async def run_service(force_oobe: bool = False) -> None:
                 kwargs={"stop_event": phone_spinner_stop},
                 daemon=True,
             )
-            phone_spinner_thread.start()
 
-            # Run portal until user submits config
-            provision_data = await _run_portal(
+            # Start the captive portal server FIRST so it's listening on
+            # port 80 before the AP broadcasts the SSID.  This prevents
+            # the race where a phone connects to the AP but gets
+            # "connection refused" because uvicorn hasn't bound yet.
+            server_ready = asyncio.Event()
+            portal_task = asyncio.create_task(_run_portal(
                 shutdown_event, timeout=None, display=display,
                 phone_spinner_stop=phone_spinner_stop,
                 phone_spinner_thread=phone_spinner_thread,
-            )
+                server_ready=server_ready,
+            ))
+
+            # Wait for uvicorn to be listening (< 1s typically)
+            await server_ready.wait()
+            logger.info("Portal server ready on port %d", PORTAL_PORT)
+
+            # Now start the AP — phones that connect will hit a live server
+            if not _enter_ap_mode(ssid):
+                logger.error("Cannot start AP mode — exiting")
+                _stop_spinner(welcome_spinner_stop, welcome_spinner_thread)
+                portal_task.cancel()
+                await asyncio.gather(portal_task, return_exceptions=True)
+                sys.exit(1)
+
+            # Stop the welcome spinner and transition to "connect phone"
+            _stop_spinner(welcome_spinner_stop, welcome_spinner_thread)
+            phone_spinner_thread.start()
+
+            # Wait for the user to submit Wi-Fi config via the portal
+            provision_data = await portal_task
             _stop_spinner(phone_spinner_stop, phone_spinner_thread)
             logger.info("Portal returned: %s", provision_data)
             _exit_ap_mode()
@@ -587,6 +628,19 @@ async def run_service(force_oobe: bool = False) -> None:
                 )
                 await proc.wait()
                 logger.info("CMS client restarted")
+
+                # Pre-start the API and player services in the background
+                # while waiting for CMS adoption.  By the time OOBE finishes
+                # they'll have completed their slow Python/GStreamer imports
+                # and be ready to serve immediately.
+                for svc in ("agora-api", "agora-player"):
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo", "systemctl", "start", svc,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc.wait()
+                    logger.info("Pre-started %s", svc)
 
                 # Try mDNS auto-discovery if no CMS was explicitly configured
                 if not _get_cms_host():
@@ -632,10 +686,11 @@ async def run_service(force_oobe: bool = False) -> None:
         display.close()
 
         # Restart Plymouth so the animated boot splash covers the gap while
-        # the player process imports GStreamer and builds its first pipeline
-        # (~20-25s on Pi Zero 2 W).  The player calls `plymouth quit
-        # --retain-splash` before claiming the DRM device, so the handoff
-        # is seamless.
+        # the player process imports GStreamer and builds its first pipeline.
+        # The player was pre-started during CMS adoption wait so it should
+        # already be warm — Plymouth covers any remaining init time.
+        # The player calls `plymouth quit --retain-splash` before claiming
+        # the DRM device, so the handoff is seamless.
         logger.info("Starting Plymouth splash for player handoff")
         proc = await asyncio.create_subprocess_exec(
             "sudo", "plymouthd", "--mode=boot",
@@ -651,7 +706,7 @@ async def run_service(force_oobe: bool = False) -> None:
         await proc.wait()
         logger.info("Plymouth splash active")
 
-        # Start the player now that provisioning is done
+        # Ensure the player is running (no-op if already pre-started)
         proc = await asyncio.create_subprocess_exec(
             "sudo", "systemctl", "start", "agora-player",
             stdout=asyncio.subprocess.DEVNULL,
@@ -675,16 +730,24 @@ async def run_service(force_oobe: bool = False) -> None:
 
             # Wi-Fi failed — enter AP mode with timeout
             logger.warning("Wi-Fi not available — entering AP mode for %ds", AP_SESSION_TIMEOUT)
+
+            # Start portal server before AP so it's listening when phones connect
+            portal_shutdown = asyncio.Event()
+            server_ready = asyncio.Event()
+            portal_task = asyncio.create_task(_run_portal(
+                portal_shutdown, timeout=AP_SESSION_TIMEOUT,
+                server_ready=server_ready,
+            ))
+            await server_ready.wait()
+
             if not _enter_ap_mode(ssid):
                 logger.error("Cannot start AP mode — retrying in 30s")
+                portal_shutdown.set()
+                await asyncio.gather(portal_task, return_exceptions=True)
                 await asyncio.sleep(30)
                 continue
 
-            # Reset shutdown event for this AP session
-            portal_shutdown = asyncio.Event()
-            provision_data = await _run_portal(
-                portal_shutdown, timeout=AP_SESSION_TIMEOUT,
-            )
+            provision_data = await portal_task
             _exit_ap_mode()
 
             if provision_data:
