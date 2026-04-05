@@ -27,7 +27,7 @@ from shared.state import read_state, write_state
 class TestSyncDedup:
     """_handle_sync must not write desired.json when the schedule result is unchanged."""
 
-    def _make_client(self, tmp_path):
+    def _make_client(self, tmp_path, assets=None):
         from api.config import Settings
         from cms_client.service import CMSClient
 
@@ -41,6 +41,9 @@ class TestSyncDedup:
         )
         settings.ensure_dirs()
         client = CMSClient(settings)
+        # Pre-register assets so has_asset() returns True
+        for name, checksum in (assets or []):
+            client.asset_manager.register(name, f"videos/{name}", 1024, checksum or "")
         return client
 
     def _sync_data(self, default_asset="splash.jpg", default_asset_checksum=None, schedules=None):
@@ -55,7 +58,7 @@ class TestSyncDedup:
     @pytest.mark.asyncio
     async def test_duplicate_sync_no_rewrite(self, tmp_path):
         """Two identical syncs should only write desired.json once."""
-        client = self._make_client(tmp_path)
+        client = self._make_client(tmp_path, assets=[("image.jpg", None)])
         sync = self._sync_data(default_asset="image.jpg")
 
         # First sync — should write desired.json
@@ -72,7 +75,7 @@ class TestSyncDedup:
     @pytest.mark.asyncio
     async def test_changed_sync_does_rewrite(self, tmp_path):
         """A sync that changes the default asset should write desired.json."""
-        client = self._make_client(tmp_path)
+        client = self._make_client(tmp_path, assets=[("image_a.jpg", None), ("image_b.jpg", None)])
 
         await client._handle_sync(self._sync_data(default_asset="image_a.jpg"))
         state1 = read_state(client.settings.desired_state_path, DesiredState)
@@ -86,7 +89,7 @@ class TestSyncDedup:
     @pytest.mark.asyncio
     async def test_schedule_winner_unchanged_no_rewrite(self, tmp_path):
         """Sync with same schedule winner should not rewrite desired.json."""
-        client = self._make_client(tmp_path)
+        client = self._make_client(tmp_path, assets=[("video.mp4", None)])
         schedules = [
             {
                 "id": "s1",
@@ -113,7 +116,7 @@ class TestSyncDedup:
     @pytest.mark.asyncio
     async def test_replaced_default_asset_triggers_rewrite(self, tmp_path):
         """Same asset name but different checksum should rewrite desired.json."""
-        client = self._make_client(tmp_path)
+        client = self._make_client(tmp_path, assets=[("image.jpg", "aaa")])
 
         await client._handle_sync(
             self._sync_data(default_asset="image.jpg", default_asset_checksum="aaa")
@@ -131,7 +134,7 @@ class TestSyncDedup:
     @pytest.mark.asyncio
     async def test_replaced_schedule_asset_triggers_rewrite(self, tmp_path):
         """Same schedule asset name but different checksum should trigger rewrite."""
-        client = self._make_client(tmp_path)
+        client = self._make_client(tmp_path, assets=[("video.mp4", "checksum_old")])
         schedules_v1 = [
             {
                 "id": "s1", "name": "Test", "asset": "video.mp4",
@@ -162,7 +165,7 @@ class TestSyncDedup:
     @pytest.mark.asyncio
     async def test_eval_loop_no_rewrite(self, tmp_path):
         """The 15s eval loop should not rewrite desired.json for unchanged result."""
-        client = self._make_client(tmp_path)
+        client = self._make_client(tmp_path, assets=[("image.jpg", None)])
         sync = self._sync_data(default_asset="image.jpg")
 
         await client._handle_sync(sync)

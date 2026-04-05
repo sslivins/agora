@@ -559,6 +559,20 @@ class CMSClient:
             asset = winner.get("asset", "")
             checksum = winner.get("asset_checksum")
             loop_count = winner.get("loop_count")
+
+            if not self.asset_manager.has_asset(asset, checksum):
+                # Asset not on device yet — request fetch and show splash
+                logger.info(
+                    "Schedule: asset %s not on device, requesting fetch", asset,
+                )
+                self._request_asset_fetch(asset)
+                # Don't cache — retry on next eval when asset may have arrived
+                if self._last_eval_state != ("waiting", asset, checksum):
+                    desired = DesiredState(mode=PlaybackMode.SPLASH)
+                    write_state(self.settings.desired_state_path, desired)
+                    self._last_eval_state = ("waiting", asset, checksum)
+                return
+
             state_key = ("play", asset, checksum, loop_count)
             if self._last_eval_state == state_key:
                 return
@@ -569,6 +583,19 @@ class CMSClient:
             logger.info("Schedule: playing %s (priority %d, loop_count=%s)", asset, winner.get("priority", 0), loop_count)
         elif default_asset:
             default_checksum = sync_data.get("default_asset_checksum")
+
+            if not self.asset_manager.has_asset(default_asset, default_checksum):
+                logger.info(
+                    "Schedule: default asset %s not on device, requesting fetch",
+                    default_asset,
+                )
+                self._request_asset_fetch(default_asset)
+                if self._last_eval_state != ("waiting", default_asset, default_checksum):
+                    desired = DesiredState(mode=PlaybackMode.SPLASH)
+                    write_state(self.settings.desired_state_path, desired)
+                    self._last_eval_state = ("waiting", default_asset, default_checksum)
+                return
+
             state_key = ("default", default_asset, default_checksum)
             if self._last_eval_state == state_key:
                 return
@@ -585,6 +612,23 @@ class CMSClient:
             write_state(self.settings.desired_state_path, desired)
             self._last_eval_state = state_key
             logger.info("Schedule: no active schedule, showing splash")
+
+    def _request_asset_fetch(self, asset_name: str) -> None:
+        """Fire-and-forget a fetch_request for a missing asset via WebSocket."""
+        ws = self._ws
+        if not ws:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        msg = json.dumps({
+            "type": "fetch_request",
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "asset": asset_name,
+        })
+        loop.create_task(ws.send(msg))
 
     async def _schedule_eval_loop(self) -> None:
         """Local schedule evaluator — re-evaluates cached schedule every 15s."""
