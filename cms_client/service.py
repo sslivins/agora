@@ -914,6 +914,17 @@ class CMSClient:
             atomic_write(boot_config, json.dumps(cfg, indent=2))
             logger.info("API key updated")
 
+        if "ssh_enabled" in msg and msg["ssh_enabled"] is not None:
+            enabled = msg["ssh_enabled"]
+            if enabled:
+                os.system("sudo systemctl enable ssh")
+                os.system("sudo systemctl start ssh")
+                logger.info("SSH enabled by CMS")
+            else:
+                os.system("sudo systemctl stop ssh")
+                os.system("sudo systemctl disable ssh")
+                logger.info("SSH disabled by CMS")
+
     async def _handle_reboot(self, ws) -> None:
         logger.info("Reboot requested by CMS")
         try:
