@@ -85,7 +85,7 @@ def _draw_bg(ctx: cairo.Context, w: int, h: int) -> None:
 def _draw_text(
     ctx: cairo.Context, cx: float, y: float, text: str, font_desc: str,
     color: tuple = WHITE, alpha: float = 1.0, center: bool = True,
-    wrap_width: Optional[float] = None,
+    wrap_width: Optional[float] = None, markup: bool = False,
 ) -> float:
     """Draw text and return its pixel height."""
     layout = PangoCairo.create_layout(ctx)
@@ -93,7 +93,10 @@ def _draw_text(
     if wrap_width:
         layout.set_width(int(wrap_width * Pango.SCALE))
         layout.set_alignment(Pango.Alignment.CENTER)
-    layout.set_text(text, -1)
+    if markup:
+        layout.set_markup(text, -1)
+    else:
+        layout.set_text(text, -1)
     _, ext = layout.get_pixel_extents()
     if center and not wrap_width:
         ctx.move_to(cx - ext.width / 2, y)
@@ -182,6 +185,7 @@ def _draw_checkmark(ctx: cairo.Context, cx: float, cy: float, size: float = 60) 
 
 def _draw_x_mark(ctx: cairo.Context, cx: float, cy: float, size: float = 50) -> None:
     """Draw a red circle with an X."""
+    ctx.new_path()
     ctx.arc(cx, cy, size, 0, 6.28318)
     ctx.set_source_rgba(*RED, 0.15)
     ctx.fill_preserve()
@@ -348,8 +352,11 @@ class ProvisionDisplay:
 
     # ── Static screens ───────────────────────────────────────────────────
 
-    def show_welcome(self) -> None:
-        """Screen: Welcome — 'Setting up your Agora...'"""
+    def show_welcome(self, frame: int = -1) -> None:
+        """Screen: Welcome — 'Setting up your Agora...'
+
+        If *frame* >= 0, draw an animated spinner below the status text.
+        """
         if not self.available:
             return
         ctx = self._ctx()
@@ -362,13 +369,32 @@ class ProvisionDisplay:
         y += 70
         _draw_text(
             ctx, cx, y,
-            "Let's get your display set up.\nThis will only take a minute.",
+            "Let's get your device set up.\nThis will only take a minute.",
             "Sans 28", WHITE, alpha=0.7, wrap_width=600,
         )
         y += 120
         _draw_text(ctx, cx, y, "Starting setup...", "Sans 26", AMBER)
+        if frame >= 0:
+            y += 180
+            _draw_spinner(ctx, cx, y, 25, frame)
         _draw_progress_dots(ctx, cx, h, 0)
         self._blit()
+
+    def animate_welcome(self, *, stop_event=None, fps: int = 10) -> None:
+        """Animate the welcome screen with a spinner."""
+        if not self.available:
+            return
+        frame = 0
+        frame_time = 1.0 / fps
+        while True:
+            t0 = time.monotonic()
+            self.show_welcome(frame=frame)
+            frame += 1
+            if stop_event and stop_event.is_set():
+                break
+            elapsed = time.monotonic() - t0
+            if elapsed < frame_time:
+                time.sleep(frame_time - elapsed)
 
     def show_connect_phone(self, ssid: str, frame: int = -1) -> None:
         """Screen: Step 1 — 'Connect your phone to Agora-XXXX'.
@@ -398,7 +424,7 @@ class ProvisionDisplay:
         y += th + 40
         th = _draw_text(ctx, cx, y, "Waiting for connection...", "Sans 28", AMBER)
         if frame >= 0:
-            _draw_spinner(ctx, cx, y + th + 50, radius=25, frame=frame, num_dots=8)
+            _draw_spinner(ctx, cx, y + th + 65, radius=25, frame=frame, num_dots=8)
         _draw_progress_dots(ctx, cx, h, 1)
         self._blit()
 
@@ -440,7 +466,7 @@ class ProvisionDisplay:
             ctx, cx, y,
             "A setup page should open on your phone.\n"
             "If it doesn't, open your browser and go to:",
-            "Sans 26", WHITE, alpha=0.7, wrap_width=600,
+            "Sans 26", WHITE, alpha=0.7, wrap_width=900,
         )
         y += th + 30
         _draw_badge(ctx, cx, y, "http://10.42.0.1", "Monospace Bold 32",
@@ -473,8 +499,8 @@ class ProvisionDisplay:
         y += 50
         _draw_text(ctx, cx, y, "Wi-Fi Connected!", "Sans Bold 40", GREEN)
         y += 70
-        _draw_checkmark(ctx, cx, y + 50)
-        y += 140
+        _draw_checkmark(ctx, cx, y + 80)
+        y += 240
         _draw_text(ctx, cx, y, f"Connected to {network}", "Sans 28", WHITE, alpha=0.7)
         _draw_progress_dots(ctx, cx, h, 3)
         self._blit()
@@ -492,17 +518,24 @@ class ProvisionDisplay:
         _draw_text(ctx, cx, y, "Step 3 of 5", "Sans 24", WHITE, alpha=0.5)
         y += 50
         _draw_text(ctx, cx, y, "Wi-Fi Connection Failed", "Sans Bold 40", RED)
-        y += 70
+        y += 80
         _draw_x_mark(ctx, cx, y + 45)
         y += 130
         if error:
             _draw_text(ctx, cx, y, error, "Sans 26", WHITE, alpha=0.6)
             y += 50
+        th = _draw_text(
+            ctx, cx, y,
+            f"Could not connect to:",
+            "Sans 26", WHITE, alpha=0.5,
+        )
+        y += th + 10
+        th = _draw_text(ctx, cx, y, f"\"{network}\"", "Sans Bold 28", WHITE, alpha=0.7)
+        y += th + 100
         _draw_text(
             ctx, cx, y,
-            f"Could not connect to \"{network}\".\n"
             "Restarting setup so you can try again...",
-            "Sans 26", WHITE, alpha=0.5, wrap_width=550,
+            "Sans 26", WHITE, alpha=0.5,
         )
         _draw_progress_dots(ctx, cx, h, 3)
         self._blit()
@@ -515,7 +548,7 @@ class ProvisionDisplay:
             step="Step 4 of 5", title="Contacting Server",
             detail=host, detail_font="Monospace 32", detail_color=BLUE,
             subtitle="Verifying connection to the\ncontent management server...",
-            progress=4,
+            progress=4, y_offset=100,
         )
 
     def show_cms_connected_pending(self, cms_host: str = "") -> None:
@@ -536,20 +569,23 @@ class ProvisionDisplay:
             ctx, cx, y,
             "This device has connected to the server\n"
             "and is waiting to be adopted.",
-            "Sans 26", WHITE, alpha=0.7, wrap_width=600,
+            "Sans 26", WHITE, alpha=0.7, wrap_width=800,
         )
         y += th + 30
         th = _draw_text(
             ctx, cx, y,
             "Open the CMS in your browser and click\n"
-            '"Adopt" next to this device:',
-            "Sans 26", WHITE, alpha=0.5, wrap_width=600,
+            '<b>"Adopt"</b> next to this device:',
+            "Sans 26", WHITE, alpha=0.5, wrap_width=800, markup=True,
         )
         y += th + 25
         if cms_host:
             url = f"http://{cms_host}"
-            _draw_badge(ctx, cx, y, url, "Monospace Bold 28",
+            bw, bh = _draw_badge(ctx, cx, y, url, "Monospace Bold 28",
                         bg_color=(0.3, 0.3, 0.4))
+            y += bh + 90
+        _draw_spinner(ctx, cx, y, 20, self._frame)
+        self._frame += 1
         _draw_progress_dots(ctx, cx, h, 5)
         self._blit()
 
@@ -569,9 +605,14 @@ class ProvisionDisplay:
         y += th + 30
         th = _draw_text(
             ctx, cx, y,
-            "Your device has been adopted by the server.\n"
+            "Your device has been adopted by the server.",
+            "Sans 28", WHITE, alpha=0.7,
+        )
+        y += th + 30
+        th = _draw_text(
+            ctx, cx, y,
             "Content will appear shortly.",
-            "Sans 28", WHITE, alpha=0.7, wrap_width=500,
+            "Sans 28", WHITE, alpha=0.7,
         )
         _draw_progress_dots(ctx, cx, h, 5)
         self._blit()
@@ -651,7 +692,7 @@ class ProvisionDisplay:
 
     def _show_spinner_screen(
         self, *, step: str, title: str, detail: str, detail_font: str,
-        detail_color: tuple, subtitle: str, progress: int,
+        detail_color: tuple, subtitle: str, progress: int, y_offset: int = 0,
     ) -> None:
         """Render a single frame of a spinner screen and blit it."""
         ctx = self._ctx()
@@ -661,13 +702,13 @@ class ProvisionDisplay:
         y = h * 0.12
         y = _draw_logo(ctx, cx, y) + 10
         _draw_text(ctx, cx, y, step, "Sans 24", WHITE, alpha=0.5)
-        y += 50
+        y += 50 + y_offset
         _draw_text(ctx, cx, y, title, "Sans Bold 40", WHITE)
         y += 80
         _draw_text(ctx, cx, y, detail, detail_font, detail_color)
-        y += 60
-        _draw_spinner(ctx, cx, y + 15, 20, self._frame)
-        y += 50
+        y += 70
+        _draw_spinner(ctx, cx, y + 30, 20, self._frame)
+        y += 85
         _draw_text(ctx, cx, y, subtitle, "Sans 26", WHITE, alpha=0.6, wrap_width=500)
         _draw_progress_dots(ctx, cx, h, progress)
         self._frame += 1
@@ -676,7 +717,7 @@ class ProvisionDisplay:
     def animate_spinner(
         self, *, step: str, title: str, detail: str, detail_font: str = "Sans Bold 36",
         detail_color: tuple = BLUE, subtitle: str, progress: int,
-        duration: float = 0.0, stop_event=None, fps: int = 10,
+        duration: float = 0.0, stop_event=None, fps: int = 10, y_offset: int = 0,
     ) -> None:
         """Run a spinner animation loop.
 
@@ -694,6 +735,7 @@ class ProvisionDisplay:
             self._show_spinner_screen(
                 step=step, title=title, detail=detail, detail_font=detail_font,
                 detail_color=detail_color, subtitle=subtitle, progress=progress,
+                y_offset=y_offset,
             )
             # Check exit conditions
             if stop_event and stop_event.is_set():
