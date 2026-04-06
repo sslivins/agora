@@ -56,9 +56,32 @@ Two processes, communicating via JSON state files on disk (`desired.json` and `c
 
 - **`main` is sacred** — never commit directly to `main`.
 - All changes must be made on a feature branch and merged via pull request.
-- Branch naming: `feature/<short-description>`, `fix/<short-description>`, `chore/<short-description>`.
+- Branch naming: `feat/<short-description>`, `fix/<short-description>`, `chore/<short-description>`, `perf/<short-description>`, `refactor/<short-description>`, `docs/<short-description>`, `test/<short-description>`, `ci/<short-description>`.
 - **Never merge a PR** unless the user explicitly asks you to. Creating PRs is fine; merging requires explicit approval.
 - Bump the version in `api/__init__.py` and `docs/openapi.yaml` when shipping user-facing changes.
+- **After creating a PR, always check CI status** using `gh pr checks <number>` or `gh run list`. Monitor until all checks pass. If any fail, inspect the logs with `gh run view <run-id> --log-failed`, fix issues, push fixes, and re-check until green.
+
+## Commit Messages — Conventional Commits
+
+All commit messages **must** use [Conventional Commits](https://www.conventionalcommits.org/) format. The release workflow auto-generates changelogs from these prefixes.
+
+**Format:** `<type>(<optional scope>): <description>`
+
+| Prefix | When to use | Example |
+|---|---|---|
+| `feat:` | New feature or capability | `feat: add device group scheduling` |
+| `fix:` | Bug fix | `fix: prevent player crash on missing asset` |
+| `perf:` | Performance improvement | `perf: reduce GStreamer pipeline startup time` |
+| `refactor:` | Code restructuring (no behavior change) | `refactor: extract asset validation helper` |
+| `test:` | Adding or updating tests only | `test: add OOBE provisioning flow tests` |
+| `docs:` | Documentation only | `docs: update OpenAPI spec for new endpoints` |
+| `ci:` | CI/CD workflow changes | `ci: add changelog generation to release workflow` |
+| `chore:` | Maintenance, deps, tooling | `chore: bump FastAPI to 0.115` |
+
+- Use the **imperative mood** in descriptions: "add" not "added", "fix" not "fixes".
+- Optional scope in parentheses: `fix(player): handle missing codec gracefully`.
+- Keep the first line under 72 characters.
+- Add a blank line + body for complex changes.
 
 ## Hardware Target
 

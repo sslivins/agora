@@ -43,12 +43,105 @@ jobs:
       - name: Build .deb package
         run: bash packaging/build-deb.sh "${{ steps.version.outputs.version }}"
 
+      - name: Generate changelog
+        id: changelog
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n1)
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+          echo "Generating changelog: ${PREV_TAG:-initial}..${TAG}"
+
+          FEATURES=$(git log ${RANGE} --oneline --no-merges --grep="^feat" | sed 's/^[a-f0-9]* feat[^:]*: //' || true)
+          FIXES=$(git log ${RANGE} --oneline --no-merges --grep="^fix" | sed 's/^[a-f0-9]* fix[^:]*: //' || true)
+          PERF=$(git log ${RANGE} --oneline --no-merges --grep="^perf" | sed 's/^[a-f0-9]* perf[^:]*: //' || true)
+          REFACTORS=$(git log ${RANGE} --oneline --no-merges --grep="^refactor" | sed 's/^[a-f0-9]* refactor[^:]*: //' || true)
+          TESTS=$(git log ${RANGE} --oneline --no-merges --grep="^test" | sed 's/^[a-f0-9]* test[^:]*: //' || true)
+          DOCS=$(git log ${RANGE} --oneline --no-merges --grep="^docs" | sed 's/^[a-f0-9]* docs[^:]*: //' || true)
+          CI_CHANGES=$(git log ${RANGE} --oneline --no-merges --grep="^ci" | sed 's/^[a-f0-9]* ci[^:]*: //' || true)
+          CHORE=$(git log ${RANGE} --oneline --no-merges --grep="^chore" | sed 's/^[a-f0-9]* chore[^:]*: //' || true)
+
+          # Collect commit hashes that matched a category
+          MATCHED=$(git log ${RANGE} --oneline --no-merges --grep="^feat\|^fix\|^perf\|^refactor\|^test\|^docs\|^ci\|^chore" --format="%h" || true)
+          # All commits
+          ALL=$(git log ${RANGE} --oneline --no-merges --format="%h %s" || true)
+          # Other = commits not matching any conventional prefix
+          OTHER=""
+          while IFS= read -r line; do
+            hash=$(echo "$line" | cut -d' ' -f1)
+            if ! echo "$MATCHED" | grep -q "^${hash}$"; then
+              msg=$(echo "$line" | cut -d' ' -f2-)
+              OTHER="${OTHER}${msg}"$'\n'
+            fi
+          done <<< "$ALL"
+          OTHER=$(echo "$OTHER" | sed '/^$/d')
+
+          {
+            echo "## Agora ${TAG}"
+            echo ""
+            if [ -n "$FEATURES" ]; then
+              echo "### ✨ Features"
+              echo "$FEATURES" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$FIXES" ]; then
+              echo "### 🐛 Fixes"
+              echo "$FIXES" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$PERF" ]; then
+              echo "### ⚡ Performance"
+              echo "$PERF" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$REFACTORS" ]; then
+              echo "### ♻️ Refactors"
+              echo "$REFACTORS" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$TESTS" ]; then
+              echo "### 🧪 Tests"
+              echo "$TESTS" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$DOCS" ]; then
+              echo "### 📝 Documentation"
+              echo "$DOCS" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$CI_CHANGES" ]; then
+              echo "### 🔧 CI"
+              echo "$CI_CHANGES" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$CHORE" ]; then
+              echo "### 🧹 Chores"
+              echo "$CHORE" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            if [ -n "$OTHER" ]; then
+              echo "### 📦 Other"
+              echo "$OTHER" | while IFS= read -r line; do echo "- $line"; done
+              echo ""
+            fi
+            echo "---"
+            echo ""
+            echo "**Full diff:** [\`${PREV_TAG:-initial}...${TAG}\`](https://github.com/${{ github.repository }}/compare/${PREV_TAG:-$(git rev-list --max-parents=0 HEAD | head -1)}...${TAG})"
+          } > /tmp/release_body.md
+
+          echo "📋 Generated changelog:"
+          cat /tmp/release_body.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
+          name: Agora ${{ steps.version.outputs.tag }}
+          body_path: /tmp/release_body.md
           files: build/*.deb
-          generate_release_notes: true
 
   publish-apt:
     needs: release
