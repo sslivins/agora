@@ -75,10 +75,7 @@ def _get_fb_info(fb_path: str = "/dev/fb0") -> tuple[int, int, int]:
 
 
 def _draw_bg(ctx: cairo.Context, w: int, h: int) -> None:
-    pat = cairo.LinearGradient(0, 0, 0, h)
-    pat.add_color_stop_rgb(0, 0.08, 0.08, 0.12)
-    pat.add_color_stop_rgb(1, 0.04, 0.04, 0.08)
-    ctx.set_source(pat)
+    ctx.set_source_rgb(0.06, 0.06, 0.10)
     ctx.paint()
 
 
@@ -370,7 +367,7 @@ class ProvisionDisplay:
         _draw_text(
             ctx, cx, y,
             "Let's get your device set up.\nThis will only take a minute.",
-            "Sans 28", WHITE, alpha=0.7, wrap_width=600,
+            "Sans 28", WHITE, alpha=0.7, wrap_width=800,
         )
         y += 120
         _draw_text(ctx, cx, y, "Starting setup...", "Sans 26", AMBER)
@@ -419,7 +416,7 @@ class ProvisionDisplay:
             ctx, cx, y,
             "On your phone, open Wi-Fi settings and\n"
             "connect to the network shown above.",
-            "Sans 26", WHITE, alpha=0.7, wrap_width=600,
+            "Sans 26", WHITE, alpha=0.7, wrap_width=800,
         )
         y += th + 40
         th = _draw_text(ctx, cx, y, "Waiting for connection...", "Sans 28", AMBER)
@@ -584,8 +581,6 @@ class ProvisionDisplay:
             bw, bh = _draw_badge(ctx, cx, y, url, "Monospace Bold 28",
                         bg_color=(0.3, 0.3, 0.4))
             y += bh + 90
-        _draw_spinner(ctx, cx, y, 20, self._frame)
-        self._frame += 1
         _draw_progress_dots(ctx, cx, h, 5)
         self._blit()
 
@@ -641,7 +636,7 @@ class ProvisionDisplay:
             "Check that the CMS server is running\n"
             "and reachable from this network.\n\n"
             "The device will retry automatically.",
-            "Sans 26", WHITE, alpha=0.5, wrap_width=550,
+            "Sans 26", WHITE, alpha=0.5, wrap_width=800,
         )
         _draw_progress_dots(ctx, cx, h, 4)
         self._blit()
@@ -663,7 +658,7 @@ class ProvisionDisplay:
             ctx, cx, y,
             "Scan the QR code with your phone to\n"
             "update the server address.",
-            "Sans 26", WHITE, alpha=0.7, wrap_width=600,
+            "Sans 26", WHITE, alpha=0.7, wrap_width=800,
         )
         y += 85
 
@@ -709,7 +704,7 @@ class ProvisionDisplay:
         y += 70
         _draw_spinner(ctx, cx, y + 30, 20, self._frame)
         y += 85
-        _draw_text(ctx, cx, y, subtitle, "Sans 26", WHITE, alpha=0.6, wrap_width=500)
+        _draw_text(ctx, cx, y, subtitle, "Sans 26", WHITE, alpha=0.6, wrap_width=800)
         _draw_progress_dots(ctx, cx, h, progress)
         self._frame += 1
         self._blit()

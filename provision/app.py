@@ -268,7 +268,7 @@ async def reconfigure(request: Request):
     cms_port = int(body.get("cms_port", CMS_DEFAULT_PORT))
 
     if not cms_host:
-        return {"success": False, "error": "CMS host is required"}
+        cms_host = CMS_MDNS_HOST
 
     # Strip protocol prefixes
     for prefix in ("ws://", "wss://", "http://", "https://"):

@@ -72,6 +72,21 @@ class TestWaitForCmsAdoption:
         assert result == "failed"
 
     @pytest.mark.asyncio
+    async def test_disconnected_with_error_counts_as_failure(self):
+        """A 'disconnected' state with an error field should count toward
+        the error threshold (e.g. connection timeout)."""
+        shutdown = asyncio.Event()
+
+        def mock_read_status():
+            return {"state": "disconnected", "error": "timed out during handshake"}
+
+        with patch("provision.service._get_cms_host", return_value="192.168.1.1"), \
+             patch("provision.service._read_cms_status", side_effect=mock_read_status), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await _wait_for_cms_adoption(None, shutdown)
+        assert result == "failed"
+
+    @pytest.mark.asyncio
     async def test_returns_shutdown_when_event_set(self):
         """Should return 'shutdown' when shutdown event is set."""
         shutdown = asyncio.Event()

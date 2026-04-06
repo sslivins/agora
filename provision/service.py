@@ -391,7 +391,7 @@ async def _wait_for_cms_adoption(
                     shown_pending = True
                     logger.info("CMS connected — waiting for adoption")
 
-            elif state == "error":
+            elif state == "error" or (state == "disconnected" and status.get("error")):
                 _stop_spinner(spinner_stop, spinner_thread)
                 consecutive_errors += 1
                 error_msg = status.get("error", "")
@@ -407,7 +407,8 @@ async def _wait_for_cms_adoption(
                     display.show_cms_failed(cms_host, error_msg)
 
             elif state in ("connecting", "disconnected", ""):
-                consecutive_errors = 0
+                # Only reset error counter for clean connecting/disconnected
+                # (no error field — e.g. initial startup before first attempt)
                 if not shown_connecting and display and display.available:
                     spinner_stop = threading.Event()
                     spinner_thread = threading.Thread(
@@ -452,7 +453,7 @@ async def _run_reconfigure_server(
         logger.error("Cannot determine device IP for reconfigure server")
         return False
 
-    url = f"http://{device_ip}"
+    url = f"http://{device_ip}/reconfigure"
     logger.info("Starting reconfigure server at %s", url)
 
     if display and display.available:
@@ -492,11 +493,24 @@ async def _run_reconfigure_server(
                 server.should_exit = True
                 return
 
-    await asyncio.gather(
-        server.serve(),
-        _watch_shutdown(),
-        _watch_reconfigure(),
-    )
+    tasks = [
+        asyncio.create_task(server.serve()),
+        asyncio.create_task(_watch_shutdown()),
+        asyncio.create_task(_watch_reconfigure()),
+    ]
+    # Wait until any task completes (server exits or reconfigure/shutdown)
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    for t in pending:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    # Re-raise any exception from completed tasks
+    for t in done:
+        if t.exception():
+            raise t.exception()
 
     return reconfigured
 
@@ -615,9 +629,6 @@ async def run_service(force_oobe: bool = False) -> None:
 
             if connected:
                 logger.info("Wi-Fi connected successfully")
-                # Write provisioning flag
-                PROVISION_FLAG.parent.mkdir(parents=True, exist_ok=True)
-                PROVISION_FLAG.write_text("1")
 
                 # Restart the CMS client so it reconnects immediately
                 # (it may have hit exponential backoff while Wi-Fi was down)
@@ -687,9 +698,20 @@ async def run_service(force_oobe: bool = False) -> None:
                     continue
                 # Shutdown triggered — loop will exit on next iteration
 
+        # Mark provisioned only after successful OOBE completion.
+        # If we wrote this unconditionally, a CMS failure + reboot would
+        # skip the OOBE on next boot.
         if not shutdown_event.is_set() and adoption_success:
+            PROVISION_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            PROVISION_FLAG.write_text("1")
+            logger.info("Provisioning flag written")
             display.show_adopted()
             await asyncio.sleep(OOBE_DISPLAY_HOLD)
+        elif not shutdown_event.is_set() and result == "no_cms":
+            # Standalone mode (no CMS configured) — mark provisioned
+            PROVISION_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            PROVISION_FLAG.write_text("1")
+            logger.info("Provisioning flag written (standalone mode)")
 
         display.close()
 
