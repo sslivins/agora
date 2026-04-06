@@ -1,6 +1,19 @@
 # Agora
 
-A media playback system for **Raspberry Pi Zero 2 W** that plays video and images on a TV via HDMI, with content managed through a REST API, web UI, and optional central management via [Agora CMS](https://github.com/sslivins/agora-cms).
+**Turn any TV into a managed digital signage display with a $15 Raspberry Pi Zero 2 W.**
+
+Agora is a lightweight media playback system that runs on a Raspberry Pi, playing video and images on any HDMI-connected screen. Upload content through a local web UI or REST API, or connect to [Agora CMS](https://github.com/sslivins/agora-cms) for centralized scheduling and fleet management across dozens of displays.
+
+**No cloud services, no subscriptions, no vendor lock-in.** Everything runs on your own hardware.
+
+### Highlights
+
+- **Zero-config setup** — Flash an SD card, plug in, and connect via your phone's Wi-Fi
+- **Hardware-accelerated playback** — H.264 video decoded in hardware via V4L2, smooth 1080p on a $15 board
+- **Web UI + REST API** — Upload assets, control playback, and monitor status from any browser or script
+- **Fleet-ready** — Optional CMS connection for centralized scheduling, remote control, and over-the-air updates
+- **Captive portal provisioning** — On first boot, the device creates a Wi-Fi hotspot with a guided setup wizard
+- **Self-healing** — Automatic reconnection, schedule caching, and graceful fallback to splash screens
 
 ## Install on Raspberry Pi Zero 2 W
 

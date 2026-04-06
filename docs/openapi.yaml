@@ -6,7 +6,7 @@ info:
     playback control, CMS integration, and status monitoring. A separate player service
     handles GStreamer pipelines, and an optional CMS client connects to Agora CMS for
     centralized scheduling and fleet management.
-  version: 0.9.26
+  version: 1.0.0
   license:
     name: MIT
 
@@ -259,10 +259,29 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /cms/status:
+    get:
+      tags: [cms]
+      summary: CMS connection status
+      description: >
+        Returns whether the CMS client service is running, whether the device
+        has an auth token, and the raw CMS client status (connection state,
+        last sync time, etc.).
+      operationId: getCmsStatus
+      responses:
+        "200":
+          description: CMS connection status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CmsStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /cms/config:
     get:
       tags: [cms]
-      summary: Get CMS connection status
+      summary: Get CMS connection config
       description: >
         Returns the current CMS connection configuration, service status,
         and whether the device has registered with the CMS.
@@ -503,3 +522,16 @@ components:
           type: integer
           description: CMS server port.
           default: 8080
+
+    CmsStatusResponse:
+      type: object
+      properties:
+        service_active:
+          type: boolean
+          description: Whether the agora-cms-client systemd service is running.
+        has_auth_token:
+          type: boolean
+          description: Whether the device has a stored CMS auth token.
+        cms_status:
+          type: object
+          description: Raw CMS client status (connection state, last sync, etc.).
