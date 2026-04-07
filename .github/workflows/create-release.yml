@@ -167,7 +167,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p pool
-          gh release download "${{ needs.release.outputs.tag }}" --pattern "*.deb" --dir pool/
+          gh release download "${{ needs.release.outputs.tag }}" --pattern "*.deb" --dir pool/ --clobber
 
       - name: Generate APT repository metadata
         run: |
