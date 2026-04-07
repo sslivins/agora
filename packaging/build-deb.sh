@@ -37,7 +37,7 @@ mkdir -p "${BUILD_DIR}/etc/systemd/system"
 mkdir -p "${BUILD_DIR}/usr/share/plymouth/themes/splash"
 
 # ── Source code ──
-for dir in api player shared cms_client provision; do
+for dir in api player shared cms_client provision scripts; do
     cp -r "${REPO_ROOT}/${dir}" "${BUILD_DIR}/opt/agora/src/"
 done
 # Remove dev-only tools not needed at runtime
