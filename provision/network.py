@@ -86,13 +86,19 @@ def scan_wifi() -> list[WifiNetwork]:
 
 
 def is_wifi_connected() -> bool:
-    """Check if any Wi-Fi connection is active."""
+    """Check if any Wi-Fi connection is active and has an IP address.
+
+    NetworkManager can report a saved Wi-Fi profile as "activated" before
+    DHCP completes, so we also verify that the interface has been assigned
+    an IP address to avoid false positives (see issue #64).
+    """
     try:
         result = _run(["nmcli", "-t", "-f", "TYPE,STATE", "connection", "show", "--active"])
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
                 if line.startswith("802-11-wireless:"):
-                    return True
+                    # Connection profile is active — verify we have an IP
+                    return get_device_ip() is not None
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
     return False
