@@ -43,31 +43,31 @@
 - ~30 concurrent device WebSocket connections (trivial load)
 
 ### TODO
-- [ ] Define CMS data model (devices, groups, schedules, assets)
-- [ ] Define CMS ↔ device WebSocket protocol (message types, auth handshake)
-- [ ] Device-side: registration client + WebSocket sync client
-- [ ] Device-side: asset pre-fetch + cleanup logic
-- [ ] CMS: device management API + UI (approve, group, configure)
-- [ ] CMS: schedule management API + UI (create, recurring rules, priorities)
-- [ ] CMS: asset library (upload once, assign to devices/groups)
-- [ ] CMS: push asset to device (transfer over WebSocket or HTTP download?)
-- [ ] CMS: dashboard (device status, what's playing, connectivity)
-- [ ] Handle CMS unavailability gracefully (keep playing current content, poll for reconnect)
+- [x] Define CMS data model (devices, groups, schedules, assets)
+- [x] Define CMS ↔ device WebSocket protocol (message types, auth handshake)
+- [x] Device-side: registration client + WebSocket sync client
+- [x] Device-side: asset pre-fetch + cleanup logic
+- [x] CMS: device management API + UI (approve, group, configure)
+- [x] CMS: schedule management API + UI (create, recurring rules, priorities)
+- [x] CMS: asset library (upload once, assign to devices/groups)
+- [x] CMS: push asset to device (transfer over WebSocket or HTTP download?)
+- [x] CMS: dashboard (device status, what's playing, connectivity)
+- [x] Handle CMS unavailability gracefully (keep playing current content, poll for reconnect)
 
 ## Scheduled Playback (Device-Local — Superseded by CMS)
-- [ ] Design schedule data model (cron-like or time-range based?)
-- [ ] Add schedule storage (JSON file or SQLite?)
-- [ ] Scheduler service that writes `desired.json` at trigger times
-- [ ] API endpoints: CRUD for schedules
-- [ ] Web UI: schedule management page
-- [ ] Handle overlapping schedules / priority rules
-- [ ] Return to splash when scheduled playback ends
+- [x] ~~Design schedule data model~~ — handled by CMS
+- [x] ~~Add schedule storage~~ — PostgreSQL in CMS
+- [x] ~~Scheduler service~~ — CMS scheduler pushes to device
+- [x] ~~API endpoints: CRUD for schedules~~ — CMS REST API
+- [x] ~~Web UI: schedule management page~~ — CMS web UI
+- [x] ~~Handle overlapping schedules / priority rules~~ — CMS priority system
+- [x] ~~Return to splash when scheduled playback ends~~ — CMS sync handles this
 
 ## Features
 - [ ] Asset preview thumbnails in web UI
 - [ ] Playlist support (ordered sequence of assets)
 - [ ] Volume control via API
-- [ ] Multi-device management (control multiple Pis from one UI)
+- [x] Multi-device management (control multiple Pis from one UI) — via CMS
 
 ## Captive Portal Provisioning
 - [x] Provisioning FastAPI service (provision/)
@@ -83,7 +83,7 @@
 - [ ] Install script updates (dnsmasq, NetworkManager packages)
 
 ## Infrastructure
-- [ ] CI/CD pipeline (GitHub Actions: lint, test)
+- [x] CI/CD pipeline (GitHub Actions: lint, test)
 - [ ] Automated deployment script (scp + systemctl restart)
 - [ ] Log viewer in web UI
 - [ ] Backup/restore configuration
@@ -93,7 +93,11 @@
   - Root cause: kmssink's `kms_open()` probed 13 wrong DRM drivers (~320ms each) before reaching `vc4`
   - Fix: added `driver-name=vc4` to all kmssink pipelines (PR #46)
   - Result: pipeline startup dropped from ~5s to <1s
+- [ ] Wi-Fi AP fallback not triggering — when a provisioned device can't connect to Wi-Fi on boot, it starts up normally instead of switching to AP mode.
+  - **Root cause (likely):** `is_wifi_connected()` in `provision/network.py` only checks if NetworkManager has an "active" 802-11-wireless connection (`nmcli connection show --active`). NM can show a saved Wi-Fi profile as "activated" (associated with AP) before it actually has an IP or before it discovers the network is unreachable. The 60s `_wait_for_wifi` loop polls every 2s and returns True on this false positive, so the service exits cleanly and never enters AP mode.
+  - **Fix options:** (a) After `is_wifi_connected()` returns True, verify actual IP connectivity (e.g. `nmcli -t -f IP4.ADDRESS device show wlan0` or ping the gateway). (b) Use `nmcli -t -f GENERAL.STATE device show wlan0` and check for `100 (connected)` instead of just checking the connection profile.
+  - **Secondary issue:** `agora-provision.service` uses `Type=simple` — the `Before=agora-api.service` ordering doesn't actually block other services from starting until provision finishes. Consider `Type=oneshot` + `RemainAfterExit=yes` for the provisioned boot path, or split into a separate oneshot unit that gates the other services.
 - [ ] Handle missing HDMI gracefully (no display connected)
 - [ ] Watchdog: auto-restart player if pipeline hangs
-- [ ] HDMI CEC standby after splash timeout — power off TV when in splash mode for N minutes (configurable, e.g. 30min), CEC wake on play command
+- [ ] HDMI CEC integration — CEC confirmed working on Pi Zero 2 W via `cec-ctl` (no sudo needed, `video` group has `/dev/cec0` access). Commands: `cec-ctl --to 0 --standby` (TV off), `cec-ctl --to 0 --image-view-on` (TV on + switch input). Features: standby TV after splash timeout (configurable, e.g. 30min), wake TV on play command, expose on/off via API/CMS
 - [ ] Splash screen pixel shifting — subtle periodic shift to reduce burn-in on static splash image

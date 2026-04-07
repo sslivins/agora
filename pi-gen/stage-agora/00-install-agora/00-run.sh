@@ -68,6 +68,19 @@ sed -i 's/console=tty1/console=tty3/g' /boot/firmware/cmdline.txt 2>/dev/null ||
 # Force HDMI connector detection with 1080p mode on kernel cmdline
 sed -i 's/rootwait/rootwait video=HDMI-A-1:1920x1080@60D/' /boot/firmware/cmdline.txt 2>/dev/null || true
 
+# ── Configure NTP to use CMS server (Pi has no battery-backed RTC) ──
+# The agora package installs configure-ntp.sh which reads cms_config.json.
+# On fresh images there's no CMS config yet, so set the default (agora-cms.local).
+# The CMS client service re-runs the script on each start to pick up
+# the actual CMS host after provisioning.
+mkdir -p /etc/systemd/timesyncd.conf.d
+cat > /etc/systemd/timesyncd.conf.d/agora.conf <<'NTP_EOF'
+[Time]
+NTP=agora-cms.local
+FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
+NTP_EOF
+systemctl enable systemd-timesyncd
+
 # ── Clean up ──
 apt-get clean
 rm -rf /var/lib/apt/lists/*
