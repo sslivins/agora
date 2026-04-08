@@ -70,6 +70,7 @@ class AgoraPlayer:
         self._current_path: Optional[Path] = None  # file being played
         self._current_mtime: Optional[float] = None  # mtime when pipeline was built
         self._loops_completed: int = 0
+        self._health_retries: int = 0
         self._plymouth_quit: bool = False
         self._running = True
 
@@ -159,6 +160,10 @@ class AgoraPlayer:
     def _teardown(self) -> None:
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
+            # Wait for NULL state to complete so hardware resources (V4L2
+            # decoder, KMS/DRM plane, ALSA) are fully released before
+            # building a new pipeline.
+            self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             self.pipeline = None
         self._current_path = None
         self._current_mtime = None
@@ -421,6 +426,7 @@ class AgoraPlayer:
                     return
             self.current_desired = desired
             self._teardown()
+            self._health_retries = 0
             is_video = path.suffix.lower() == ".mp4"
             self._current_path = path
             self._current_mtime = path.stat().st_mtime
@@ -435,6 +441,8 @@ class AgoraPlayer:
             # Periodic position updates for CMS status reporting
             GLib.timeout_add_seconds(10, self._update_position)
 
+    _HEALTH_CHECK_MAX_RETRIES = 3
+
     def _check_pipeline_health(self, asset_name: str) -> bool:
         """Verify the pipeline reached PLAYING state. Returns False (no repeat)."""
         if not self.pipeline:
@@ -448,16 +456,58 @@ class AgoraPlayer:
             return False
 
         _, state, _ = self.pipeline.get_state(0)
-        if state != Gst.State.PLAYING:
-            logger.error(
-                "Pipeline health check failed for %s: state is %s (expected PLAYING)",
+        if state == Gst.State.PLAYING:
+            if self._health_retries > 0:
+                logger.info(
+                    "Pipeline reached PLAYING for %s after %d retry(ies)",
+                    asset_name, self._health_retries,
+                )
+                self._health_retries = 0
+            return False
+
+        # Not PLAYING — retry with a full rebuild
+        if self._health_retries < self._HEALTH_CHECK_MAX_RETRIES:
+            self._health_retries += 1
+            logger.warning(
+                "Pipeline health check failed for %s: state is %s — "
+                "rebuilding (retry %d/%d)",
                 asset_name, state.value_nick if state else "NULL",
+                self._health_retries, self._HEALTH_CHECK_MAX_RETRIES,
             )
+            path = self._current_path or self._resolve_asset(asset_name)
             self._teardown()
-            self._update_current(
-                error=f"Pipeline failed to reach PLAYING state ({state.value_nick if state else 'NULL'})",
-            )
-            GLib.timeout_add_seconds(3, self._show_splash)
+            if path and path.is_file():
+                is_video = path.suffix.lower() == ".mp4"
+                self._current_path = path
+                self._current_mtime = path.stat().st_mtime
+                self.pipeline = self._build_pipeline(path, is_video)
+                self._loops_completed = 0
+                self.pipeline.set_state(Gst.State.PLAYING)
+                GLib.timeout_add_seconds(
+                    5, self._check_pipeline_health, asset_name,
+                )
+            else:
+                logger.error("Asset file not found for retry: %s", asset_name)
+                self._health_retries = 0
+                self._update_current(
+                    error=f"Asset not found during retry: {asset_name}",
+                )
+                GLib.timeout_add_seconds(3, self._show_splash)
+            return False
+
+        # All retries exhausted
+        logger.error(
+            "Pipeline health check failed for %s after %d retries: "
+            "state is %s (expected PLAYING)",
+            asset_name, self._HEALTH_CHECK_MAX_RETRIES,
+            state.value_nick if state else "NULL",
+        )
+        self._health_retries = 0
+        self._teardown()
+        self._update_current(
+            error=f"Pipeline failed to reach PLAYING state after {self._HEALTH_CHECK_MAX_RETRIES} retries",
+        )
+        GLib.timeout_add_seconds(3, self._show_splash)
         return False
 
     # ── State file watcher ──

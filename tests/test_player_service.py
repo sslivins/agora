@@ -26,6 +26,8 @@ def player():
         p._plymouth_quit = False
         p._current_path = None
         p._current_mtime = None
+        p._health_retries = 0
+        p._loops_completed = 0
         yield p
 
 
@@ -75,36 +77,9 @@ class TestPipelineSelection:
 
 
 class TestPipelineHealthCheck:
-    """Verify _check_pipeline_health reports errors when pipeline fails to start."""
+    """Verify _check_pipeline_health retries with rebuild before giving up."""
 
-    def test_reports_error_and_recovers_when_not_playing(self, player, tmp_path):
-        """Pipeline stuck in PAUSED should report an error and recover to splash."""
-        with patch("player.service.Gst") as mock_gst, \
-             patch("player.service.GLib") as mock_glib:
-            mock_gst.State.PLAYING = "PLAYING"
-
-            mock_state = MagicMock()
-            mock_state.value_nick = "paused"
-
-            mock_pipeline = MagicMock()
-            mock_pipeline.get_state.return_value = (None, mock_state, None)
-            player.pipeline = mock_pipeline
-
-            player.current_desired = DesiredState(
-                mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
-            )
-
-            with patch.object(player, "_update_current") as mock_update, \
-                 patch.object(player, "_show_splash"):
-                player._check_pipeline_health("test.mp4")
-                mock_update.assert_called_once()
-                call_kwargs = mock_update.call_args[1]
-                assert call_kwargs["error"] is not None
-                assert "PLAYING" in call_kwargs["error"]
-                # Should schedule splash recovery
-                mock_glib.timeout_add_seconds.assert_called_once()
-
-    def test_no_error_when_pipeline_is_playing(self, player, tmp_path):
+    def test_no_error_when_pipeline_is_playing(self, player):
         """Pipeline in PLAYING state should not report an error."""
         with patch("player.service.Gst") as mock_gst:
             playing_state = MagicMock()
@@ -133,6 +108,163 @@ class TestPipelineHealthCheck:
         with patch.object(player, "_update_current") as mock_update:
             player._check_pipeline_health("test.mp4")
             mock_update.assert_not_called()
+
+    def test_first_failure_rebuilds_pipeline(self, player, tmp_path):
+        """First health check failure should teardown, rebuild, and schedule another check."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+        player._current_path = video
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib:
+            mock_gst.State.PLAYING = "PLAYING"
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+
+            mock_state = MagicMock()
+            mock_state.value_nick = "ready"
+            mock_pipeline = MagicMock()
+            mock_pipeline.get_state.return_value = (None, mock_state, None)
+            player.pipeline = mock_pipeline
+
+            new_pipeline = MagicMock()
+            mock_gst.parse_launch.return_value = new_pipeline
+
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+            )
+
+            with patch.object(player, "_update_current") as mock_update, \
+                 patch.object(player, "_show_splash") as mock_splash:
+                player._check_pipeline_health("test.mp4")
+
+                # Should NOT show splash or report error on first failure
+                mock_splash.assert_not_called()
+                mock_update.assert_not_called()
+                # Should have rebuilt the pipeline
+                assert player.pipeline == new_pipeline
+                new_pipeline.set_state.assert_called_with("PLAYING")
+                # Should schedule another health check
+                mock_glib.timeout_add_seconds.assert_called_once()
+                assert player._health_retries == 1
+
+    def test_retries_exhaust_then_fails(self, player, tmp_path):
+        """After max retries, should teardown, report error, and show splash."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+        player._current_path = video
+        player._health_retries = 3  # Already at max
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib:
+            mock_gst.State.PLAYING = "PLAYING"
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+
+            mock_state = MagicMock()
+            mock_state.value_nick = "ready"
+            mock_pipeline = MagicMock()
+            mock_pipeline.get_state.return_value = (None, mock_state, None)
+            player.pipeline = mock_pipeline
+
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+            )
+
+            with patch.object(player, "_update_current") as mock_update, \
+                 patch.object(player, "_show_splash"):
+                player._check_pipeline_health("test.mp4")
+
+                # Should report error with retry count
+                mock_update.assert_called_once()
+                error_msg = mock_update.call_args[1]["error"]
+                assert "3 retries" in error_msg
+                # Pipeline should be torn down
+                assert player.pipeline is None
+                assert player._health_retries == 0
+                # Should schedule splash
+                mock_glib.timeout_add_seconds.assert_called_once()
+
+    def test_success_after_retry_logs_and_resets(self, player):
+        """If pipeline reaches PLAYING after retries, counter should reset."""
+        player._health_retries = 2  # Had 2 prior failures
+
+        with patch("player.service.Gst") as mock_gst:
+            playing_state = MagicMock()
+            playing_state.value_nick = "playing"
+            mock_gst.State.PLAYING = playing_state
+
+            mock_pipeline = MagicMock()
+            mock_pipeline.get_state.return_value = (None, playing_state, None)
+            player.pipeline = mock_pipeline
+
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+            )
+
+            with patch.object(player, "_update_current") as mock_update:
+                player._check_pipeline_health("test.mp4")
+                mock_update.assert_not_called()
+                assert player._health_retries == 0
+
+    def test_new_playback_resets_retry_counter(self, player, tmp_path):
+        """Starting a new playback should reset _health_retries."""
+        player._health_retries = 2
+
+        video = tmp_path / "videos" / "new.mp4"
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"\x00" * 100)
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        player.state_dir = state_dir
+        player.desired_path = state_dir / "desired.json"
+        player.current_path = state_dir / "current.json"
+        player.base = tmp_path
+        player.assets_dir = tmp_path
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib"):
+            mock_gst.State.NULL = "NULL"
+            mock_gst.State.PLAYING = "PLAYING"
+            mock_gst.CLOCK_TIME_NONE = 0
+            mock_gst.parse_launch.return_value = MagicMock()
+
+            # Different timestamp so we don't hit the "unchanged" early return
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="old.mp4", loop=True,
+                timestamp="2026-01-01T00:00:00Z",
+            )
+
+            desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="new.mp4", loop=True,
+                timestamp="2026-01-01T00:00:01Z",
+            )
+
+            with patch.object(player, "_update_current"), \
+                 patch("player.service.read_state", return_value=desired):
+                player.desired_path.write_text("{}")
+                player.apply_desired()
+                assert player._health_retries == 0
+
+
+class TestTeardownSync:
+    """Verify _teardown waits for NULL state before returning."""
+
+    def test_teardown_waits_for_null_state(self, player):
+        """_teardown should call get_state to wait for NULL transition."""
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+
+            mock_pipeline = MagicMock()
+            player.pipeline = mock_pipeline
+
+            player._teardown()
+
+            mock_pipeline.set_state.assert_called_once_with("NULL")
+            mock_pipeline.get_state.assert_called_once_with(0)
+            assert player.pipeline is None
 
 
 class TestHasAudio:
