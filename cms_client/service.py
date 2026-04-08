@@ -415,6 +415,8 @@ class CMSClient:
                         await self._handle_upgrade(ws)
                     elif msg_type == "factory_reset":
                         await self._handle_factory_reset(ws)
+                    elif msg_type == "request_logs":
+                        await self._handle_request_logs(msg, ws)
                     elif "error" in msg:
                         error_text = msg["error"]
                         logger.error("CMS error: %s", error_text)
@@ -1046,6 +1048,48 @@ class CMSClient:
         logger.warning("Factory reset complete — rebooting")
         await asyncio.sleep(1)
         os.system("sudo reboot")
+
+    async def _handle_request_logs(self, msg: dict, ws) -> None:
+        """Collect journalctl logs for requested services and send back."""
+        request_id = msg.get("request_id", "")
+        services = msg.get("services") or [
+            "agora-player", "agora-api", "agora-cms-client", "agora-provision",
+        ]
+        since = msg.get("since", "24h")
+        logger.info("Log request %s: services=%s since=%s", request_id, services, since)
+
+        logs: dict[str, str] = {}
+        error = None
+
+        for service in services:
+            try:
+                result = subprocess.run(
+                    ["journalctl", "-u", service, f"--since={since} ago",
+                     "--no-pager", "-o", "short-iso"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                logs[service] = result.stdout if result.returncode == 0 else (
+                    result.stderr or f"journalctl exited with code {result.returncode}"
+                )
+            except subprocess.TimeoutExpired:
+                logs[service] = f"[timed out reading logs for {service}]"
+            except FileNotFoundError:
+                error = "journalctl not available on this device"
+                break
+            except Exception as e:
+                logs[service] = f"[error: {e}]"
+
+        try:
+            await ws.send(json.dumps({
+                "type": "logs_response",
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": request_id,
+                "device_id": self.device_id,
+                "logs": logs,
+                "error": error,
+            }))
+        except Exception:
+            logger.exception("Failed to send logs response")
 
     async def _handle_upgrade(self, ws) -> None:
         logger.info("Upgrade requested by CMS")
