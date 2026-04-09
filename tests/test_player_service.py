@@ -1109,3 +1109,31 @@ class TestErrorBackoff:
             with patch.object(player, "_update_current"):
                 player._on_state_changed(None, mock_message)
                 assert player._error_retry_delay == 3
+
+    def test_splash_playing_does_not_reset_backoff(self, player):
+        """Splash reaching PLAYING should NOT reset backoff delay."""
+        with patch("player.service.Gst") as mock_gst:
+            playing_state = MagicMock()
+            playing_state.value_nick = "playing"
+            mock_gst.State.PLAYING = playing_state
+
+            mock_pipeline = MagicMock()
+            mock_pipeline.get_state.return_value = (None, playing_state, None)
+            player.pipeline = mock_pipeline
+            player._error_retry_delay = 12  # Previously backed off
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.SPLASH, loop=False
+            )
+
+            mock_message = MagicMock()
+            mock_message.src = mock_pipeline
+            new_state = MagicMock()
+            new_state.value_nick = "playing"
+            new_state.__eq__ = lambda self, other: other == playing_state
+            old_state = MagicMock()
+            old_state.value_nick = "paused"
+            mock_message.parse_state_changed.return_value = (old_state, new_state, None)
+
+            with patch.object(player, "_update_current"):
+                player._on_state_changed(None, mock_message)
+                assert player._error_retry_delay == 12  # NOT reset

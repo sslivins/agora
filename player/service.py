@@ -209,7 +209,10 @@ class AgoraPlayer:
         logger.debug("Pipeline state: %s -> %s", old.value_nick, new_name)
 
         if new == Gst.State.PLAYING and self.current_desired:
-            self._error_retry_delay = 3  # Reset backoff on success
+            # Only reset backoff when desired content starts playing,
+            # not when splash fallback reaches PLAYING
+            if self.current_desired.mode == PlaybackMode.PLAY:
+                self._error_retry_delay = 3
             started = datetime.now(timezone.utc)
             mode = self.current_desired.mode
             asset = self.current_desired.asset
