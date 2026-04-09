@@ -28,6 +28,7 @@ def player():
         p._current_mtime = None
         p._health_retries = 0
         p._error_retry_delay = 3
+        p._pending_error = None
         p._loops_completed = 0
         yield p
 
@@ -863,6 +864,27 @@ class TestErrorTranslation:
         result = player._translate_error(raw)
         assert result == "Playback error: Some totally unexpected GStreamer error"
 
+    def test_drm_error_in_debug_string(self, player):
+        """Real GStreamer wraps the specific error in debug, not err.message."""
+        raw = "GStreamer encountered a general resource error."
+        debug = "gst_kms_sink_show_frame: drmModeSetPlane failed: Permission denied (13)"
+        result = player._translate_error(raw, debug)
+        assert result == "No display connected \u2014 check the HDMI cable"
+
+    def test_audio_error_in_message_only(self, player):
+        """Audio errors appear directly in err.message."""
+        raw = "Could not open audio device for playback"
+        debug = "gstalsa: some alsa debug info"
+        result = player._translate_error(raw, debug)
+        assert result == "No audio output \u2014 check the HDMI cable"
+
+    def test_generic_resource_error_without_details(self, player):
+        """Generic resource error with no detail in debug passes through."""
+        raw = "GStreamer encountered a general resource error."
+        debug = "some unrelated debug info"
+        result = player._translate_error(raw, debug)
+        assert result == "Playback error: GStreamer encountered a general resource error."
+
     def test_is_display_error_true_for_drm(self, player):
         assert player._is_display_error("drmModeSetPlane failed: Permission denied (13)") is True
 
@@ -871,6 +893,12 @@ class TestErrorTranslation:
 
     def test_is_display_error_false_for_other(self, player):
         assert player._is_display_error("Failed to allocate required memory") is False
+
+    def test_is_display_error_via_debug_string(self, player):
+        """_is_display_error should detect display errors in the debug string."""
+        raw = "GStreamer encountered a general resource error."
+        debug = "drmModeSetPlane failed: Permission denied (13)"
+        assert player._is_display_error(raw, debug) is True
 
 
 class TestErrorBackoff:
@@ -885,7 +913,8 @@ class TestErrorBackoff:
             mock_message.parse_error.return_value = (mock_err, "debug info")
 
             with patch.object(player, "_teardown"), \
-                 patch.object(player, "_update_current"):
+                 patch.object(player, "_update_current"), \
+                 patch.object(player, "_show_splash"):
                 assert player._error_retry_delay == 3
 
                 player._on_error(None, mock_message)
@@ -910,7 +939,8 @@ class TestErrorBackoff:
             player._error_retry_delay = 48
 
             with patch.object(player, "_teardown"), \
-                 patch.object(player, "_update_current"):
+                 patch.object(player, "_update_current"), \
+                 patch.object(player, "_show_splash"):
                 player._on_error(None, mock_message)
                 delay = mock_glib.timeout_add_seconds.call_args[0][0]
                 assert delay == 48
@@ -933,7 +963,8 @@ class TestErrorBackoff:
             player._error_retry_delay = 30  # Previously backed off
 
             with patch.object(player, "_teardown"), \
-                 patch.object(player, "_update_current"):
+                 patch.object(player, "_update_current"), \
+                 patch.object(player, "_show_splash"):
                 player._on_error(None, mock_message)
                 delay = mock_glib.timeout_add_seconds.call_args[0][0]
                 assert delay == 3
@@ -948,11 +979,108 @@ class TestErrorBackoff:
             mock_message.parse_error.return_value = (mock_err, "debug info")
 
             with patch.object(player, "_teardown"), \
-                 patch.object(player, "_update_current") as mock_update:
+                 patch.object(player, "_update_current") as mock_update, \
+                 patch.object(player, "_show_splash"):
                 player._on_error(None, mock_message)
                 mock_update.assert_called_once_with(
                     error="No display connected \u2014 check the HDMI cable"
                 )
+
+    def test_on_error_shows_splash_immediately(self, player):
+        """_on_error should show splash immediately as visual fallback."""
+        with patch("player.service.GLib"):
+            mock_message = MagicMock()
+            mock_err = MagicMock()
+            mock_err.message = "drmModeSetPlane failed"
+            mock_message.parse_error.return_value = (mock_err, "debug info")
+
+            with patch.object(player, "_teardown"), \
+                 patch.object(player, "_update_current"), \
+                 patch.object(player, "_show_splash") as mock_splash:
+                player._on_error(None, mock_message)
+                mock_splash.assert_called_once()
+
+    def test_on_error_schedules_retry_desired(self, player):
+        """_on_error should schedule _retry_desired after backoff delay."""
+        with patch("player.service.GLib") as mock_glib:
+            mock_message = MagicMock()
+            mock_err = MagicMock()
+            mock_err.message = "Could not open audio device"
+            mock_message.parse_error.return_value = (mock_err, "debug info")
+
+            with patch.object(player, "_teardown"), \
+                 patch.object(player, "_update_current"), \
+                 patch.object(player, "_show_splash"):
+                player._on_error(None, mock_message)
+                mock_glib.timeout_add_seconds.assert_called_once_with(
+                    3, player._retry_desired,
+                )
+
+    def test_on_error_sets_pending_error_for_splash(self, player):
+        """_on_error should set _pending_error so splash preserves it."""
+        with patch("player.service.GLib"):
+            mock_message = MagicMock()
+            mock_err = MagicMock()
+            mock_err.message = "Could not open audio device"
+            mock_message.parse_error.return_value = (mock_err, "debug info")
+
+            with patch.object(player, "_teardown"), \
+                 patch.object(player, "_update_current"), \
+                 patch.object(player, "_show_splash"):
+                player._on_error(None, mock_message)
+                # _show_splash will have consumed it, but _pending_error
+                # was set to the friendly message before the call
+                # Verify by checking the call happened after _pending_error was set
+                # (splash mock doesn't clear it)
+                assert player._pending_error == "No audio output \u2014 check the HDMI cable"
+
+    def test_retry_desired_calls_apply_desired(self, player):
+        """_retry_desired should re-read desired.json via apply_desired."""
+        with patch.object(player, "apply_desired") as mock_apply:
+            result = player._retry_desired()
+            mock_apply.assert_called_once()
+            assert result is False  # one-shot timer
+
+    def test_splash_preserves_pending_error(self, player, tmp_path):
+        """_show_splash should include _pending_error in current.json."""
+        splash_img = tmp_path / "assets" / "splash" / "default.png"
+        splash_img.parent.mkdir(parents=True)
+        splash_img.touch()
+
+        player._pending_error = "No audio output \u2014 check the HDMI cable"
+
+        with patch.object(player, "_find_splash", return_value=splash_img), \
+             patch.object(player, "_teardown"), \
+             patch.object(player, "_build_pipeline") as mock_build, \
+             patch.object(player, "_update_current") as mock_update:
+            mock_build.return_value = MagicMock()
+            player._show_splash()
+            mock_update.assert_called_once_with(
+                mode=PlaybackMode.SPLASH,
+                asset="default.png",
+                error="No audio output \u2014 check the HDMI cable",
+            )
+            assert player._pending_error is None  # consumed
+
+    def test_splash_clears_error_when_no_pending(self, player, tmp_path):
+        """_show_splash should pass error=None when no pending error."""
+        splash_img = tmp_path / "assets" / "splash" / "default.png"
+        splash_img.parent.mkdir(parents=True)
+        splash_img.touch()
+
+        player._pending_error = None
+
+        with patch.object(player, "_find_splash", return_value=splash_img), \
+             patch.object(player, "_teardown"), \
+             patch.object(player, "_build_pipeline") as mock_build, \
+             patch.object(player, "_update_current") as mock_update:
+            mock_build.return_value = MagicMock()
+            player._show_splash()
+            mock_update.assert_called_once_with(
+                mode=PlaybackMode.SPLASH,
+                asset="default.png",
+                error=None,
+            )
 
     def test_successful_playback_resets_backoff(self, player):
         """Pipeline reaching PLAYING should reset _error_retry_delay to 3."""

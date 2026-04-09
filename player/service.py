@@ -72,6 +72,7 @@ class AgoraPlayer:
         self._loops_completed: int = 0
         self._health_retries: int = 0
         self._error_retry_delay: int = 3
+        self._pending_error: Optional[str] = None
         self._plymouth_quit: bool = False
         self._running = True
 
@@ -249,28 +250,36 @@ class AgoraPlayer:
     _DISPLAY_ERROR_MARKERS = ("drmModeSetPlane", "Could not open audio device")
 
     @classmethod
-    def _translate_error(cls, raw: str) -> str:
-        """Translate raw GStreamer error into a user-friendly message."""
+    def _translate_error(cls, raw: str, debug: str = "") -> str:
+        """Translate raw GStreamer error into a user-friendly message.
+
+        Checks both the error message and debug string, since GStreamer
+        often wraps the real cause (e.g. drmModeSetPlane) in debug info
+        while the message is a generic 'resource error'.
+        """
+        combined = f"{raw} {debug}"
         for marker, friendly in cls._ERROR_TRANSLATIONS:
-            if marker in raw:
+            if marker in combined:
                 return friendly
         return f"Playback error: {raw}"
 
     @classmethod
-    def _is_display_error(cls, raw: str) -> bool:
+    def _is_display_error(cls, raw: str, debug: str = "") -> bool:
         """Return True if the error indicates a missing/broken display."""
-        return any(m in raw for m in cls._DISPLAY_ERROR_MARKERS)
+        combined = f"{raw} {debug}"
+        return any(m in combined for m in cls._DISPLAY_ERROR_MARKERS)
 
     _RETRY_DELAY_MAX = 60
 
     def _on_error(self, bus, message) -> None:
         err, debug = message.parse_error()
-        friendly = self._translate_error(err.message)
-        logger.error("Pipeline error: %s (%s)", err.message, debug)
+        debug_str = debug or ""
+        friendly = self._translate_error(err.message, debug_str)
+        logger.error("Pipeline error: %s (%s)", err.message, debug_str)
         self._teardown()
         self._update_current(error=friendly)
         # Exponential backoff for display errors to avoid burning CPU/memory
-        if self._is_display_error(err.message):
+        if self._is_display_error(err.message, debug_str):
             delay = self._error_retry_delay
             self._error_retry_delay = min(
                 self._error_retry_delay * 2, self._RETRY_DELAY_MAX,
@@ -278,14 +287,20 @@ class AgoraPlayer:
         else:
             delay = 3
             self._error_retry_delay = 3
+        # Show splash immediately as visual fallback (preserves error)
+        self._pending_error = friendly
+        self._show_splash()
+        # Schedule retry of the original desired content after backoff
         logger.info("Retrying in %ds", delay)
-        GLib.timeout_add_seconds(delay, self._show_splash)
+        GLib.timeout_add_seconds(delay, self._retry_desired)
 
     # ── Splash ──
 
     def _show_splash(self) -> bool:
         """Show splash screen. Returns False to cancel GLib timeout repeat."""
         self._teardown()
+        error = self._pending_error
+        self._pending_error = None
         splash = self._find_splash()
         if splash:
             is_video = splash.suffix.lower() == ".mp4"
@@ -297,11 +312,17 @@ class AgoraPlayer:
             self.current_desired = DesiredState(
                 mode=PlaybackMode.SPLASH, loop=is_video
             )
-            self._update_current(mode=PlaybackMode.SPLASH, asset=splash.name)
+            self._update_current(mode=PlaybackMode.SPLASH, asset=splash.name, error=error)
             logger.info("Showing splash: %s", splash.name)
         else:
             logger.warning("No splash asset found")
-            self._update_current(mode=PlaybackMode.STOP)
+            self._update_current(mode=PlaybackMode.STOP, error=error)
+        return False
+
+    def _retry_desired(self) -> bool:
+        """Re-read desired.json and attempt playback. Returns False (one-shot)."""
+        logger.info("Retrying desired state")
+        self.apply_desired()
         return False
 
     # ── State management ──
