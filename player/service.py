@@ -272,7 +272,7 @@ class AgoraPlayer:
         combined = f"{raw} {debug}"
         return any(m in combined for m in cls._DISPLAY_ERROR_MARKERS)
 
-    _RETRY_DELAY_MAX = 60
+    _RETRY_DELAY_MAX = 15
 
     def _on_error(self, bus, message) -> None:
         err, debug = message.parse_error()

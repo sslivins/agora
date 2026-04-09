@@ -929,28 +929,28 @@ class TestErrorBackoff:
                 assert player._error_retry_delay == 12
 
     def test_display_error_caps_at_max_delay(self, player):
-        """Retry delay should not exceed _RETRY_DELAY_MAX (60s)."""
+        """Retry delay should not exceed _RETRY_DELAY_MAX (15s)."""
         with patch("player.service.GLib") as mock_glib:
             mock_message = MagicMock()
             mock_err = MagicMock()
             mock_err.message = "drmModeSetPlane failed: Permission denied (13)"
             mock_message.parse_error.return_value = (mock_err, "debug info")
 
-            player._error_retry_delay = 48
+            player._error_retry_delay = 12
 
             with patch.object(player, "_teardown"), \
                  patch.object(player, "_update_current"), \
                  patch.object(player, "_show_splash"):
                 player._on_error(None, mock_message)
                 delay = mock_glib.timeout_add_seconds.call_args[0][0]
-                assert delay == 48
-                assert player._error_retry_delay == 60  # capped
+                assert delay == 12
+                assert player._error_retry_delay == 15  # capped
 
                 mock_glib.reset_mock()
                 player._on_error(None, mock_message)
                 delay = mock_glib.timeout_add_seconds.call_args[0][0]
-                assert delay == 60
-                assert player._error_retry_delay == 60  # stays capped
+                assert delay == 15
+                assert player._error_retry_delay == 15  # stays capped
 
     def test_non_display_error_resets_delay(self, player):
         """Non-display errors should use 3s and reset the backoff counter."""
