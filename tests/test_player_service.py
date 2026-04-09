@@ -588,10 +588,12 @@ class TestAssetNotFoundDesiredState:
 
 
 class TestChecksumValidation:
-    """Verify player validates asset checksum before building pipeline."""
+    """Verify player does NOT re-checksum assets at play time (Issue #79).
+    Checksum verification is handled by the CMS client at download time."""
 
-    def test_matching_checksum_allows_playback(self, player, tmp_path):
-        """Player should proceed when file checksum matches expected."""
+    def test_expected_checksum_does_not_block_playback(self, player, tmp_path):
+        """Player should proceed immediately even with expected_checksum set
+        — no SHA-256 verification at play time."""
         player.desired_path = tmp_path / "desired.json"
         player.current_path = tmp_path / "current.json"
         player.assets_dir = tmp_path / "assets"
@@ -603,13 +605,11 @@ class TestChecksumValidation:
         content = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 100
         video.write_bytes(content)
 
-        import hashlib
-        checksum = hashlib.sha256(content).hexdigest()
-
+        # Use a WRONG checksum — player should NOT verify it and should still play
         from datetime import datetime, timezone
         desired = DesiredState(
             mode=PlaybackMode.PLAY, asset="test.mp4", loop=True,
-            expected_checksum=checksum,
+            expected_checksum="0000000000000000000000000000000000000000000000000000000000000000",
             timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
         )
         from shared.state import write_state
@@ -624,44 +624,8 @@ class TestChecksumValidation:
 
             player.apply_desired()
 
-            # Pipeline should have been built
+            # Pipeline should be built regardless of checksum
             mock_gst.parse_launch.assert_called_once()
-
-    def test_mismatched_checksum_blocks_playback(self, player, tmp_path):
-        """Player should refuse to play when checksum doesn't match."""
-        player.desired_path = tmp_path / "desired.json"
-        player.current_path = tmp_path / "current.json"
-        player.assets_dir = tmp_path / "assets"
-        (player.assets_dir / "videos").mkdir(parents=True)
-        player._loops_completed = 0
-
-        video = player.assets_dir / "videos" / "bad.mp4"
-        video.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 100)
-
-        from datetime import datetime, timezone
-        desired = DesiredState(
-            mode=PlaybackMode.PLAY, asset="bad.mp4", loop=True,
-            expected_checksum="0000000000000000000000000000000000000000000000000000000000000000",
-            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
-        )
-        from shared.state import write_state
-        write_state(player.desired_path, desired)
-
-        with patch("player.service.Gst") as mock_gst, \
-             patch.object(player, "_update_current") as mock_update, \
-             patch.object(player, "_show_splash") as mock_splash:
-            mock_gst.State.PLAYING = "PLAYING"
-
-            player.apply_desired()
-
-            # Pipeline should NOT have been built
-            mock_gst.parse_launch.assert_not_called()
-            # Error should have been reported
-            mock_update.assert_called()
-            call_kwargs = mock_update.call_args[1]
-            assert "Checksum mismatch" in call_kwargs["error"]
-            # Should fall back to splash
-            mock_splash.assert_called_once()
 
     def test_no_checksum_skips_validation(self, player, tmp_path):
         """When no expected_checksum is set, skip validation and play."""
