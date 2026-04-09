@@ -1,5 +1,8 @@
 # Agora
 
+[![Tests](https://github.com/sslivins/agora/actions/workflows/tests.yml/badge.svg)](https://github.com/sslivins/agora/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/github/v/release/sslivins/agora)](https://github.com/sslivins/agora/releases/latest)
+
 **Turn any TV into a managed digital signage display with a $15 Raspberry Pi Zero 2 W.**
 
 Agora is a lightweight media playback system that runs on a Raspberry Pi, playing video and images on any HDMI-connected screen. Upload content through a local web UI or REST API, or connect to [Agora CMS](https://github.com/sslivins/agora-cms) for centralized scheduling and fleet management across dozens of displays.
