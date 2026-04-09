@@ -1137,3 +1137,214 @@ class TestErrorBackoff:
             with patch.object(player, "_update_current"):
                 player._on_state_changed(None, mock_message)
                 assert player._error_retry_delay == 12  # NOT reset
+
+
+class TestDisplayDetection:
+    """Verify HDMI display detection via DDC/EDID I2C probe."""
+
+    def test_display_connected_returns_true(self, player):
+        """Should return True when I2C read succeeds (display plugged in)."""
+        mock_fcntl = MagicMock()
+        with patch("player.service.os.open", return_value=3) as mock_open, \
+             patch.dict("sys.modules", {"fcntl": mock_fcntl}), \
+             patch("player.service.os.read", return_value=b"\x00") as mock_read, \
+             patch("player.service.os.close") as mock_close:
+            result = player._is_display_connected()
+            assert result is True
+            mock_open.assert_called_once_with("/dev/i2c-2", 2)  # O_RDWR = 2
+            mock_fcntl.ioctl.assert_called_once_with(3, 0x0703, 0x50)
+            mock_read.assert_called_once_with(3, 1)
+            mock_close.assert_called_once_with(3)
+
+    def test_display_disconnected_returns_false(self, player):
+        """Should return False when I2C read fails with OSError (no display)."""
+        mock_fcntl = MagicMock()
+        with patch("player.service.os.open", return_value=3), \
+             patch.dict("sys.modules", {"fcntl": mock_fcntl}), \
+             patch("player.service.os.read", side_effect=OSError(5, "I/O error")), \
+             patch("player.service.os.close") as mock_close:
+            result = player._is_display_connected()
+            assert result is False
+            mock_close.assert_called_once_with(3)
+
+    def test_display_bus_unavailable_returns_none(self, player):
+        """Should return None when the I2C bus device cannot be opened."""
+        with patch("player.service.os.open", side_effect=OSError(2, "No such file")):
+            result = player._is_display_connected()
+            assert result is None
+
+    def test_display_ioctl_failure_returns_false(self, player):
+        """Should return False when ioctl fails (slave address rejected)."""
+        mock_fcntl = MagicMock()
+        mock_fcntl.ioctl.side_effect = OSError(22, "Invalid argument")
+        with patch("player.service.os.open", return_value=3), \
+             patch.dict("sys.modules", {"fcntl": mock_fcntl}), \
+             patch("player.service.os.close") as mock_close:
+            result = player._is_display_connected()
+            assert result is False
+            mock_close.assert_called_once_with(3)
+
+    def test_update_current_includes_display_connected(self, player, tmp_path):
+        """_update_current should include display_connected from the probe."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(type(player), "_is_display_connected", return_value=True), \
+             patch.object(player, "_query_position_ms", return_value=0):
+            player._update_current(mode=PlaybackMode.PLAY, asset="test.mp4")
+
+        import json
+        data = json.loads(state_file.read_text())
+        assert data["display_connected"] is True
+
+    def test_update_current_display_disconnected(self, player, tmp_path):
+        """_update_current should record display_connected=False when probe fails."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(type(player), "_is_display_connected", return_value=False), \
+             patch.object(player, "_query_position_ms", return_value=0):
+            player._update_current(mode=PlaybackMode.PLAY, asset="test.mp4")
+
+        import json
+        data = json.loads(state_file.read_text())
+        assert data["display_connected"] is False
+
+    def test_update_position_probes_display(self, player, tmp_path):
+        """_update_position should update display_connected in current.json."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.PLAY, asset="test.mp4",
+            pipeline_state="PLAYING", playback_position_ms=1000,
+            display_connected=True,
+        )
+        write_state(state_file, initial)
+
+        player.pipeline = MagicMock()
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(player, "_query_position_ms", return_value=1000), \
+             patch.object(type(player), "_is_display_connected", return_value=False):
+            result = player._update_position()
+
+        assert result is True
+        import json
+        data = json.loads(state_file.read_text())
+        assert data["display_connected"] is False
+
+    def test_update_position_no_write_when_unchanged(self, player, tmp_path):
+        """_update_position should not write when position and display are unchanged."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.PLAY, asset="test.mp4",
+            pipeline_state="PLAYING", playback_position_ms=1000,
+            display_connected=True,
+        )
+        write_state(state_file, initial)
+        mtime_before = state_file.stat().st_mtime_ns
+
+        player.pipeline = MagicMock()
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(player, "_query_position_ms", return_value=1000), \
+             patch.object(type(player), "_is_display_connected", return_value=True):
+            result = player._update_position()
+
+        assert result is True
+        # File should not have been rewritten
+        assert state_file.stat().st_mtime_ns == mtime_before
+
+    def test_display_transition_logs_warning(self, player, tmp_path):
+        """Display state transition should log a warning."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.PLAY, asset="test.mp4",
+            pipeline_state="PLAYING", playback_position_ms=1000,
+            display_connected=True,
+        )
+        write_state(state_file, initial)
+
+        player.pipeline = MagicMock()
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        import logging
+        with patch.object(player, "_query_position_ms", return_value=1000), \
+             patch.object(type(player), "_is_display_connected", return_value=False), \
+             patch("player.service.logger") as mock_logger:
+            player._update_position()
+            mock_logger.warning.assert_called_once_with("Display %s", "disconnected")
+
+    def test_display_reconnect_logs_connected(self, player, tmp_path):
+        """Display reconnect should log 'connected'."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.PLAY, asset="test.mp4",
+            pipeline_state="PLAYING", playback_position_ms=1000,
+            display_connected=False,
+        )
+        write_state(state_file, initial)
+
+        player.pipeline = MagicMock()
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        import logging
+        with patch.object(player, "_query_position_ms", return_value=1000), \
+             patch.object(type(player), "_is_display_connected", return_value=True), \
+             patch("player.service.logger") as mock_logger:
+            player._update_position()
+            mock_logger.warning.assert_called_once_with("Display %s", "connected")
+
+    def test_initial_probe_does_not_log(self, player, tmp_path):
+        """Transition from None to True/False should not log (initial probe)."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.PLAY, asset="test.mp4",
+            pipeline_state="PLAYING", playback_position_ms=1000,
+            display_connected=None,  # initial state
+        )
+        write_state(state_file, initial)
+
+        player.pipeline = MagicMock()
+        player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(player, "_query_position_ms", return_value=1000), \
+             patch.object(type(player), "_is_display_connected", return_value=True), \
+             patch("player.service.logger") as mock_logger:
+            player._update_position()
+            mock_logger.warning.assert_not_called()

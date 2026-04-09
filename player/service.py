@@ -52,6 +52,11 @@ class AgoraPlayer:
         "imagefreeze ! kmssink driver-name=vc4 sync=false"
     )
 
+    # HDMI display detection via DDC/EDID I2C probe
+    # Bus number is specific to Raspberry Pi Zero 2 W (single HDMI port)
+    _I2C_BUS = "/dev/i2c-2"
+    _EDID_ADDR = 0x50
+    _I2C_SLAVE = 0x0703  # ioctl request code
 
     DEFAULT_SPLASH_CONFIG = "splash/default.png"
 
@@ -272,6 +277,29 @@ class AgoraPlayer:
         combined = f"{raw} {debug}"
         return any(m in combined for m in cls._DISPLAY_ERROR_MARKERS)
 
+    @classmethod
+    def _is_display_connected(cls) -> Optional[bool]:
+        """Probe the HDMI DDC/EDID I2C bus to detect a connected display.
+
+        Reads one byte from the EDID EEPROM at address 0x50 on /dev/i2c-2.
+        Returns True if the device responds (display connected), False if
+        it fails with an I/O error (no display), or None if the I2C bus
+        is not available (e.g. i2c-dev module not loaded).
+        """
+        try:
+            fd = os.open(cls._I2C_BUS, os.O_RDWR)
+        except OSError:
+            return None
+        try:
+            import fcntl
+            fcntl.ioctl(fd, cls._I2C_SLAVE, cls._EDID_ADDR)
+            os.read(fd, 1)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
     _RETRY_DELAY_MAX = 15
 
     def _on_error(self, bus, message) -> None:
@@ -366,6 +394,7 @@ class AgoraPlayer:
             started_at=started_at,
             playback_position_ms=self._query_position_ms(),
             pipeline_state=pipeline_state,
+            display_connected=self._is_display_connected(),
             error=error,
         )
         write_state(self.current_path, state)
@@ -381,8 +410,17 @@ class AgoraPlayer:
         try:
             current = read_state(self.current_path, CurrentState)
             pos = self._query_position_ms()
+            display = self._is_display_connected()
+            changed = False
             if pos is not None and current.playback_position_ms != pos:
                 current.playback_position_ms = pos
+                changed = True
+            if current.display_connected != display:
+                if display is not None and current.display_connected is not None:
+                    logger.warning("Display %s", "connected" if display else "disconnected")
+                current.display_connected = display
+                changed = True
+            if changed:
                 current.updated_at = datetime.now(timezone.utc)
                 write_state(self.current_path, current)
         except Exception:
