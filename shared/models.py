@@ -31,6 +31,7 @@ class CurrentState(BaseModel):
     started_at: Optional[datetime] = None
     playback_position_ms: Optional[int] = None
     pipeline_state: str = "NULL"
+    display_connected: Optional[bool] = None
     error: Optional[str] = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

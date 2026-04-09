@@ -52,6 +52,11 @@ class AgoraPlayer:
         "imagefreeze ! kmssink driver-name=vc4 sync=false"
     )
 
+    # HDMI display detection via DDC/EDID I2C probe
+    # Bus number is specific to Raspberry Pi Zero 2 W (single HDMI port)
+    _I2C_BUS = "/dev/i2c-2"
+    _EDID_ADDR = 0x50
+    _I2C_SLAVE = 0x0703  # ioctl request code
 
     DEFAULT_SPLASH_CONFIG = "splash/default.png"
 
@@ -72,6 +77,7 @@ class AgoraPlayer:
         self._loops_completed: int = 0
         self._health_retries: int = 0
         self._error_retry_delay: int = 3
+        self._pending_error: Optional[str] = None
         self._plymouth_quit: bool = False
         self._running = True
 
@@ -208,7 +214,10 @@ class AgoraPlayer:
         logger.debug("Pipeline state: %s -> %s", old.value_nick, new_name)
 
         if new == Gst.State.PLAYING and self.current_desired:
-            self._error_retry_delay = 3  # Reset backoff on success
+            # Only reset backoff when desired content starts playing,
+            # not when splash fallback reaches PLAYING
+            if self.current_desired.mode == PlaybackMode.PLAY:
+                self._error_retry_delay = 3
             started = datetime.now(timezone.utc)
             mode = self.current_desired.mode
             asset = self.current_desired.asset
@@ -249,28 +258,59 @@ class AgoraPlayer:
     _DISPLAY_ERROR_MARKERS = ("drmModeSetPlane", "Could not open audio device")
 
     @classmethod
-    def _translate_error(cls, raw: str) -> str:
-        """Translate raw GStreamer error into a user-friendly message."""
+    def _translate_error(cls, raw: str, debug: str = "") -> str:
+        """Translate raw GStreamer error into a user-friendly message.
+
+        Checks both the error message and debug string, since GStreamer
+        often wraps the real cause (e.g. drmModeSetPlane) in debug info
+        while the message is a generic 'resource error'.
+        """
+        combined = f"{raw} {debug}"
         for marker, friendly in cls._ERROR_TRANSLATIONS:
-            if marker in raw:
+            if marker in combined:
                 return friendly
         return f"Playback error: {raw}"
 
     @classmethod
-    def _is_display_error(cls, raw: str) -> bool:
+    def _is_display_error(cls, raw: str, debug: str = "") -> bool:
         """Return True if the error indicates a missing/broken display."""
-        return any(m in raw for m in cls._DISPLAY_ERROR_MARKERS)
+        combined = f"{raw} {debug}"
+        return any(m in combined for m in cls._DISPLAY_ERROR_MARKERS)
 
-    _RETRY_DELAY_MAX = 60
+    @classmethod
+    def _is_display_connected(cls) -> Optional[bool]:
+        """Probe the HDMI DDC/EDID I2C bus to detect a connected display.
+
+        Reads one byte from the EDID EEPROM at address 0x50 on /dev/i2c-2.
+        Returns True if the device responds (display connected), False if
+        it fails with an I/O error (no display), or None if the I2C bus
+        is not available (e.g. i2c-dev module not loaded).
+        """
+        try:
+            fd = os.open(cls._I2C_BUS, os.O_RDWR)
+        except OSError:
+            return None
+        try:
+            import fcntl
+            fcntl.ioctl(fd, cls._I2C_SLAVE, cls._EDID_ADDR)
+            os.read(fd, 1)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    _RETRY_DELAY_MAX = 15
 
     def _on_error(self, bus, message) -> None:
         err, debug = message.parse_error()
-        friendly = self._translate_error(err.message)
-        logger.error("Pipeline error: %s (%s)", err.message, debug)
+        debug_str = debug or ""
+        friendly = self._translate_error(err.message, debug_str)
+        logger.error("Pipeline error: %s (%s)", err.message, debug_str)
         self._teardown()
         self._update_current(error=friendly)
         # Exponential backoff for display errors to avoid burning CPU/memory
-        if self._is_display_error(err.message):
+        if self._is_display_error(err.message, debug_str):
             delay = self._error_retry_delay
             self._error_retry_delay = min(
                 self._error_retry_delay * 2, self._RETRY_DELAY_MAX,
@@ -278,14 +318,20 @@ class AgoraPlayer:
         else:
             delay = 3
             self._error_retry_delay = 3
+        # Show splash immediately as visual fallback (preserves error)
+        self._pending_error = friendly
+        self._show_splash()
+        # Schedule retry of the original desired content after backoff
         logger.info("Retrying in %ds", delay)
-        GLib.timeout_add_seconds(delay, self._show_splash)
+        GLib.timeout_add_seconds(delay, self._retry_desired)
 
     # ── Splash ──
 
     def _show_splash(self) -> bool:
         """Show splash screen. Returns False to cancel GLib timeout repeat."""
         self._teardown()
+        error = self._pending_error
+        self._pending_error = None
         splash = self._find_splash()
         if splash:
             is_video = splash.suffix.lower() == ".mp4"
@@ -297,11 +343,17 @@ class AgoraPlayer:
             self.current_desired = DesiredState(
                 mode=PlaybackMode.SPLASH, loop=is_video
             )
-            self._update_current(mode=PlaybackMode.SPLASH, asset=splash.name)
+            self._update_current(mode=PlaybackMode.SPLASH, asset=splash.name, error=error)
             logger.info("Showing splash: %s", splash.name)
         else:
             logger.warning("No splash asset found")
-            self._update_current(mode=PlaybackMode.STOP)
+            self._update_current(mode=PlaybackMode.STOP, error=error)
+        return False
+
+    def _retry_desired(self) -> bool:
+        """Re-read desired.json and attempt playback. Returns False (one-shot)."""
+        logger.info("Retrying desired state")
+        self.apply_desired()
         return False
 
     # ── State management ──
@@ -342,6 +394,7 @@ class AgoraPlayer:
             started_at=started_at,
             playback_position_ms=self._query_position_ms(),
             pipeline_state=pipeline_state,
+            display_connected=self._is_display_connected(),
             error=error,
         )
         write_state(self.current_path, state)
@@ -357,8 +410,17 @@ class AgoraPlayer:
         try:
             current = read_state(self.current_path, CurrentState)
             pos = self._query_position_ms()
+            display = self._is_display_connected()
+            changed = False
             if pos is not None and current.playback_position_ms != pos:
                 current.playback_position_ms = pos
+                changed = True
+            if current.display_connected != display:
+                if display is not None and current.display_connected is not None:
+                    logger.warning("Display %s", "connected" if display else "disconnected")
+                current.display_connected = display
+                changed = True
+            if changed:
                 current.updated_at = datetime.now(timezone.utc)
                 write_state(self.current_path, current)
         except Exception:

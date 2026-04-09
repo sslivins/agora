@@ -481,6 +481,7 @@ class CMSClient:
             "error_timestamp": current_data.get("updated_at") if current_data.get("error") else None,
             "ssh_enabled": _is_ssh_enabled(),
             "local_api_enabled": _is_local_api_enabled(self.settings.persist_dir),
+            "display_connected": current_data.get("display_connected"),
         }
         await self._ws.send(json.dumps(status_msg))
 
