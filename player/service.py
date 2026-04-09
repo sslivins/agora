@@ -507,23 +507,6 @@ class AgoraPlayer:
                 self._update_current(error=f"Asset not readable: {desired.asset}")
                 self._show_splash()
                 return
-            if desired.expected_checksum:
-                import hashlib
-                sha = hashlib.sha256()
-                with open(path, "rb") as f:
-                    for chunk in iter(lambda: f.read(65536), b""):
-                        sha.update(chunk)
-                actual = sha.hexdigest()
-                if actual != desired.expected_checksum:
-                    logger.error(
-                        "Checksum mismatch for %s: expected %s, got %s — showing splash",
-                        desired.asset, desired.expected_checksum, actual,
-                    )
-                    self._update_current(
-                        error=f"Checksum mismatch: {desired.asset}",
-                    )
-                    self._show_splash()
-                    return
             self.current_desired = desired
             self._teardown()
             self._health_retries = 0
