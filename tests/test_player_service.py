@@ -27,6 +27,7 @@ def player():
         p._current_path = None
         p._current_mtime = None
         p._health_retries = 0
+        p._error_retry_delay = 3
         p._loops_completed = 0
         yield p
 
@@ -778,3 +779,205 @@ class TestStartupDesiredRace:
         assert player.current_desired is not None
         assert player.current_desired.mode == PlaybackMode.PLAY
         assert player.current_desired.asset == "target.png"
+
+
+class TestTeardownBusCleanup:
+    """Verify _teardown removes bus signal watch to prevent GSource leaks."""
+
+    def test_teardown_removes_signal_watch(self, player):
+        """_teardown must call bus.remove_signal_watch() before setting NULL."""
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+
+            mock_bus = MagicMock()
+            mock_pipeline = MagicMock()
+            mock_pipeline.get_bus.return_value = mock_bus
+            player.pipeline = mock_pipeline
+
+            player._teardown()
+
+            mock_pipeline.get_bus.assert_called_once()
+            mock_bus.remove_signal_watch.assert_called_once()
+            mock_pipeline.set_state.assert_called_once_with("NULL")
+            mock_pipeline.get_state.assert_called_once_with(0)
+            assert player.pipeline is None
+
+    def test_teardown_handles_no_bus_gracefully(self, player):
+        """_teardown should not crash if get_bus() returns None."""
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+
+            mock_pipeline = MagicMock()
+            mock_pipeline.get_bus.return_value = None
+            player.pipeline = mock_pipeline
+
+            player._teardown()
+
+            assert player.pipeline is None
+
+    def test_no_signal_watch_leak_after_error_loop(self, player):
+        """Simulating multiple error→teardown→rebuild cycles should not accumulate bus watches."""
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib"):
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+
+            buses = []
+            for i in range(5):
+                mock_bus = MagicMock(name=f"bus_{i}")
+                mock_pipeline = MagicMock(name=f"pipeline_{i}")
+                mock_pipeline.get_bus.return_value = mock_bus
+                player.pipeline = mock_pipeline
+
+                player._teardown()
+
+                mock_bus.remove_signal_watch.assert_called_once()
+                buses.append(mock_bus)
+
+            # All 5 buses should have had their signal watch removed
+            assert all(b.remove_signal_watch.called for b in buses)
+
+
+class TestErrorTranslation:
+    """Verify _translate_error maps GStreamer errors to friendly messages."""
+
+    def test_drm_set_plane_error(self, player):
+        raw = "drmModeSetPlane failed: Permission denied (13)"
+        result = player._translate_error(raw)
+        assert result == "No display connected \u2014 check the HDMI cable"
+
+    def test_audio_device_error(self, player):
+        raw = "Could not open audio device for playback"
+        result = player._translate_error(raw)
+        assert result == "No audio output \u2014 check the HDMI cable"
+
+    def test_memory_allocation_error(self, player):
+        raw = "Failed to allocate required memory"
+        result = player._translate_error(raw)
+        assert result == "Not enough memory to decode this video"
+
+    def test_unknown_error_passes_through(self, player):
+        raw = "Some totally unexpected GStreamer error"
+        result = player._translate_error(raw)
+        assert result == "Playback error: Some totally unexpected GStreamer error"
+
+    def test_is_display_error_true_for_drm(self, player):
+        assert player._is_display_error("drmModeSetPlane failed: Permission denied (13)") is True
+
+    def test_is_display_error_true_for_audio(self, player):
+        assert player._is_display_error("Could not open audio device for playback") is True
+
+    def test_is_display_error_false_for_other(self, player):
+        assert player._is_display_error("Failed to allocate required memory") is False
+
+
+class TestErrorBackoff:
+    """Verify _on_error uses exponential backoff for display errors."""
+
+    def test_display_error_increases_retry_delay(self, player):
+        """Display errors should double the retry delay each time."""
+        with patch("player.service.GLib") as mock_glib:
+            mock_message = MagicMock()
+            mock_err = MagicMock()
+            mock_err.message = "drmModeSetPlane failed: Permission denied (13)"
+            mock_message.parse_error.return_value = (mock_err, "debug info")
+
+            with patch.object(player, "_teardown"), \
+                 patch.object(player, "_update_current"):
+                assert player._error_retry_delay == 3
+
+                player._on_error(None, mock_message)
+                delay1 = mock_glib.timeout_add_seconds.call_args[0][0]
+                assert delay1 == 3
+                assert player._error_retry_delay == 6
+
+                mock_glib.reset_mock()
+                player._on_error(None, mock_message)
+                delay2 = mock_glib.timeout_add_seconds.call_args[0][0]
+                assert delay2 == 6
+                assert player._error_retry_delay == 12
+
+    def test_display_error_caps_at_max_delay(self, player):
+        """Retry delay should not exceed _RETRY_DELAY_MAX (60s)."""
+        with patch("player.service.GLib") as mock_glib:
+            mock_message = MagicMock()
+            mock_err = MagicMock()
+            mock_err.message = "drmModeSetPlane failed: Permission denied (13)"
+            mock_message.parse_error.return_value = (mock_err, "debug info")
+
+            player._error_retry_delay = 48
+
+            with patch.object(player, "_teardown"), \
+                 patch.object(player, "_update_current"):
+                player._on_error(None, mock_message)
+                delay = mock_glib.timeout_add_seconds.call_args[0][0]
+                assert delay == 48
+                assert player._error_retry_delay == 60  # capped
+
+                mock_glib.reset_mock()
+                player._on_error(None, mock_message)
+                delay = mock_glib.timeout_add_seconds.call_args[0][0]
+                assert delay == 60
+                assert player._error_retry_delay == 60  # stays capped
+
+    def test_non_display_error_resets_delay(self, player):
+        """Non-display errors should use 3s and reset the backoff counter."""
+        with patch("player.service.GLib") as mock_glib:
+            mock_message = MagicMock()
+            mock_err = MagicMock()
+            mock_err.message = "Failed to allocate required memory"
+            mock_message.parse_error.return_value = (mock_err, "debug info")
+
+            player._error_retry_delay = 30  # Previously backed off
+
+            with patch.object(player, "_teardown"), \
+                 patch.object(player, "_update_current"):
+                player._on_error(None, mock_message)
+                delay = mock_glib.timeout_add_seconds.call_args[0][0]
+                assert delay == 3
+                assert player._error_retry_delay == 3
+
+    def test_on_error_reports_friendly_message(self, player):
+        """_on_error should pass the translated message to _update_current."""
+        with patch("player.service.GLib"):
+            mock_message = MagicMock()
+            mock_err = MagicMock()
+            mock_err.message = "drmModeSetPlane failed: Permission denied (13)"
+            mock_message.parse_error.return_value = (mock_err, "debug info")
+
+            with patch.object(player, "_teardown"), \
+                 patch.object(player, "_update_current") as mock_update:
+                player._on_error(None, mock_message)
+                mock_update.assert_called_once_with(
+                    error="No display connected \u2014 check the HDMI cable"
+                )
+
+    def test_successful_playback_resets_backoff(self, player):
+        """Pipeline reaching PLAYING should reset _error_retry_delay to 3."""
+        with patch("player.service.Gst") as mock_gst:
+            playing_state = MagicMock()
+            playing_state.value_nick = "playing"
+            mock_gst.State.PLAYING = playing_state
+
+            mock_pipeline = MagicMock()
+            mock_pipeline.get_state.return_value = (None, playing_state, None)
+            player.pipeline = mock_pipeline
+            player._error_retry_delay = 30  # Previously backed off
+            player.current_desired = DesiredState(
+                mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+            )
+
+            mock_message = MagicMock()
+            mock_message.src = mock_pipeline
+            new_state = MagicMock()
+            new_state.value_nick = "playing"
+            new_state.__eq__ = lambda self, other: other == playing_state
+            old_state = MagicMock()
+            old_state.value_nick = "paused"
+            mock_message.parse_state_changed.return_value = (old_state, new_state, None)
+
+            with patch.object(player, "_update_current"):
+                player._on_state_changed(None, mock_message)
+                assert player._error_retry_delay == 3

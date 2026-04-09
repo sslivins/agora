@@ -71,6 +71,7 @@ class AgoraPlayer:
         self._current_mtime: Optional[float] = None  # mtime when pipeline was built
         self._loops_completed: int = 0
         self._health_retries: int = 0
+        self._error_retry_delay: int = 3
         self._plymouth_quit: bool = False
         self._running = True
 
@@ -159,6 +160,9 @@ class AgoraPlayer:
 
     def _teardown(self) -> None:
         if self.pipeline:
+            bus = self.pipeline.get_bus()
+            if bus:
+                bus.remove_signal_watch()
             self.pipeline.set_state(Gst.State.NULL)
             # Wait for NULL state to complete so hardware resources (V4L2
             # decoder, KMS/DRM plane, ALSA) are fully released before
@@ -204,6 +208,7 @@ class AgoraPlayer:
         logger.debug("Pipeline state: %s -> %s", old.value_nick, new_name)
 
         if new == Gst.State.PLAYING and self.current_desired:
+            self._error_retry_delay = 3  # Reset backoff on success
             started = datetime.now(timezone.utc)
             mode = self.current_desired.mode
             asset = self.current_desired.asset
@@ -235,13 +240,46 @@ class AgoraPlayer:
             logger.info("Playback complete, switching to splash")
             self._show_splash()
 
+    _ERROR_TRANSLATIONS = [
+        ("drmModeSetPlane failed", "No display connected — check the HDMI cable"),
+        ("Could not open audio device", "No audio output — check the HDMI cable"),
+        ("Failed to allocate required memory", "Not enough memory to decode this video"),
+    ]
+
+    _DISPLAY_ERROR_MARKERS = ("drmModeSetPlane", "Could not open audio device")
+
+    @classmethod
+    def _translate_error(cls, raw: str) -> str:
+        """Translate raw GStreamer error into a user-friendly message."""
+        for marker, friendly in cls._ERROR_TRANSLATIONS:
+            if marker in raw:
+                return friendly
+        return f"Playback error: {raw}"
+
+    @classmethod
+    def _is_display_error(cls, raw: str) -> bool:
+        """Return True if the error indicates a missing/broken display."""
+        return any(m in raw for m in cls._DISPLAY_ERROR_MARKERS)
+
+    _RETRY_DELAY_MAX = 60
+
     def _on_error(self, bus, message) -> None:
         err, debug = message.parse_error()
+        friendly = self._translate_error(err.message)
         logger.error("Pipeline error: %s (%s)", err.message, debug)
         self._teardown()
-        self._update_current(error=err.message)
-        # Recover by showing splash after a brief delay
-        GLib.timeout_add_seconds(3, self._show_splash)
+        self._update_current(error=friendly)
+        # Exponential backoff for display errors to avoid burning CPU/memory
+        if self._is_display_error(err.message):
+            delay = self._error_retry_delay
+            self._error_retry_delay = min(
+                self._error_retry_delay * 2, self._RETRY_DELAY_MAX,
+            )
+        else:
+            delay = 3
+            self._error_retry_delay = 3
+        logger.info("Retrying in %ds", delay)
+        GLib.timeout_add_seconds(delay, self._show_splash)
 
     # ── Splash ──
 
