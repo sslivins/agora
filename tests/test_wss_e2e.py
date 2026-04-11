@@ -28,7 +28,7 @@ def provision_server():
     """Start the provision app on a local port for Playwright tests."""
     from provision.app import app
 
-    config = uvicorn.Config(app, host="127.0.0.1", port=18081, log_level="error")
+    config = uvicorn.Config(app, host="127.0.0.1", port=18081, log_level="error", ws="none")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -62,7 +62,7 @@ def api_server(tmp_path_factory):
     settings.ensure_dirs()
     app.state.settings = settings
 
-    config = uvicorn.Config(app, host="127.0.0.1", port=18082, log_level="error")
+    config = uvicorn.Config(app, host="127.0.0.1", port=18082, log_level="error", ws="none")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()

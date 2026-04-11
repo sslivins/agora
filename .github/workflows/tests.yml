@@ -24,4 +24,6 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run tests
-        run: python -m pytest tests/ --tb=short -q
+        run: |
+          python -m pytest tests/ --ignore=tests/test_wss_e2e.py --tb=short -q
+          python -m pytest tests/test_wss_e2e.py --tb=short -q
