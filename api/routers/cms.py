@@ -14,6 +14,7 @@ router = APIRouter(prefix="/cms", dependencies=[Depends(require_auth)])
 
 CMS_WS_PATH = "/ws/device"
 DEFAULT_CMS_PORT = 8080
+DEFAULT_CMS_TLS_PORT = 443
 
 
 def _read_cms_config(settings: Settings) -> dict:
@@ -37,9 +38,13 @@ def _read_cms_status(settings: Settings) -> dict:
         return {}
 
 
-def _build_ws_url(host: str, port: int) -> str:
-    """Build a WebSocket URL from host and port."""
-    return f"ws://{host}:{port}{CMS_WS_PATH}"
+def _build_ws_url(host: str, port: int, tls: bool = False) -> str:
+    """Build a WebSocket URL from host, port, and TLS setting."""
+    scheme = "wss" if tls else "ws"
+    # Omit port for default ports (443 for wss, 80 for ws)
+    if (tls and port == DEFAULT_CMS_TLS_PORT) or (not tls and port == 80):
+        return f"{scheme}://{host}{CMS_WS_PATH}"
+    return f"{scheme}://{host}:{port}{CMS_WS_PATH}"
 
 
 @router.get("/config")
@@ -69,10 +74,12 @@ async def get_cms_config(settings: Settings = Depends(get_settings)):
 
     cms_host = config.get("cms_host", "")
     cms_port = config.get("cms_port", DEFAULT_CMS_PORT)
+    cms_tls = config.get("cms_tls", False)
 
     return {
         "cms_host": cms_host,
         "cms_port": cms_port,
+        "cms_tls": cms_tls,
         "has_auth_token": has_auth_token,
         "service_active": service_active,
         "configured": bool(cms_host),
@@ -113,6 +120,7 @@ async def set_cms_config(request: Request, settings: Settings = Depends(get_sett
 
     cms_host = body.get("cms_host", "").strip()
     cms_port = int(body.get("cms_port", DEFAULT_CMS_PORT))
+    cms_tls = bool(body.get("cms_tls", False))
 
     if not cms_host:
         raise HTTPException(status_code=400, detail="Server address is required")
@@ -120,6 +128,8 @@ async def set_cms_config(request: Request, settings: Settings = Depends(get_sett
     # Strip any accidental protocol prefix the user might paste
     for prefix in ("ws://", "wss://", "http://", "https://"):
         if cms_host.startswith(prefix):
+            if prefix in ("wss://", "https://"):
+                cms_tls = True
             cms_host = cms_host[len(prefix):]
     # Strip trailing slashes or paths
     cms_host = cms_host.split("/")[0]
@@ -132,10 +142,15 @@ async def set_cms_config(request: Request, settings: Settings = Depends(get_sett
         except ValueError:
             pass
 
+    # Default port based on TLS setting
+    if cms_tls and cms_port == DEFAULT_CMS_PORT:
+        cms_port = DEFAULT_CMS_TLS_PORT
+
     config = _read_cms_config(settings)
     config["cms_host"] = cms_host
     config["cms_port"] = cms_port
-    config["cms_url"] = _build_ws_url(cms_host, cms_port)
+    config["cms_tls"] = cms_tls
+    config["cms_url"] = _build_ws_url(cms_host, cms_port, cms_tls)
     _write_cms_config(settings, config)
 
     # Try to restart the CMS client service so it picks up the new config
@@ -147,4 +162,4 @@ async def set_cms_config(request: Request, settings: Settings = Depends(get_sett
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
 
-    return {"status": "ok", "cms_host": cms_host, "cms_port": cms_port}
+    return {"status": "ok", "cms_host": cms_host, "cms_port": cms_port, "cms_tls": cms_tls}

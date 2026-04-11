@@ -44,7 +44,11 @@
                         <input type="text" id="cms-port" placeholder="8080">
                     </div>
                 </div>
-                <span class="form-hint">Leave blank to auto-discover via mDNS (agora-cms.local), or enter an address manually.</span>
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; cursor: pointer; font-size: 0.9rem;">
+                    <input type="checkbox" id="cms-tls" onchange="onTlsToggle(this.checked)">
+                    <span>Use TLS (wss://)</span>
+                </label>
+                <span class="form-hint">Leave blank to auto-discover via mDNS (agora-cms.local), or enter an address manually. Enable TLS for cloud-hosted servers.</span>
             </div>
 
             <!-- Device Name -->
@@ -62,6 +66,18 @@
     </div>
 
     <script>
+    /* ── TLS toggle ── */
+    function onTlsToggle(checked) {
+        var portEl = document.getElementById("cms-port");
+        if (checked && (portEl.value === "8080" || portEl.value === "")) {
+            portEl.value = "443";
+            portEl.placeholder = "443";
+        } else if (!checked && (portEl.value === "443" || portEl.value === "")) {
+            portEl.value = "";
+            portEl.placeholder = "8080";
+        }
+    }
+
     /* ── Wi-Fi Scan ── */
     async function scanNetworks() {
         var select = document.getElementById("wifi-ssid");
@@ -119,11 +135,13 @@
         statusEl.className = "status info";
         statusEl.innerHTML = '<span class="spinner"></span>Submitting…';
 
+        var cmsTls = document.getElementById("cms-tls").checked;
         var payload = {
             wifi_ssid: wifiSsid,
             wifi_password: document.getElementById("wifikey").value,
             cms_host: document.getElementById("cms-host").value.trim(),
-            cms_port: parseInt(document.getElementById("cms-port").value) || 8080,
+            cms_port: parseInt(document.getElementById("cms-port").value) || (cmsTls ? 443 : 8080),
+            cms_tls: cmsTls,
             device_name: document.getElementById("device-name").value.trim(),
         };
 

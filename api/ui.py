@@ -162,10 +162,12 @@ async def settings_page(
 
     cms_host = ""
     cms_port = ""
+    cms_tls = False
     try:
         config = json.loads(settings.cms_config_path.read_text())
         cms_host = config.get("cms_host", "")
         cms_port = config.get("cms_port", "")
+        cms_tls = config.get("cms_tls", False)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
@@ -219,6 +221,7 @@ async def settings_page(
             "user": user,
             "cms_host": cms_host,
             "cms_port": cms_port,
+            "cms_tls": cms_tls,
             "configured": configured,
             "service_active": service_active,
             "cms_status": cms_status,

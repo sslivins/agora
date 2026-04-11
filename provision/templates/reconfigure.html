@@ -30,7 +30,11 @@
                         <input type="number" id="cms-port" placeholder="8080" min="1" max="65535">
                     </div>
                 </div>
-                <span class="form-hint">Enter the hostname or IP address of your CMS server.</span>
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; cursor: pointer; font-size: 0.9rem;">
+                    <input type="checkbox" id="cms-tls" onchange="onTlsToggle(this.checked)">
+                    <span>Use TLS (wss://)</span>
+                </label>
+                <span class="form-hint">Enter the hostname or IP address of your CMS server. Enable TLS for cloud-hosted servers.</span>
             </div>
 
             <div id="status" class="status"></div>
@@ -40,6 +44,17 @@
     </div>
 
     <script>
+    function onTlsToggle(checked) {
+        var portEl = document.getElementById("cms-port");
+        if (checked && (portEl.value === "8080" || portEl.value === "")) {
+            portEl.value = "443";
+            portEl.placeholder = "443";
+        } else if (!checked && (portEl.value === "443" || portEl.value === "")) {
+            portEl.value = "";
+            portEl.placeholder = "8080";
+        }
+    }
+
     async function loadConfig() {
         try {
             const res = await fetch("/api/cms/config");
@@ -49,6 +64,10 @@
             }
             if (data.cms_port) {
                 document.getElementById("cms-port").value = data.cms_port;
+            }
+            if (data.cms_tls) {
+                document.getElementById("cms-tls").checked = true;
+                document.getElementById("cms-port").placeholder = "443";
             }
         } catch (e) {
             /* ignore — fields stay at defaults */
@@ -61,6 +80,7 @@
         const submitBtn = document.getElementById("submit-btn");
 
         const cmsHost = document.getElementById("cms-host").value.trim() || "agora-cms.local";
+        const cmsTls = document.getElementById("cms-tls").checked;
 
         submitBtn.disabled = true;
         statusEl.className = "status info";
@@ -72,7 +92,8 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     cms_host: cmsHost,
-                    cms_port: parseInt(document.getElementById("cms-port").value) || 8080,
+                    cms_port: parseInt(document.getElementById("cms-port").value) || (cmsTls ? 443 : 8080),
+                    cms_tls: cmsTls,
                 }),
             });
             const data = await res.json();
