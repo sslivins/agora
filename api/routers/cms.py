@@ -153,13 +153,7 @@ async def set_cms_config(request: Request, settings: Settings = Depends(get_sett
     config["cms_url"] = _build_ws_url(cms_host, cms_port, cms_tls)
     _write_cms_config(settings, config)
 
-    # Try to restart the CMS client service so it picks up the new config
-    try:
-        subprocess.run(
-            ["sudo", "systemctl", "restart", "agora-cms-client"],
-            capture_output=True, timeout=10,
-        )
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+    # The CMS client service watches cms_config.json for changes and
+    # reconnects automatically — no service restart needed.
 
     return {"status": "ok", "cms_host": cms_host, "cms_port": cms_port, "cms_tls": cms_tls}

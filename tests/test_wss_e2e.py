@@ -270,3 +270,61 @@ class TestSettingsPageTlsToggle:
 
         body = req_info.value.post_data_json
         assert body["cms_tls"] is True
+
+
+class TestSettingsPageCmsReconnect:
+    """Test that changing the CMS host on the Settings page writes config
+    and returns success (the client-side reconnect is tested separately
+    in test_cms_url_reconnect.py)."""
+
+    def test_change_cms_host_saves_config(self, page, api_server):
+        """Submitting a new CMS host should write cms_config.json on disk."""
+        base_url, settings = api_server
+        # Clean any leftover config from prior tests
+        settings.cms_config_path.unlink(missing_ok=True)
+        _login(page, base_url)
+        page.goto(f"{base_url}/settings")
+
+        page.fill("#cms-host", "new-cms.example.com")
+        page.fill("#cms-port", "8080")
+        # Ensure TLS is unchecked (may be checked from prior test)
+        if page.locator("#cms-tls").is_checked():
+            page.uncheck("#cms-tls")
+
+        with page.expect_request("**/cms/config") as req_info:
+            page.click("#cms-connect-btn")
+
+        body = req_info.value.post_data_json
+        assert body["cms_host"] == "new-cms.example.com"
+        assert body["cms_port"] == 8080
+
+        # Wait for the response to be processed
+        page.wait_for_timeout(1000)
+
+        # Config file should be updated on disk
+        config = json.loads(settings.cms_config_path.read_text())
+        assert config["cms_url"] == "ws://new-cms.example.com:8080/ws/device"
+
+    def test_change_cms_host_with_tls_saves_wss_url(self, page, api_server):
+        """Submitting with TLS enabled should write a wss:// URL."""
+        base_url, settings = api_server
+        _login(page, base_url)
+        page.goto(f"{base_url}/settings")
+
+        page.fill("#cms-host", "cloud.example.com")
+        page.check("#cms-tls")
+
+        with page.expect_request("**/cms/config") as req_info:
+            page.click("#cms-connect-btn")
+
+        body = req_info.value.post_data_json
+        assert body["cms_host"] == "cloud.example.com"
+        assert body["cms_tls"] is True
+
+        page.wait_for_timeout(1000)
+
+        config = json.loads(settings.cms_config_path.read_text())
+        assert config["cms_url"].startswith("wss://cloud.example.com")
+
+        # Clean up
+        settings.cms_config_path.unlink(missing_ok=True)
