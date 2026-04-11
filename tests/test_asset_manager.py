@@ -285,3 +285,32 @@ class TestRebuildFromDisk:
         )
 
         assert manager.has_asset("partial.mp4.tmp") is False
+
+    def test_rebuild_prunes_deleted_files(self, manager):
+        """Manifest entries for files deleted from disk are removed."""
+        manager.register("gone.mp4", "videos/gone.mp4", 5000, "abc123")
+        assert manager.has_asset("gone.mp4") is True
+
+        # File does NOT exist on disk — rebuild should prune it
+        manager.rebuild_from_disk(
+            manager.assets_dir / "videos",
+            manager.assets_dir / "images",
+            manager.assets_dir / "splash",
+        )
+
+        assert manager.has_asset("gone.mp4") is False
+        assert manager.total_size_bytes == 0
+
+    def test_rebuild_keeps_existing_files(self, manager):
+        """Manifest entries for files still on disk are preserved."""
+        video = manager.assets_dir / "videos" / "still_here.mp4"
+        video.write_bytes(b"present")
+        manager.register("still_here.mp4", "videos/still_here.mp4", len(b"present"), "hash1")
+
+        manager.rebuild_from_disk(
+            manager.assets_dir / "videos",
+            manager.assets_dir / "images",
+            manager.assets_dir / "splash",
+        )
+
+        assert manager.has_asset("still_here.mp4") is True

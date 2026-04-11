@@ -154,6 +154,13 @@ class AssetManager:
         """Scan asset directories and rebuild manifest for files not already tracked."""
         import hashlib
 
+        # Prune entries for files that no longer exist on disk
+        stale = [name for name, info in self._manifest.items()
+                 if not (self.assets_dir / info["path"]).exists()]
+        for name in stale:
+            del self._manifest[name]
+            logger.info("Pruned stale manifest entry: %s", name)
+
         for dir_path in [videos_dir, images_dir, splash_dir]:
             if not dir_path.exists():
                 continue
