@@ -190,11 +190,7 @@ systemctl disable wpa_supplicant 2>/dev/null || true
 systemctl enable NetworkManager 2>/dev/null || true
 systemctl restart NetworkManager 2>/dev/null || true
 
-# ── Configure NTP to use CMS server (Pi has no battery-backed RTC) ──
-# Install the configure-ntp script and run it to set up timesyncd.
-# On first install, defaults to agora-cms.local; the CMS client service
-# re-runs this script on each start to pick up the actual CMS host
-# from /opt/agora/persist/cms_config.json.
+# ── Configure NTP with public pools (Pi has no battery-backed RTC) ──
 chmod +x "${AGORA_BASE}/src/scripts/configure-ntp.sh"
 bash "${AGORA_BASE}/src/scripts/configure-ntp.sh" || true
 

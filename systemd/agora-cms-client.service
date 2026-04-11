@@ -12,8 +12,7 @@ Environment=AGORA_BASE=/opt/agora
 Restart=always
 RestartSec=10
 
-# Configure NTP to use CMS server, then wait for network to settle
-ExecStartPre=/bin/bash /opt/agora/src/scripts/configure-ntp.sh
+# Wait for network to settle before connecting to CMS
 ExecStartPre=/bin/sleep 5
 
 StandardOutput=journal
