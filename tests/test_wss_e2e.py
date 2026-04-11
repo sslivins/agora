@@ -19,9 +19,6 @@ import httpx
 import pytest
 import uvicorn
 
-# Skip this entire module when Playwright is not installed (e.g. in CI)
-pytest.importorskip("playwright", reason="Playwright not installed — skipping E2E tests")
-
 
 # ── Server fixtures ──────────────────────────────────────────────────────────
 

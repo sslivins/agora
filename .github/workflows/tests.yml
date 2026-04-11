@@ -20,6 +20,8 @@ jobs:
         run: |
           pip install -r requirements-api.txt
           pip install pytest pytest-asyncio httpx
+          pip install pytest-playwright
+          playwright install --with-deps chromium
 
       - name: Run tests
         run: python -m pytest tests/ --tb=short -q
