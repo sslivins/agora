@@ -171,6 +171,7 @@ async def provision(request: Request):
     wifi_password = body.get("wifi_password", "")
     cms_host = body.get("cms_host", "").strip() or CMS_MDNS_HOST
     cms_port = int(body.get("cms_port", CMS_DEFAULT_PORT))
+    cms_tls = bool(body.get("cms_tls", False))
     device_name = body.get("device_name", "").strip()
 
     if not wifi_ssid:
@@ -181,6 +182,8 @@ async def provision(request: Request):
         # Strip protocol prefixes
         for prefix in ("ws://", "wss://", "http://", "https://"):
             if cms_host.startswith(prefix):
+                if prefix in ("wss://", "https://"):
+                    cms_tls = True
                 cms_host = cms_host[len(prefix):]
         cms_host = cms_host.split("/")[0]
         if ":" in cms_host:
@@ -191,10 +194,21 @@ async def provision(request: Request):
             except ValueError:
                 pass
 
+        # Default port based on TLS
+        if cms_tls and cms_port == CMS_DEFAULT_PORT:
+            cms_port = 443
+
+        scheme = "wss" if cms_tls else "ws"
+        if cms_tls and cms_port == 443:
+            cms_url = f"{scheme}://{cms_host}/ws/device"
+        else:
+            cms_url = f"{scheme}://{cms_host}:{cms_port}/ws/device"
+
         cms_config = {
             "cms_host": cms_host,
             "cms_port": cms_port,
-            "cms_url": f"ws://{cms_host}:{cms_port}/ws/device",
+            "cms_tls": cms_tls,
+            "cms_url": cms_url,
         }
         cms_config_path = PERSIST_DIR / "cms_config.json"
         cms_config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,9 +269,10 @@ async def get_cms_config():
         return {
             "cms_host": cfg.get("cms_host", ""),
             "cms_port": cfg.get("cms_port", CMS_DEFAULT_PORT),
+            "cms_tls": cfg.get("cms_tls", False),
         }
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"cms_host": "", "cms_port": CMS_DEFAULT_PORT}
+        return {"cms_host": "", "cms_port": CMS_DEFAULT_PORT, "cms_tls": False}
 
 
 @app.post("/api/reconfigure")
@@ -266,6 +281,7 @@ async def reconfigure(request: Request):
     body = await request.json()
     cms_host = body.get("cms_host", "").strip()
     cms_port = int(body.get("cms_port", CMS_DEFAULT_PORT))
+    cms_tls = bool(body.get("cms_tls", False))
 
     if not cms_host:
         cms_host = CMS_MDNS_HOST
@@ -273,6 +289,8 @@ async def reconfigure(request: Request):
     # Strip protocol prefixes
     for prefix in ("ws://", "wss://", "http://", "https://"):
         if cms_host.startswith(prefix):
+            if prefix in ("wss://", "https://"):
+                cms_tls = True
             cms_host = cms_host[len(prefix):]
     cms_host = cms_host.split("/")[0]
     if ":" in cms_host:
@@ -283,10 +301,21 @@ async def reconfigure(request: Request):
         except ValueError:
             pass
 
+    # Default port based on TLS
+    if cms_tls and cms_port == CMS_DEFAULT_PORT:
+        cms_port = 443
+
+    scheme = "wss" if cms_tls else "ws"
+    if cms_tls and cms_port == 443:
+        cms_url = f"{scheme}://{cms_host}/ws/device"
+    else:
+        cms_url = f"{scheme}://{cms_host}:{cms_port}/ws/device"
+
     cms_config = {
         "cms_host": cms_host,
         "cms_port": cms_port,
-        "cms_url": f"ws://{cms_host}:{cms_port}/ws/device",
+        "cms_tls": cms_tls,
+        "cms_url": cms_url,
     }
     cms_config_path = PERSIST_DIR / "cms_config.json"
     cms_config_path.parent.mkdir(parents=True, exist_ok=True)

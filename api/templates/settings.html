@@ -35,8 +35,17 @@
             <div class="form-group form-group-port">
                 <label for="cms-port">Port</label>
                 <input type="number" id="cms-port" name="cms_port"
-                       placeholder="8080" value="{{ cms_port }}" min="1" max="65535">
+                       placeholder="{{ 443 if cms_tls else 8080 }}" value="{{ cms_port }}" min="1" max="65535">
             </div>
+        </div>
+        <div class="form-row" style="margin-top: 0.5rem;">
+            <label class="toggle-label" style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                <input type="checkbox" id="cms-tls" name="cms_tls"
+                       {% if cms_tls %}checked{% endif %}
+                       onchange="onTlsToggle(this.checked)">
+                <span>Use TLS (wss://)</span>
+                <span class="text-muted" style="font-size: 0.8rem;">— required for cloud-hosted CMS</span>
+            </label>
         </div>
         <div id="config-status" class="form-status"></div>
         <button type="submit" class="btn btn-primary" id="cms-connect-btn"
@@ -66,7 +75,7 @@
     <ol class="help-steps">
         <li>Enter your <strong>CMS server address</strong> above and click Connect.</li>
         <li>This device will connect and appear as <em>Pending</em> in the
-            {% if cms_host %}<a href="http://{{ cms_host }}:{{ cms_port or 8080 }}/" class="cms-link">CMS dashboard</a>{% else %}CMS dashboard{% endif %}.</li>
+            {% if cms_host %}<a href="{{ 'https' if cms_tls else 'http' }}://{{ cms_host }}{% if not cms_tls %}:{{ cms_port or 8080 }}{% endif %}/" class="cms-link">CMS dashboard</a>{% else %}CMS dashboard{% endif %}.</li>
         <li><strong>Adopt the device</strong> in the CMS to start receiving schedules and content.</li>
     </ol>
 </section>
@@ -74,24 +83,41 @@
 <script>
 const origHost = document.getElementById("cms-host").value;
 const origPort = document.getElementById("cms-port").value;
+const origTls = document.getElementById("cms-tls").checked;
 const connectBtn = document.getElementById("cms-connect-btn");
+
+function onTlsToggle(checked) {
+    const portEl = document.getElementById("cms-port");
+    // Auto-switch port when toggling TLS (only if currently at the default)
+    if (checked && (portEl.value === "8080" || portEl.value === "")) {
+        portEl.value = "443";
+        portEl.placeholder = "443";
+    } else if (!checked && (portEl.value === "443" || portEl.value === "")) {
+        portEl.value = "8080";
+        portEl.placeholder = "8080";
+    }
+    checkChanged();
+}
 
 function checkChanged() {
     const hostChanged = document.getElementById("cms-host").value.trim() !== origHost;
     const portChanged = document.getElementById("cms-port").value.trim() !== origPort;
-    connectBtn.disabled = !(hostChanged || portChanged) && connectBtn.hasAttribute("data-was-disabled");
+    const tlsChanged = document.getElementById("cms-tls").checked !== origTls;
+    connectBtn.disabled = !(hostChanged || portChanged || tlsChanged) && connectBtn.hasAttribute("data-was-disabled");
 }
 
 if (connectBtn.disabled) {
     connectBtn.setAttribute("data-was-disabled", "1");
     document.getElementById("cms-host").addEventListener("input", checkChanged);
     document.getElementById("cms-port").addEventListener("input", checkChanged);
+    document.getElementById("cms-tls").addEventListener("change", checkChanged);
 }
 
 async function saveCmsConfig(form) {
     const statusEl = document.getElementById("config-status");
     const cmsHost = document.getElementById("cms-host").value.trim();
-    const cmsPort = document.getElementById("cms-port").value.trim() || "8080";
+    const cmsTls = document.getElementById("cms-tls").checked;
+    const cmsPort = document.getElementById("cms-port").value.trim() || (cmsTls ? "443" : "8080");
 
     if (!cmsHost) {
         statusEl.textContent = "Server address is required.";
@@ -105,6 +131,7 @@ async function saveCmsConfig(form) {
     const res = await apiCall("POST", "/cms/config", {
         cms_host: cmsHost,
         cms_port: parseInt(cmsPort),
+        cms_tls: cmsTls,
     });
 
     if (res && res.ok) {
@@ -179,8 +206,11 @@ function updateCmsStatus(data) {
         // Linkify "CMS Devices page" if we have a CMS host
         const cmsHost = document.getElementById("cms-host").value.trim();
         const cmsPort = document.getElementById("cms-port").value.trim() || "8080";
+        const cmsTls = document.getElementById("cms-tls").checked;
         if (cmsHost) {
-            const devicesUrl = `http://${cmsHost}:${cmsPort}/devices`;
+            const proto = cmsTls ? "https" : "http";
+            const portSuffix = cmsTls ? "" : `:${cmsPort}`;
+            const devicesUrl = `${proto}://${cmsHost}${portSuffix}/devices`;
             const linked = message.replace(
                 "CMS Devices page",
                 `<a href="${devicesUrl}" class="cms-link" target="_blank">CMS Devices page</a>`

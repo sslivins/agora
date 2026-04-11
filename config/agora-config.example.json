@@ -5,5 +5,6 @@
     "secret_key": "CHANGE_ME_to_another_secure_random_string",
     "device_name": "breakroom-01",
     "default_splash": "splash/default.png",
-    "cms_url": "ws://YOUR_CMS_IP:8080/ws/device"
+    "cms_url": "ws://YOUR_CMS_IP:8080/ws/device",
+    "_cms_url_tls_example": "wss://YOUR_CMS_HOST/ws/device"
 }
