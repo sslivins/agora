@@ -25,5 +25,6 @@ jobs:
 
       - name: Run tests
         run: |
-          python -m pytest tests/ --ignore=tests/test_wss_e2e.py --tb=short -q
+          python -m pytest tests/ --ignore=tests/test_wss_e2e.py --ignore=tests/test_cms_url_reconnect.py --tb=short -q
+          python -m pytest tests/test_cms_url_reconnect.py --tb=short -q
           python -m pytest tests/test_wss_e2e.py --tb=short -q

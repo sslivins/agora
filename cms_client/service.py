@@ -31,6 +31,7 @@ PROTOCOL_VERSION = 1
 # Reconnect backoff: 2s, 4s, 8s, ... capped at 60s
 RECONNECT_BASE = 2
 RECONNECT_MAX = 60
+CONFIG_POLL_INTERVAL = 5  # seconds between CMS config file checks
 
 STATUS_INTERVAL = 30    # seconds between heartbeat status messages
 RAPID_STATUS_INTERVAL = 3  # seconds between status messages after a state change
@@ -289,10 +290,12 @@ class CMSClient:
             logger.info("CMS URL discovered: %s", cms_url)
 
         self._running = True
+        self._active_cms_url = cms_url
         attempt = 0
 
         eval_task = asyncio.create_task(self._schedule_eval_loop())
         fetch_task = asyncio.create_task(self._fetch_loop())
+        config_task = asyncio.create_task(self._config_watch_loop())
 
         try:
             while self._running:
@@ -336,7 +339,7 @@ class CMSClient:
                     )
                     await asyncio.sleep(delay)
         finally:
-            for task in [eval_task, fetch_task]:
+            for task in [eval_task, fetch_task, config_task]:
                 task.cancel()
                 try:
                     await task
@@ -348,9 +351,35 @@ class CMSClient:
         if self._ws:
             await self._ws.close()
 
+    async def _config_watch_loop(self) -> None:
+        """Poll cms_config.json for URL changes and trigger reconnect."""
+        while self._running:
+            await asyncio.sleep(CONFIG_POLL_INTERVAL)
+            try:
+                new_url = self._get_cms_url()
+                if new_url and new_url != self._active_cms_url:
+                    logger.info(
+                        "CMS URL changed: %s → %s — reconnecting",
+                        self._active_cms_url, new_url,
+                    )
+                    self._active_cms_url = new_url
+                    # Clear auth token — the new CMS won't recognise it
+                    _save_auth_token(self.settings.auth_token_path, "")
+                    self._write_cms_status(
+                        "connecting",
+                        message="CMS URL changed. Reconnecting\u2026",
+                    )
+                    if self._ws:
+                        await self._ws.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Config watch error", exc_info=True)
+
     async def _connect_and_run(self) -> None:
         """Single connection lifecycle: connect → register → message loop."""
         cms_url = self._get_cms_url()
+        self._active_cms_url = cms_url
         logger.info("Connecting to CMS at %s", cms_url)
 
         async with websockets.connect(
