@@ -148,10 +148,11 @@ def _save_auth_token(path: Path, token: str) -> None:
 
 # ── Schedule evaluation helpers ──
 
-def _parse_time(s: str) -> tuple[int, int]:
-    """Parse 'HH:MM' string to (hour, minute)."""
+def _parse_time(s: str) -> tuple[int, int, int]:
+    """Parse 'HH:MM' or 'HH:MM:SS' string to (hour, minute, second)."""
     parts = s.split(":")
-    return int(parts[0]), int(parts[1])
+    sec = int(parts[2]) if len(parts) > 2 else 0
+    return int(parts[0]), int(parts[1]), sec
 
 
 def _schedule_matches_now(entry: dict, now: datetime) -> bool:
@@ -167,17 +168,17 @@ def _schedule_matches_now(entry: dict, now: datetime) -> bool:
     if days and now.isoweekday() not in days:
         return False
 
-    sh, sm = _parse_time(entry["start_time"])
-    eh, em = _parse_time(entry["end_time"])
-    start_mins = sh * 60 + sm
-    end_mins = eh * 60 + em
-    cur_mins = now.hour * 60 + now.minute
+    sh, sm, ss = _parse_time(entry["start_time"])
+    eh, em, es = _parse_time(entry["end_time"])
+    start_secs = sh * 3600 + sm * 60 + ss
+    end_secs = eh * 3600 + em * 60 + es
+    cur_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-    if start_mins <= end_mins:
-        if not (start_mins <= cur_mins < end_mins):
+    if start_secs <= end_secs:
+        if not (start_secs <= cur_secs < end_secs):
             return False
     else:
-        if not (cur_mins >= start_mins or cur_mins < end_mins):
+        if not (cur_secs >= start_secs or cur_secs < end_secs):
             return False
 
     return True
