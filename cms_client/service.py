@@ -444,6 +444,8 @@ class CMSClient:
                         await self._handle_upgrade(ws)
                     elif msg_type == "factory_reset":
                         await self._handle_factory_reset(ws)
+                    elif msg_type == "wipe_assets":
+                        await self._handle_wipe_assets(msg, ws)
                     elif msg_type == "request_logs":
                         await self._handle_request_logs(msg, ws)
                     elif "error" in msg:
@@ -1078,6 +1080,49 @@ class CMSClient:
         logger.warning("Factory reset complete — rebooting")
         await asyncio.sleep(1)
         os.system("sudo reboot")
+
+    async def _handle_wipe_assets(self, msg: dict, ws) -> None:
+        """Wipe all cached assets and schedule state.
+
+        Sent by the CMS on adoption or device deletion so the device starts
+        clean.  Unlike factory_reset, this preserves provisioning, Wi-Fi, and
+        auth credentials — the device stays connected and re-syncs immediately.
+        """
+        reason = msg.get("reason", "unknown")
+        logger.warning("Wipe assets requested by CMS (reason: %s)", reason)
+
+        state_dir = self.settings.state_dir
+
+        # Clear schedule and asset manifest
+        _safe_unlink(state_dir / "schedule.json")
+        _safe_unlink(state_dir / "assets.json")
+
+        # Wipe asset files on disk
+        for subdir in [self.settings.videos_dir, self.settings.images_dir]:
+            if subdir.exists():
+                for f in subdir.iterdir():
+                    if f.is_file():
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+
+        # Reinitialise the asset manager so in-memory state matches disk
+        self.asset_manager.rebuild_from_disk(
+            self.settings.videos_dir, self.settings.images_dir, self.settings.splash_dir,
+        )
+
+        logger.info("Asset wipe complete (reason: %s)", reason)
+
+        try:
+            await ws.send(json.dumps({
+                "type": "wipe_assets_ack",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "reason": reason,
+            }))
+        except Exception:
+            pass
 
     async def _handle_request_logs(self, msg: dict, ws) -> None:
         """Collect journalctl logs for requested services and send back."""
