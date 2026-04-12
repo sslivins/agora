@@ -9,6 +9,7 @@ time is in the future) causes immediate play attempt. If the asset isn't
 on the device, the player fails and the device never retries fetching.
 """
 
+import asyncio
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -93,6 +94,8 @@ def cms_client(tmp_path):
     client._current_schedule_id = None
     client._current_schedule_name = None
     client._current_asset = None
+    client._eval_wake = asyncio.Event()
+    client._last_player_mode = None
     return client
 
 

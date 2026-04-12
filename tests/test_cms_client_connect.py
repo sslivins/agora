@@ -63,6 +63,8 @@ class TestCmsUrlPolling:
         client._current_schedule_id = None
         client._current_schedule_name = None
         client._current_asset = None
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = None
 
         # _get_cms_url returns "" twice, then a real URL
         call_count = 0
@@ -109,6 +111,8 @@ class TestCmsUrlPolling:
         client._current_schedule_id = None
         client._current_schedule_name = None
         client._current_asset = None
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = None
 
         client._get_cms_url = lambda: "ws://cms.local:8080/ws/device"
 
@@ -148,6 +152,8 @@ class TestConfigWatchLoop:
         client._current_schedule_id = None
         client._current_schedule_name = None
         client._current_asset = None
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = None
         return client
 
     def test_config_poll_interval_value(self):

@@ -1,5 +1,6 @@
 """Tests for CMS → device timezone synchronization."""
 
+import asyncio
 import subprocess
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +29,8 @@ def client(tmp_path):
         c._current_schedule_id = None
         c._current_schedule_name = None
         c._current_asset = None
+        c._eval_wake = asyncio.Event()
+        c._last_player_mode = None
     return c
 
 

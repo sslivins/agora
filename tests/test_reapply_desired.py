@@ -5,6 +5,7 @@ it must re-write desired.json with a **new timestamp** so the player
 detects the change (the player skips processing if the timestamp is identical).
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -53,6 +54,8 @@ def cms_client(tmp_path):
     client._current_schedule_id = None
     client._current_schedule_name = None
     client._current_asset = None
+    client._eval_wake = asyncio.Event()
+    client._last_player_mode = None
     return client
 
 
