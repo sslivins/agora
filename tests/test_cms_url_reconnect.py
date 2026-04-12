@@ -43,6 +43,7 @@ def _make_settings(tmp_path: Path, initial_cms_url: str = "") -> object:
         manifest_path = state / "assets.json"
         schedule_path = state / "schedule.json"
         desired_state_path = state / "desired.json"
+        current_state_path = state / "current.json"
         assets_dir = assets
         videos_dir = assets / "videos"
         images_dir = assets / "images"
