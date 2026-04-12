@@ -80,6 +80,9 @@ def cms_client(tmp_path):
     client.device_id = "test-device"
     client.asset_manager = MagicMock()
     client._ws = AsyncMock()
+    client._current_schedule_id = None
+    client._current_schedule_name = None
+    client._current_asset = None
     return client
 
 

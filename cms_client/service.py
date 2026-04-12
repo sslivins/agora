@@ -214,6 +214,9 @@ class CMSClient:
         self._ws = None
         self._last_eval_state: tuple | None = None
         self._rapid_until: float = 0  # monotonic deadline for rapid status
+        self._current_schedule_id: str | None = None
+        self._current_schedule_name: str | None = None
+        self._current_asset: str | None = None
         self.asset_manager = AssetManager(
             manifest_path=settings.manifest_path,
             assets_dir=settings.assets_dir,
@@ -631,6 +634,8 @@ class CMSClient:
             asset = winner.get("asset", "")
             checksum = winner.get("asset_checksum")
             loop_count = winner.get("loop_count")
+            new_schedule_id = winner.get("id")
+            new_schedule_name = winner.get("name", "")
 
             if not self.asset_manager.has_asset(asset, checksum):
                 # Asset not on device yet — request fetch and show splash
@@ -648,10 +653,23 @@ class CMSClient:
             state_key = ("play", asset, checksum, loop_count)
             if self._last_eval_state == state_key:
                 return
+
+            # Schedule changed — send ENDED for previous, STARTED for new
+            self._end_current_playback()
+
             desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=True, loop_count=loop_count, expected_checksum=checksum)
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(asset)
             self._last_eval_state = state_key
+
+            self._current_schedule_id = new_schedule_id
+            self._current_schedule_name = new_schedule_name
+            self._current_asset = asset
+            if new_schedule_id:
+                self._send_playback_event(
+                    "playback_started", new_schedule_id, new_schedule_name, asset,
+                )
+
             logger.info("Schedule: playing %s (priority %d, loop_count=%s)", asset, winner.get("priority", 0), loop_count)
         elif default_asset:
             default_checksum = sync_data.get("default_asset_checksum")
@@ -671,6 +689,10 @@ class CMSClient:
             state_key = ("default", default_asset, default_checksum)
             if self._last_eval_state == state_key:
                 return
+
+            # Leaving a scheduled playback → default asset
+            self._end_current_playback()
+
             desired = DesiredState(mode=PlaybackMode.PLAY, asset=default_asset, loop=True, expected_checksum=default_checksum)
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(default_asset)
@@ -680,10 +702,27 @@ class CMSClient:
             state_key = ("splash", None)
             if self._last_eval_state == state_key:
                 return
+
+            # Leaving a scheduled playback → splash
+            self._end_current_playback()
+
             desired = DesiredState(mode=PlaybackMode.SPLASH)
             write_state(self.settings.desired_state_path, desired)
             self._last_eval_state = state_key
             logger.info("Schedule: no active schedule, showing splash")
+
+    def _end_current_playback(self) -> None:
+        """Send PLAYBACK_ENDED for the current schedule, if any."""
+        if self._current_schedule_id:
+            self._send_playback_event(
+                "playback_ended",
+                self._current_schedule_id,
+                self._current_schedule_name or "",
+                self._current_asset or "",
+            )
+        self._current_schedule_id = None
+        self._current_schedule_name = None
+        self._current_asset = None
 
     def _request_asset_fetch(self, asset_name: str) -> None:
         """Fire-and-forget a fetch_request for a missing asset via WebSocket."""
@@ -699,6 +738,27 @@ class CMSClient:
             "protocol_version": PROTOCOL_VERSION,
             "device_id": self.device_id,
             "asset": asset_name,
+        })
+        loop.create_task(ws.send(msg))
+
+    def _send_playback_event(self, event_type: str, schedule_id: str,
+                             schedule_name: str, asset: str) -> None:
+        """Fire-and-forget a playback_started or playback_ended event."""
+        ws = self._ws
+        if not ws:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        msg = json.dumps({
+            "type": event_type,
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "schedule_id": schedule_id,
+            "schedule_name": schedule_name,
+            "asset": asset,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         loop.create_task(ws.send(msg))
 
@@ -791,6 +851,7 @@ class CMSClient:
         asset = msg.get("asset", "")
         loop = msg.get("loop", True)
         loop_count = msg.get("loop_count")
+        self._end_current_playback()
         desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=loop, loop_count=loop_count)
         write_state(self.settings.desired_state_path, desired)
         self._last_eval_state = None
@@ -798,6 +859,7 @@ class CMSClient:
         logger.info("CMS play command: %s (loop=%s, loop_count=%s)", asset, loop, loop_count)
 
     async def _handle_stop(self) -> None:
+        self._end_current_playback()
         desired = DesiredState(mode=PlaybackMode.SPLASH)
         write_state(self.settings.desired_state_path, desired)
         self._last_eval_state = None

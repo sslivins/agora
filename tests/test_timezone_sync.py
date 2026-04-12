@@ -25,6 +25,9 @@ def client(tmp_path):
     with patch.object(CMSClient, "__init__", lambda self, s: None):
         c = CMSClient(settings)
         c.settings = settings
+        c._current_schedule_id = None
+        c._current_schedule_name = None
+        c._current_asset = None
     return c
 
 

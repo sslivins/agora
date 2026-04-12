@@ -90,6 +90,9 @@ def cms_client(tmp_path):
     client.asset_manager = MagicMock()
     client._ws = AsyncMock()
     client._last_eval_state = None
+    client._current_schedule_id = None
+    client._current_schedule_name = None
+    client._current_asset = None
     return client
 
 

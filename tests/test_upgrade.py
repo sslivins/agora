@@ -33,6 +33,9 @@ class TestHandleUpgrade:
         client.device_id = "test-device"
         client.asset_manager = MagicMock()
         client._write_cms_status = MagicMock()
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
         return client
 
     @pytest.mark.asyncio

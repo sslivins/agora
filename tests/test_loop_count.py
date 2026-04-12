@@ -277,10 +277,14 @@ class TestCMSClientLoopCount:
         client.settings = MagicMock()
         client.settings.desired_state_path = desired_path
         client._last_eval_state = None
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
+        client._ws = None
 
         import asyncio
         msg = {"type": "play", "asset": "v.mp4", "loop": True, "loop_count": 7}
-        asyncio.get_event_loop().run_until_complete(client._handle_play(msg))
+        asyncio.run(client._handle_play(msg))
 
         import json
         data = json.loads(desired_path.read_text())
@@ -305,10 +309,14 @@ class TestCMSClientLoopCount:
         client.settings = MagicMock()
         client.settings.desired_state_path = desired_path
         client._last_eval_state = None
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
+        client._ws = None
 
         import asyncio
         msg = {"type": "play", "asset": "v.mp4", "loop": True}
-        asyncio.get_event_loop().run_until_complete(client._handle_play(msg))
+        asyncio.run(client._handle_play(msg))
 
         import json
         data = json.loads(desired_path.read_text())
@@ -333,6 +341,10 @@ class TestCMSClientLoopCount:
         client.settings = MagicMock()
         client.settings.desired_state_path = desired_path
         client._last_eval_state = None
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
+        client._ws = None
         client.asset_manager = MagicMock()
 
         sync_data = {

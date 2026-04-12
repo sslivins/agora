@@ -60,6 +60,9 @@ class TestCmsUrlPolling:
         client.device_id = "test-device"
         client.asset_manager = MagicMock()
         client._running = False
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
 
         # _get_cms_url returns "" twice, then a real URL
         call_count = 0
@@ -103,6 +106,9 @@ class TestCmsUrlPolling:
         client.settings = settings
         client.device_id = "test-device"
         client._running = False
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
 
         client._get_cms_url = lambda: "ws://cms.local:8080/ws/device"
 
@@ -139,6 +145,9 @@ class TestConfigWatchLoop:
         client._active_cms_url = initial_url
         client._ws = None
         client._write_cms_status = MagicMock()
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
         return client
 
     def test_config_poll_interval_value(self):
