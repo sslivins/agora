@@ -22,16 +22,25 @@ from cms_client.service import _parse_time, _schedule_matches_now, _schedule_sta
 
 class TestParseTime:
     def test_basic(self):
-        assert _parse_time("09:30") == (9, 30)
+        assert _parse_time("09:30") == (9, 30, 0)
 
     def test_midnight(self):
-        assert _parse_time("00:00") == (0, 0)
+        assert _parse_time("00:00") == (0, 0, 0)
 
     def test_end_of_day(self):
-        assert _parse_time("23:59") == (23, 59)
+        assert _parse_time("23:59") == (23, 59, 0)
 
     def test_single_digit_hour(self):
-        assert _parse_time("9:05") == (9, 5)
+        assert _parse_time("9:05") == (9, 5, 0)
+
+    def test_with_seconds(self):
+        assert _parse_time("09:30:45") == (9, 30, 45)
+
+    def test_midnight_with_seconds(self):
+        assert _parse_time("00:00:00") == (0, 0, 0)
+
+    def test_end_of_day_with_seconds(self):
+        assert _parse_time("23:59:59") == (23, 59, 59)
 
 
 # ── _schedule_matches_now tests ──
@@ -151,9 +160,30 @@ class TestScheduleMatchesNow:
         entry = self._entry(start_time="12:00", end_time="12:00")
         assert _schedule_matches_now(entry, datetime(2026, 3, 28, 12, 0)) is False
 
-    def test_seconds_ignored(self):
-        """Matching is minute-level: 16:59:59 still matches 9:00-17:00."""
-        entry = self._entry()
+    def test_second_resolution_start_inclusive(self):
+        """Start time with seconds is inclusive."""
+        entry = self._entry(start_time="09:00:30", end_time="17:00:00")
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 29)) is False
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 30)) is True
+
+    def test_second_resolution_end_exclusive(self):
+        """End time with seconds is exclusive."""
+        entry = self._entry(start_time="09:00:00", end_time="09:00:03")
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 2)) is True
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 3)) is False
+
+    def test_three_second_window(self):
+        """A 3-second clip with loop_count=1 produces a 3-second window."""
+        entry = self._entry(start_time="09:00:00", end_time="09:00:03")
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 8, 59, 59)) is False
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 0)) is True
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 1)) is True
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 2)) is True
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 9, 0, 3)) is False
+
+    def test_hh_mm_still_works(self):
+        """Legacy HH:MM format (no seconds) still works — seconds default to 0."""
+        entry = self._entry(start_time="09:00", end_time="17:00")
         now = datetime(2026, 3, 28, 16, 59, 59)
         assert _schedule_matches_now(entry, now) is True
 
