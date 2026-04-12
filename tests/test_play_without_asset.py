@@ -138,7 +138,14 @@ class TestPlayWithoutAsset:
         cms_client.asset_manager.has_asset.return_value = False
 
         sync_data = _make_schedule_data([_active_entry("video.mp4", "abc123")])
-        cms_client._evaluate_schedule(sync_data)
+
+        # _request_asset_fetch uses fire-and-forget (create_task), so we
+        # need a running event loop to flush the scheduled coroutine.
+        async def eval_and_flush():
+            cms_client._evaluate_schedule(sync_data)
+            await asyncio.sleep(0)
+
+        asyncio.run(eval_and_flush())
 
         # Should have sent a fetch_request
         assert cms_client._ws.send.call_count >= 1
