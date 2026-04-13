@@ -91,6 +91,11 @@ if [ "${AGORA_DISABLE_WIFI:-0}" = "1" ]; then
   echo "Agora: WiFi disabled by build config"
   # Write flag so provisioning service knows WiFi is disabled by policy
   echo "1" > "${ROOTFS_DIR}/opt/agora/persist/wifi_disabled"
+  # Skip OOBE — the captive portal requires WiFi to function, so it's
+  # useless on a WiFi-disabled build.  The device will boot straight into
+  # player mode and either connect to a pre-configured CMS URL or wait
+  # for one to be set via SSH / local API.
+  echo "1" > "${ROOTFS_DIR}/opt/agora/persist/provisioned"
   # Don't install the rfkill-unblock service — keep WiFi blocked
 else
   # Unblock WiFi radio (Pi OS soft-blocks it via rfkill + NM state file)
