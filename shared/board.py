@@ -84,9 +84,9 @@ def _read_model_string() -> str:
 def _detect_board(model: str) -> Board:
     """Map a device-tree model string to a Board enum."""
     model_lower = model.lower()
-    if "pi 5" in model_lower or "pi5" in model_lower:
+    if "pi 5" in model_lower or "pi5" in model_lower or "compute module 5" in model_lower:
         return Board.PI_5
-    if "pi 4" in model_lower or "pi4" in model_lower:
+    if "pi 4" in model_lower or "pi4" in model_lower or "compute module 4" in model_lower:
         return Board.PI_4
     if "pi zero 2" in model_lower:
         return Board.ZERO_2W
