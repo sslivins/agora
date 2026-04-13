@@ -72,6 +72,11 @@ jobs:
           git checkout ${{ env.PI_GEN_COMMIT }}
 
       - name: Configure pi-gen
+        env:
+          INPUT_CMS_URL: ${{ inputs.cms_url }}
+          INPUT_WIFI_SSID: ${{ inputs.wifi_ssid }}
+          INPUT_WIFI_PASS: ${{ inputs.wifi_password }}
+          INPUT_DISABLE_WIFI: ${{ inputs.disable_wifi }}
         run: |
           TIMEZONE="Etc/UTC"
 
@@ -110,16 +115,20 @@ jobs:
           EOF
 
           # Append optional build-time configuration
-          if [ -n "${{ inputs.cms_url }}" ]; then
-            echo "AGORA_CMS_URL=${{ inputs.cms_url }}" >> /tmp/pi-gen/config
+          # Values are single-quoted to handle special characters (e.g. apostrophes in SSIDs)
+          if [ -n "${INPUT_CMS_URL}" ]; then
+            ESCAPED=$(printf '%s' "${INPUT_CMS_URL}" | sed "s/'/'\\\\''/g")
+            echo "AGORA_CMS_URL='${ESCAPED}'" >> /tmp/pi-gen/config
           fi
-          if [ -n "${{ inputs.wifi_ssid }}" ]; then
-            echo "AGORA_WIFI_SSID=${{ inputs.wifi_ssid }}" >> /tmp/pi-gen/config
+          if [ -n "${INPUT_WIFI_SSID}" ]; then
+            ESCAPED=$(printf '%s' "${INPUT_WIFI_SSID}" | sed "s/'/'\\\\''/g")
+            echo "AGORA_WIFI_SSID='${ESCAPED}'" >> /tmp/pi-gen/config
           fi
-          if [ -n "${{ inputs.wifi_password }}" ]; then
-            echo "AGORA_WIFI_PASS=${{ inputs.wifi_password }}" >> /tmp/pi-gen/config
+          if [ -n "${INPUT_WIFI_PASS}" ]; then
+            ESCAPED=$(printf '%s' "${INPUT_WIFI_PASS}" | sed "s/'/'\\\\''/g")
+            echo "AGORA_WIFI_PASS='${ESCAPED}'" >> /tmp/pi-gen/config
           fi
-          if [ "${{ inputs.disable_wifi }}" = "true" ]; then
+          if [ "${INPUT_DISABLE_WIFI}" = "true" ]; then
             echo "AGORA_DISABLE_WIFI=1" >> /tmp/pi-gen/config
           fi
 
