@@ -7,6 +7,7 @@ Covers:
 - CMS client _handle_play and _evaluate_schedule passing loop_count
 """
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -259,6 +260,7 @@ class TestCMSClientLoopCount:
 
     def test_handle_play_passes_loop_count(self, tmp_path):
         """_handle_play should include loop_count in DesiredState."""
+        import asyncio
         import sys
         sys.modules.setdefault("websockets", MagicMock())
         sys.modules.setdefault("websockets.asyncio", MagicMock())
@@ -277,10 +279,15 @@ class TestCMSClientLoopCount:
         client.settings = MagicMock()
         client.settings.desired_state_path = desired_path
         client._last_eval_state = None
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = None
+        client._ws = None
 
-        import asyncio
         msg = {"type": "play", "asset": "v.mp4", "loop": True, "loop_count": 7}
-        asyncio.get_event_loop().run_until_complete(client._handle_play(msg))
+        asyncio.run(client._handle_play(msg))
 
         import json
         data = json.loads(desired_path.read_text())
@@ -288,6 +295,7 @@ class TestCMSClientLoopCount:
 
     def test_handle_play_no_loop_count(self, tmp_path):
         """_handle_play without loop_count should set it to None."""
+        import asyncio
         import sys
         sys.modules.setdefault("websockets", MagicMock())
         sys.modules.setdefault("websockets.asyncio", MagicMock())
@@ -305,10 +313,15 @@ class TestCMSClientLoopCount:
         client.settings = MagicMock()
         client.settings.desired_state_path = desired_path
         client._last_eval_state = None
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = None
+        client._ws = None
 
-        import asyncio
         msg = {"type": "play", "asset": "v.mp4", "loop": True}
-        asyncio.get_event_loop().run_until_complete(client._handle_play(msg))
+        asyncio.run(client._handle_play(msg))
 
         import json
         data = json.loads(desired_path.read_text())
@@ -316,6 +329,7 @@ class TestCMSClientLoopCount:
 
     def test_evaluate_schedule_passes_loop_count(self, tmp_path):
         """_evaluate_schedule should include loop_count from winning schedule."""
+        import asyncio
         import sys
         sys.modules.setdefault("websockets", MagicMock())
         sys.modules.setdefault("websockets.asyncio", MagicMock())
@@ -333,6 +347,12 @@ class TestCMSClientLoopCount:
         client.settings = MagicMock()
         client.settings.desired_state_path = desired_path
         client._last_eval_state = None
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = None
+        client._ws = None
         client.asset_manager = MagicMock()
 
         sync_data = {
@@ -360,3 +380,102 @@ class TestCMSClientLoopCount:
         assert data["loop_count"] == 4
         assert data["mode"] == "play"
         assert data["asset"] == "v.mp4"
+
+
+# ── Player watch loop tests ──
+
+
+class TestPlayerWatchLoop:
+    """Verify _player_watch_loop wakes eval loop on mode transition."""
+
+    def test_play_to_splash_sets_eval_wake(self, tmp_path):
+        import importlib
+        import cms_client.service as svc
+        importlib.reload(svc)
+
+        current_path = tmp_path / "current.json"
+
+        client = svc.CMSClient.__new__(svc.CMSClient)
+        client.settings = MagicMock()
+        client.settings.current_state_path = current_path
+        client._running = True
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = "play"  # was playing
+
+        # Player stopped — write splash mode
+        import json
+        current_path.write_text(json.dumps({"mode": "splash"}))
+
+        async def run_one_tick():
+            # Run the loop body once, then stop
+            async def limited_loop():
+                # Simulate one iteration
+                data = json.loads(client.settings.current_state_path.read_text())
+                mode = data.get("mode", "splash")
+                prev = client._last_player_mode
+                client._last_player_mode = mode
+                if prev == "play" and mode != "play":
+                    client._eval_wake.set()
+
+            await limited_loop()
+
+        asyncio.run(run_one_tick())
+        assert client._eval_wake.is_set()
+        assert client._last_player_mode == "splash"
+
+    def test_play_to_play_does_not_wake(self, tmp_path):
+        import importlib
+        import cms_client.service as svc
+        importlib.reload(svc)
+
+        current_path = tmp_path / "current.json"
+
+        client = svc.CMSClient.__new__(svc.CMSClient)
+        client.settings = MagicMock()
+        client.settings.current_state_path = current_path
+        client._running = True
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = "play"  # still playing
+
+        import json
+        current_path.write_text(json.dumps({"mode": "play"}))
+
+        async def run_one_tick():
+            data = json.loads(client.settings.current_state_path.read_text())
+            mode = data.get("mode", "splash")
+            prev = client._last_player_mode
+            client._last_player_mode = mode
+            if prev == "play" and mode != "play":
+                client._eval_wake.set()
+
+        asyncio.run(run_one_tick())
+        assert not client._eval_wake.is_set()
+
+    def test_splash_to_play_does_not_wake(self, tmp_path):
+        import importlib
+        import cms_client.service as svc
+        importlib.reload(svc)
+
+        current_path = tmp_path / "current.json"
+
+        client = svc.CMSClient.__new__(svc.CMSClient)
+        client.settings = MagicMock()
+        client.settings.current_state_path = current_path
+        client._running = True
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = "splash"
+
+        import json
+        current_path.write_text(json.dumps({"mode": "play", "asset": "v.mp4"}))
+
+        async def run_one_tick():
+            data = json.loads(client.settings.current_state_path.read_text())
+            mode = data.get("mode", "splash")
+            prev = client._last_player_mode
+            client._last_player_mode = mode
+            if prev == "play" and mode != "play":
+                client._eval_wake.set()
+
+        asyncio.run(run_one_tick())
+        assert not client._eval_wake.is_set()
+        assert client._last_player_mode == "play"

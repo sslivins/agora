@@ -1,5 +1,6 @@
 """Tests for CMS-triggered device upgrade handler."""
 
+import asyncio
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,6 +34,11 @@ class TestHandleUpgrade:
         client.device_id = "test-device"
         client.asset_manager = MagicMock()
         client._write_cms_status = MagicMock()
+        client._current_schedule_id = None
+        client._current_schedule_name = None
+        client._current_asset = None
+        client._eval_wake = asyncio.Event()
+        client._last_player_mode = None
         return client
 
     @pytest.mark.asyncio

@@ -5,6 +5,7 @@ the same name.  _check_and_fetch_missing() must detect the checksum mismatch
 and request a fresh copy.
 """
 
+import asyncio
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -80,6 +81,11 @@ def cms_client(tmp_path):
     client.device_id = "test-device"
     client.asset_manager = MagicMock()
     client._ws = AsyncMock()
+    client._current_schedule_id = None
+    client._current_schedule_name = None
+    client._current_asset = None
+    client._eval_wake = asyncio.Event()
+    client._last_player_mode = None
     return client
 
 
