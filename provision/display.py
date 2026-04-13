@@ -683,6 +683,72 @@ class ProvisionDisplay:
         _draw_progress_dots(ctx, cx, h, 4)
         self._blit()
 
+    # ── Ethernet / no-network screens ──────────────────────────────────
+
+    def show_ethernet_connected(self, ip: str, hostname: str = "") -> None:
+        """Screen: Ethernet connected — show IP and mDNS name, waiting for CMS."""
+        if not self.available:
+            return
+        ctx = self._ctx()
+        w, h = self._width, self._height
+        cx = w / 2
+        _draw_bg(ctx, w, h)
+        y = h * 0.12
+        y = _draw_logo(ctx, cx, y) + 30
+        th = _draw_text(ctx, cx, y, "Ethernet Connected", "Sans Bold 40", GREEN)
+        y += th + 40
+        th = _draw_text(
+            ctx, cx, y,
+            "This device is connected via Ethernet\n"
+            "and is ready to be adopted.",
+            "Sans 26", WHITE, alpha=0.7, wrap_width=800,
+        )
+        y += th + 40
+        bw, bh = _draw_badge(
+            ctx, cx, y, ip, "Monospace Bold 32",
+            bg_color=(0.3, 0.3, 0.4),
+        )
+        y += bh + 20
+        if hostname:
+            bw, bh = _draw_badge(
+                ctx, cx, y, hostname, "Monospace Bold 28",
+                bg_color=(0.25, 0.25, 0.35),
+            )
+            y += bh + 30
+        th = _draw_text(
+            ctx, cx, y,
+            "Open the CMS and adopt this device to begin.",
+            "Sans 24", WHITE, alpha=0.5, wrap_width=800,
+        )
+        self._blit()
+
+    def show_no_network(self) -> None:
+        """Screen: No network interfaces available — prompt user to connect ethernet."""
+        if not self.available:
+            return
+        ctx = self._ctx()
+        w, h = self._width, self._height
+        cx = w / 2
+        _draw_bg(ctx, w, h)
+        y = h * 0.15
+        y = _draw_logo(ctx, cx, y) + 40
+        th = _draw_text(ctx, cx, y, "No Network Connection", "Sans Bold 40", RED)
+        y += th + 40
+        th = _draw_text(
+            ctx, cx, y,
+            "This device has no WiFi adapter and\n"
+            "no Ethernet cable connected.",
+            "Sans 28", WHITE, alpha=0.7, wrap_width=800,
+        )
+        y += th + 50
+        th = _draw_text(
+            ctx, cx, y,
+            "Please connect an Ethernet cable\n"
+            "and reboot the device.",
+            "Sans 28", AMBER, wrap_width=800,
+        )
+        self._blit()
+
     # ── Animated spinner screen (reusable) ───────────────────────────────
 
     def _show_spinner_screen(

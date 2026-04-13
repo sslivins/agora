@@ -1,12 +1,14 @@
 """Provisioning service — manages the captive portal lifecycle and OOBE display.
 
 Boot flow:
-1. Check if device is provisioned (has Wi-Fi credentials)
-2. If NOT provisioned → start AP mode + captive portal immediately
-3. If provisioned → try connecting to saved Wi-Fi for 60 seconds
+1. Check network capabilities (ethernet, Wi-Fi)
+2. Ethernet connected? → Skip OOBE, go straight to LAN mode
+   - Start CMS client, show IP/mDNS on HDMI, device appears as pending in CMS
+3. WiFi available + not provisioned → AP mode + captive portal (existing OOBE)
+4. WiFi available + provisioned → try saved WiFi for 60 seconds
    - Success → exit (normal boot continues)
-   - Failure → start AP mode + captive portal with 10-minute timeout
-     - After timeout → retry Wi-Fi → cycle repeats
+   - Failure → AP mode + captive portal with 10-minute timeout
+5. No WiFi + no Ethernet → show "connect ethernet" on HDMI
 
 OOBE display:
 When running on first boot (no provisioning flag), the service drives a
@@ -43,7 +45,9 @@ from provision.network import (
     get_active_ssid,
     get_device_ip,
     get_device_serial_suffix,
+    get_ethernet_interface,
     get_wifi_interface,
+    is_ethernet_connected,
     is_wifi_connected,
     start_ap,
     stop_ap,
@@ -534,6 +538,129 @@ async def run_service(force_oobe: bool = False) -> None:
 
     run_oobe = force_oobe or not is_provisioned()
 
+    # ── Ethernet fast-path ───────────────────────────────────────────
+    # If ethernet is connected (Pi 4, Pi 5, CM5), skip OOBE entirely.
+    # The device is immediately reachable on the LAN.
+    if run_oobe and is_ethernet_connected():
+        logger.info("Ethernet connected on first boot — skipping Wi-Fi OOBE")
+
+        # Quit Plymouth so we can draw to the framebuffer
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "plymouth", "quit", "--retain-splash",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "systemctl", "stop", "agora-player",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        # Show IP + mDNS info on HDMI
+        device_ip = get_device_ip()
+        suffix = get_device_serial_suffix()
+        hostname = f"agora-{suffix}.local" if suffix else ""
+        logger.info("Ethernet IP: %s, hostname: %s", device_ip, hostname)
+
+        if device_ip:
+            display.show_ethernet_connected(device_ip, hostname)
+
+        # Start services so the device is reachable
+        for svc_name in ("agora-cms-client", "agora-api"):
+            proc = await asyncio.create_subprocess_exec(
+                "sudo", "systemctl", "start", svc_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            logger.info("Started %s", svc_name)
+
+        # Try mDNS auto-discovery if no CMS was explicitly configured
+        if not _get_cms_host():
+            _try_mdns_discovery()
+
+        # Wait for CMS adoption (same as Phase 2 of WiFi OOBE)
+        adoption_success = False
+        while not shutdown_event.is_set():
+            result = await _wait_for_cms_adoption(display, shutdown_event)
+            logger.info("CMS adoption result: %s", result)
+
+            if result == "adopted":
+                adoption_success = True
+                break
+            elif result in ("no_cms", "shutdown"):
+                break
+            elif result in ("failed", "timeout"):
+                logger.info("CMS connection failed — starting reconfigure server")
+                reconfigured = await _run_reconfigure_server(
+                    shutdown_event, display,
+                )
+                if reconfigured:
+                    logger.info("CMS reconfigured — restarting CMS client and retrying")
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo", "systemctl", "restart", "agora-cms-client",
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc.wait()
+                    continue
+
+        # Mark provisioned
+        if not shutdown_event.is_set() and adoption_success:
+            PROVISION_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            PROVISION_FLAG.write_text("1")
+            logger.info("Provisioning flag written (ethernet)")
+            display.show_adopted()
+            await asyncio.sleep(OOBE_DISPLAY_HOLD)
+        elif not shutdown_event.is_set() and result == "no_cms":
+            PROVISION_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            PROVISION_FLAG.write_text("1")
+            logger.info("Provisioning flag written (ethernet, standalone mode)")
+
+        display.close()
+
+        # Hand off to player via Plymouth bridge
+        logger.info("Starting Plymouth splash for player handoff")
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "plymouthd", "--mode=boot",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "plymouth", "show-splash",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "systemctl", "start", "agora-player",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        logger.info("Ethernet OOBE complete — handing off to player")
+        return
+
+    # ── No network at all (CM5 with no WiFi and no ethernet) ─────────
+    if run_oobe and not get_wifi_interface() and not get_ethernet_interface():
+        logger.error("No WiFi adapter and no Ethernet interface — cannot provision")
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "plymouth", "quit", "--retain-splash",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        display.show_no_network()
+        # Block until shutdown — nothing else we can do
+        await shutdown_event.wait()
+        display.close()
+        return
+
     if run_oobe:
         # ── First boot OOBE ──────────────────────────────────────────
         logger.info("Device not provisioned — starting OOBE")
@@ -745,11 +872,15 @@ async def run_service(force_oobe: bool = False) -> None:
         logger.info("OOBE complete — handing off to player")
     else:
         # ── Provisioned device boot ──────────────────────────────────
-        logger.info("Device provisioned — waiting for Wi-Fi (%ds)", WIFI_CONNECT_TIMEOUT)
-
+        # Handle both WiFi-provisioned and Ethernet-provisioned devices.
         iface = get_wifi_interface()
-        if not iface:
-            logger.error("No Wi-Fi interface found — exiting")
+        if iface:
+            logger.info("Device provisioned — waiting for Wi-Fi (%ds)", WIFI_CONNECT_TIMEOUT)
+        elif is_ethernet_connected():
+            logger.info("Device provisioned via Ethernet — network already up")
+            return
+        else:
+            logger.error("No Wi-Fi interface and no Ethernet — exiting")
             sys.exit(1)
 
         while not shutdown_event.is_set():
