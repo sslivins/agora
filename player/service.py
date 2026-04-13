@@ -15,28 +15,47 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
+from shared.board import Board, get_board, get_i2c_bus, supported_codecs  # noqa: E402
 from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
 
 logger = logging.getLogger("agora.player")
 
 
-class AgoraPlayer:
-    """Manages GStreamer pipelines driven by desired state file changes."""
+def _build_video_pipeline_str(board: Board) -> str:
+    """Return the GStreamer pipeline string for video playback with audio."""
+    codecs = supported_codecs()
+    if "hevc" in codecs:
+        decode = "h265parse ! v4l2h265dec"
+    else:
+        decode = "h264parse ! v4l2h264dec"
 
-    VIDEO_PIPELINE = (
+    return (
         'filesrc location="{path}" ! '
         "qtdemux name=dmux "
-        "dmux.video_0 ! queue ! h264parse ! v4l2h264dec ! kmssink driver-name=vc4 sync=true "
+        f"dmux.video_0 ! queue ! {decode} ! kmssink driver-name=vc4 sync=true "
         "dmux.audio_0 ! queue ! decodebin ! audioconvert ! audioresample ! "
         'alsasink device="hdmi:CARD=vc4hdmi,DEV=0"'
     )
 
-    VIDEO_PIPELINE_NO_AUDIO = (
+
+def _build_video_pipeline_no_audio_str(board: Board) -> str:
+    """Return the GStreamer pipeline string for video playback without audio."""
+    codecs = supported_codecs()
+    if "hevc" in codecs:
+        decode = "h265parse ! v4l2h265dec"
+    else:
+        decode = "h264parse ! v4l2h264dec"
+
+    return (
         'filesrc location="{path}" ! '
         "qtdemux name=dmux "
-        "dmux.video_0 ! queue ! h264parse ! v4l2h264dec ! kmssink driver-name=vc4 sync=false"
+        f"dmux.video_0 ! queue ! {decode} ! kmssink driver-name=vc4 sync=false"
     )
+
+
+class AgoraPlayer:
+    """Manages GStreamer pipelines driven by desired state file changes."""
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -53,8 +72,6 @@ class AgoraPlayer:
     )
 
     # HDMI display detection via DDC/EDID I2C probe
-    # Bus number is specific to Raspberry Pi Zero 2 W (single HDMI port)
-    _I2C_BUS = "/dev/i2c-2"
     _EDID_ADDR = 0x50
     _I2C_SLAVE = 0x0703  # ioctl request code
 
@@ -68,6 +85,9 @@ class AgoraPlayer:
         self.desired_path = self.state_dir / "desired.json"
         self.current_path = self.state_dir / "current.json"
         self.splash_config_path = self.persist_dir / "splash"
+
+        self._board = get_board()
+        self._i2c_bus = get_i2c_bus()
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self.loop = GLib.MainLoop()
@@ -184,10 +204,10 @@ class AgoraPlayer:
 
         if is_video:
             if self._has_audio(path):
-                pipeline_str = self.VIDEO_PIPELINE.format(path=path)
+                pipeline_str = _build_video_pipeline_str(self._board).format(path=path)
             else:
                 logger.info("No audio track detected, using video-only pipeline")
-                pipeline_str = self.VIDEO_PIPELINE_NO_AUDIO.format(path=path)
+                pipeline_str = _build_video_pipeline_no_audio_str(self._board).format(path=path)
         elif path.suffix.lower() in (".jpg", ".jpeg"):
             pipeline_str = self.IMAGE_PIPELINE_JPEG.format(path=path)
         else:
@@ -281,13 +301,14 @@ class AgoraPlayer:
     def _is_display_connected(cls) -> Optional[bool]:
         """Probe the HDMI DDC/EDID I2C bus to detect a connected display.
 
-        Reads one byte from the EDID EEPROM at address 0x50 on /dev/i2c-2.
-        Returns True if the device responds (display connected), False if
-        it fails with an I/O error (no display), or None if the I2C bus
-        is not available (e.g. i2c-dev module not loaded).
+        Reads one byte from the EDID EEPROM at address 0x50 on the board's
+        primary HDMI I2C bus.  Returns True if the device responds (display
+        connected), False if it fails with an I/O error (no display), or
+        None if the I2C bus is not available.
         """
+        i2c_bus = get_i2c_bus()
         try:
-            fd = os.open(cls._I2C_BUS, os.O_RDWR)
+            fd = os.open(i2c_bus, os.O_RDWR)
         except OSError:
             return None
         try:

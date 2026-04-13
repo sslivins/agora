@@ -30,6 +30,8 @@ def player():
         p._error_retry_delay = 3
         p._pending_error = None
         p._loops_completed = 0
+        p._board = svc.Board.ZERO_2W
+        p._i2c_bus = "/dev/i2c-2"
         yield p
 
 

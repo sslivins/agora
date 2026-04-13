@@ -79,6 +79,8 @@ def player():
         p._plymouth_quit = False
         p._current_path = None
         p._current_mtime = None
+        p._board = svc.Board.ZERO_2W
+        p._i2c_bus = "/dev/i2c-2"
         yield p
 
 
