@@ -13,6 +13,23 @@ on:
           - zero2w
           - pi4
           - pi5
+      cms_url:
+        description: 'Pre-configure CMS WebSocket URL (e.g. wss://cms.example.com/ws/device)'
+        required: false
+        type: string
+      wifi_ssid:
+        description: 'Pre-configure WiFi network name'
+        required: false
+        type: string
+      wifi_password:
+        description: 'WiFi password (required if wifi_ssid is set)'
+        required: false
+        type: string
+      disable_wifi:
+        description: 'Disable WiFi support entirely (ethernet-only image)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -91,6 +108,20 @@ jobs:
           ENABLE_CLOUD_INIT=0
           AGORA_BOARD=${{ matrix.board }}
           EOF
+
+          # Append optional build-time configuration
+          if [ -n "${{ inputs.cms_url }}" ]; then
+            echo "AGORA_CMS_URL=${{ inputs.cms_url }}" >> /tmp/pi-gen/config
+          fi
+          if [ -n "${{ inputs.wifi_ssid }}" ]; then
+            echo "AGORA_WIFI_SSID=${{ inputs.wifi_ssid }}" >> /tmp/pi-gen/config
+          fi
+          if [ -n "${{ inputs.wifi_password }}" ]; then
+            echo "AGORA_WIFI_PASS=${{ inputs.wifi_password }}" >> /tmp/pi-gen/config
+          fi
+          if [ "${{ inputs.disable_wifi }}" = "true" ]; then
+            echo "AGORA_DISABLE_WIFI=1" >> /tmp/pi-gen/config
+          fi
 
           # Remove leading whitespace from heredoc
           sed -i 's/^          //' /tmp/pi-gen/config

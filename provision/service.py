@@ -71,6 +71,7 @@ except OSError:
 PERSIST_DIR = Path("/opt/agora/persist")
 STATE_DIR = Path("/opt/agora/state")
 PROVISION_FLAG = PERSIST_DIR / "provisioned"
+WIFI_DISABLED_FLAG = PERSIST_DIR / "wifi_disabled"
 CMS_STATUS_PATH = STATE_DIR / "cms_status.json"
 
 WIFI_CONNECT_TIMEOUT = 60   # seconds to wait for Wi-Fi on boot
@@ -92,6 +93,11 @@ OOBE_DISPLAY_HOLD = 1       # seconds to hold static screens before advancing
 def is_provisioned() -> bool:
     """Check if the device has completed initial provisioning."""
     return PROVISION_FLAG.exists()
+
+
+def is_wifi_disabled() -> bool:
+    """Check if WiFi was disabled at image build time."""
+    return WIFI_DISABLED_FLAG.exists()
 
 
 def _ap_ssid() -> str:
@@ -646,8 +652,9 @@ async def run_service(force_oobe: bool = False) -> None:
         logger.info("Ethernet OOBE complete — handing off to player")
         return
 
-    # ── No network at all (CM5 with no WiFi and no ethernet) ─────────
-    if run_oobe and not get_wifi_interface() and not get_ethernet_interface():
+    # ── No network at all (CM5 with no WiFi and no ethernet, or WiFi disabled) ──
+    has_wifi = not is_wifi_disabled() and get_wifi_interface()
+    if run_oobe and not has_wifi and not get_ethernet_interface():
         logger.error("No WiFi adapter and no Ethernet interface — cannot provision")
         proc = await asyncio.create_subprocess_exec(
             "sudo", "plymouth", "quit", "--retain-splash",
@@ -872,8 +879,8 @@ async def run_service(force_oobe: bool = False) -> None:
         logger.info("OOBE complete — handing off to player")
     else:
         # ── Provisioned device boot ──────────────────────────────────
-        # Handle both WiFi-provisioned and Ethernet-provisioned devices.
-        iface = get_wifi_interface()
+        # Handle WiFi-provisioned, Ethernet-provisioned, and WiFi-disabled devices.
+        iface = None if is_wifi_disabled() else get_wifi_interface()
         if iface:
             logger.info("Device provisioned — waiting for Wi-Fi (%ds)", WIFI_CONNECT_TIMEOUT)
         elif is_ethernet_connected():
