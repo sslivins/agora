@@ -1,5 +1,5 @@
 Package: agora
-Version: 1.7.0
+Version: 1.8.0
 Architecture: arm64
 Maintainer: sslivins
 Depends: python3 (>= 3.11),
@@ -23,15 +23,15 @@ Depends: python3 (>= 3.11),
  dnsmasq,
  avahi-daemon
 Recommends: gstreamer1.0-v4l2
-Filename: pool/agora_1.7.0_arm64.deb
-Size: 1905986
-MD5sum: a2fced608b6adf543fee6bdb7f341fee
-SHA1: 78ca1e79beec4002ea13f50f993f56545409cef4
-SHA256: 2093d1ebf6d1e51aacfe3db30a43a661c3c7ab2499ced9191a20ce1181818d71
+Filename: pool/agora_1.8.0_arm64.deb
+Size: 1908428
+MD5sum: cce0402d2e86dda870f8e431445fce9d
+SHA1: 4c2e5da59888a750fd1efdef94638761e0656ccc
+SHA256: 91a68c77aebfc119c96da2ac66fb414ad091bca66ad2b083889824ecb6f60373
 Section: multimedia
 Priority: optional
 Description: Agora media playback system for Raspberry Pi
  Agora plays video and images on a TV via HDMI, with content uploaded
- and controlled through a REST API and web UI. Designed for the
- Raspberry Pi Zero 2 W.
+ and controlled through a REST API and web UI. Supports Raspberry Pi
+ Zero 2 W, Pi 4, and Pi 5/CM5 with automatic hardware detection.
 
