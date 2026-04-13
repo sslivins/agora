@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
-# Agora — Raspberry Pi Zero 2 W Setup Script
+# Agora — Raspberry Pi Setup Script
+# Supports: Pi Zero 2 W, Pi 4, Pi 5/CM5
 # Base OS: Raspberry Pi OS 64-bit Lite
 #
 # Run: curl -fsSL https://raw.githubusercontent.com/sslivins/agora/main/scripts/setup-pi.sh | sudo bash
@@ -18,7 +19,7 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # ── Preflight ──
 [[ $EUID -eq 0 ]] || error "This script must be run as root (sudo)"
-[[ "$(uname -m)" == "aarch64" ]] || warn "Expected aarch64 — are you on Pi Zero 2 W?"
+[[ "$(uname -m)" == "aarch64" ]] || warn "Expected aarch64 — are you on a supported Raspberry Pi?"
 
 info "Starting Agora setup on $(hostname)"
 

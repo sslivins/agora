@@ -2,6 +2,34 @@ name: Build Pi Image
 
 on:
   workflow_dispatch:
+    inputs:
+      board:
+        description: 'Board to build for (or "all")'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - zero2w
+          - pi4
+          - pi5
+      cms_url:
+        description: 'Pre-configure CMS WebSocket URL (e.g. wss://cms.example.com/ws/device)'
+        required: false
+        type: string
+      wifi_ssid:
+        description: 'Pre-configure WiFi network name'
+        required: false
+        type: string
+      wifi_password:
+        description: 'WiFi password (required if wifi_ssid is set)'
+        required: false
+        type: string
+      disable_wifi:
+        description: 'Disable WiFi support entirely (ethernet-only image)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -15,6 +43,10 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        board: ${{ github.event.inputs.board == 'all' && fromJSON('["zero2w","pi4","pi5"]') || fromJSON(format('["{0}"]', github.event.inputs.board)) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +55,7 @@ jobs:
         run: |
           version=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Building image for Agora v$version"
+          echo "Building image for Agora v$version (${{ matrix.board }})"
 
       - name: Install host dependencies
         run: |
@@ -59,7 +91,7 @@ jobs:
 
           # Build config — explicit STAGE_LIST with correct ordering
           cat > /tmp/pi-gen/config <<EOF
-          IMG_NAME=agora-pi
+          IMG_NAME=agora-${{ matrix.board }}
           RELEASE=trixie
           TARGET_HOSTNAME=agora
           FIRST_USER_NAME=agora
@@ -74,7 +106,22 @@ jobs:
           COMPRESSION_LEVEL=1
           STAGE_LIST="stage0 stage1 stage2 stage-agora"
           ENABLE_CLOUD_INIT=0
+          AGORA_BOARD=${{ matrix.board }}
           EOF
+
+          # Append optional build-time configuration
+          if [ -n "${{ inputs.cms_url }}" ]; then
+            echo "AGORA_CMS_URL=${{ inputs.cms_url }}" >> /tmp/pi-gen/config
+          fi
+          if [ -n "${{ inputs.wifi_ssid }}" ]; then
+            echo "AGORA_WIFI_SSID=${{ inputs.wifi_ssid }}" >> /tmp/pi-gen/config
+          fi
+          if [ -n "${{ inputs.wifi_password }}" ]; then
+            echo "AGORA_WIFI_PASS=${{ inputs.wifi_password }}" >> /tmp/pi-gen/config
+          fi
+          if [ "${{ inputs.disable_wifi }}" = "true" ]; then
+            echo "AGORA_DISABLE_WIFI=1" >> /tmp/pi-gen/config
+          fi
 
           # Remove leading whitespace from heredoc
           sed -i 's/^          //' /tmp/pi-gen/config
@@ -113,17 +160,26 @@ jobs:
 
           # Rename to version-based name: agora-v0.9.0-pi-zero2w.img.xz
           VERSION="${{ steps.version.outputs.version }}"
+          BOARD="${{ matrix.board }}"
+          # Map board short names to image names
+          case "$BOARD" in
+            zero2w) IMAGE_BOARD="pi-zero2w" ;;
+            pi4)    IMAGE_BOARD="pi4" ;;
+            pi5)    IMAGE_BOARD="pi5" ;;
+            *)      IMAGE_BOARD="$BOARD" ;;
+          esac
           EXT="${SRC_PATH#*.img}"
-          FINAL_NAME="agora-v${VERSION}-pi-zero2w.img${EXT}"
+          FINAL_NAME="agora-v${VERSION}-${IMAGE_BOARD}.img${EXT}"
           FINAL_PATH="/tmp/pi-gen/deploy/${FINAL_NAME}"
           mv "$SRC_PATH" "$FINAL_PATH"
           echo "Renamed to: $FINAL_NAME"
           echo "image-path=$FINAL_PATH" >> "$GITHUB_OUTPUT"
+          echo "image-board=$IMAGE_BOARD" >> "$GITHUB_OUTPUT"
 
       - name: Upload image as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agora-v${{ steps.version.outputs.version }}-pi-zero2w
+          name: agora-v${{ steps.version.outputs.version }}-${{ steps.find-image.outputs.image-board }}
           path: ${{ steps.find-image.outputs.image-path }}
           retention-days: 30
 

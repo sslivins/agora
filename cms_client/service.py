@@ -21,6 +21,7 @@ import websockets
 
 from api.config import Settings
 from cms_client.asset_manager import AssetManager
+from shared.board import get_cpu_temp, supported_codecs
 from shared.models import CurrentState, DesiredState, PlaybackMode
 from shared.state import atomic_write, read_state, write_state
 
@@ -66,19 +67,8 @@ def _get_storage_mb(path: Path) -> tuple[int, int]:
 
 
 def _get_cpu_temp() -> float | None:
-    """Read CPU temperature via vcgencmd. Returns degrees Celsius or None."""
-    try:
-        result = subprocess.run(
-            ["vcgencmd", "measure_temp"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            # Output format: "temp=45.6'C\n"
-            text = result.stdout.strip()
-            return float(text.split("=")[1].split("'")[0])
-    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-        pass
-    return None
+    """Read CPU temperature. Uses vcgencmd with sysfs fallback for Pi 5."""
+    return get_cpu_temp()
 
 
 def _is_ssh_enabled() -> bool | None:
@@ -418,6 +408,7 @@ class CMSClient:
                 "device_name": self.settings.device_name,
                 "device_name_custom": name_is_custom,
                 "device_type": _get_device_type(),
+                "supported_codecs": supported_codecs(),
                 "ip_address": _get_local_ip(),
                 "storage_capacity_mb": cap_mb,
                 "storage_used_mb": used_mb,

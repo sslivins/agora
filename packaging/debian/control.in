@@ -27,5 +27,5 @@ Recommends: gstreamer1.0-v4l2
 Maintainer: sslivins
 Description: Agora media playback system for Raspberry Pi
  Agora plays video and images on a TV via HDMI, with content uploaded
- and controlled through a REST API and web UI. Designed for the
- Raspberry Pi Zero 2 W.
+ and controlled through a REST API and web UI. Supports Raspberry Pi
+ Zero 2 W, Pi 4, and Pi 5/CM5 with automatic hardware detection.

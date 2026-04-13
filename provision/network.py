@@ -39,6 +39,37 @@ def get_wifi_interface() -> str | None:
     return None
 
 
+def get_ethernet_interface() -> str | None:
+    """Return the name of the first Ethernet interface, or None."""
+    try:
+        result = _run(["nmcli", "-t", "-f", "TYPE,DEVICE", "device"])
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(":")
+                if len(parts) >= 2 and parts[0] == "ethernet":
+                    return parts[1]
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
+
+
+def is_ethernet_connected() -> bool:
+    """Check if an Ethernet connection is active with an IP address."""
+    iface = get_ethernet_interface()
+    if not iface:
+        return False
+    try:
+        result = _run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", iface])
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(":", 1)
+                if len(parts) == 2 and parts[0].startswith("IP4.ADDRESS") and parts[1]:
+                    return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return False
+
+
 def scan_wifi() -> list[WifiNetwork]:
     """Scan for available Wi-Fi networks. Returns deduplicated list sorted by signal."""
     iface = get_wifi_interface()
@@ -270,17 +301,21 @@ def forget_all_wifi() -> None:
 
 
 def get_device_ip() -> str | None:
-    """Return the device's IP address on the active Wi-Fi network, or None."""
-    iface = get_wifi_interface()
-    if not iface:
-        return None
-    try:
-        result = _run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", iface])
-        if result.returncode == 0:
-            for line in result.stdout.strip().splitlines():
-                parts = line.split(":", 1)
-                if len(parts) == 2 and parts[0].startswith("IP4.ADDRESS"):
-                    return parts[1].split("/")[0]
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+    """Return the device's IP address on any active network interface, or None.
+
+    Checks WiFi first, then Ethernet.
+    """
+    for iface_fn in (get_wifi_interface, get_ethernet_interface):
+        iface = iface_fn()
+        if not iface:
+            continue
+        try:
+            result = _run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", iface])
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    parts = line.split(":", 1)
+                    if len(parts) == 2 and parts[0].startswith("IP4.ADDRESS") and parts[1]:
+                        return parts[1].split("/")[0]
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
     return None

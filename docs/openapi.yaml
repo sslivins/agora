@@ -2,11 +2,11 @@ openapi: 3.0.3
 info:
   title: Agora
   description: >
-    Media playback system for Raspberry Pi Zero 2 W — REST API for asset management,
+    Media playback system for Raspberry Pi (Zero 2 W, Pi 4, Pi 5/CM5) — REST API for asset management,
     playback control, CMS integration, and status monitoring. A separate player service
     handles GStreamer pipelines, and an optional CMS client connects to Agora CMS for
     centralized scheduling and fleet management.
-  version: 1.3.1
+  version: 1.8.0
   license:
     name: MIT
 
