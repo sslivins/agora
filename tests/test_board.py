@@ -49,6 +49,15 @@ class TestDetectBoard:
     def test_pi_5_compute_module(self):
         assert _detect_board("Raspberry Pi 5") == Board.PI_5
 
+    def test_cm5_lite(self):
+        assert _detect_board("Raspberry Pi Compute Module 5 Lite Rev 1.0") == Board.PI_5
+
+    def test_cm5(self):
+        assert _detect_board("Raspberry Pi Compute Module 5 Rev 1.0") == Board.PI_5
+
+    def test_cm4(self):
+        assert _detect_board("Raspberry Pi Compute Module 4 Rev 1.0") == Board.PI_4
+
     def test_unknown_board(self):
         assert _detect_board("Something Else Entirely") == Board.UNKNOWN
 
