@@ -3,26 +3,35 @@
 [![Tests](https://github.com/sslivins/agora/actions/workflows/tests.yml/badge.svg)](https://github.com/sslivins/agora/actions/workflows/tests.yml)
 [![Release](https://img.shields.io/github/v/release/sslivins/agora)](https://github.com/sslivins/agora/releases/latest)
 
-**Turn any TV into a managed digital signage display with a $15 Raspberry Pi Zero 2 W.**
+**Turn any TV into a managed digital signage display with a Raspberry Pi.**
 
-Agora is a lightweight media playback system that runs on a Raspberry Pi, playing video and images on any HDMI-connected screen. Upload content through a local web UI or REST API, or connect to [Agora CMS](https://github.com/sslivins/agora-cms) for centralized scheduling and fleet management across dozens of displays.
+Agora is a lightweight media playback system that runs on Raspberry Pi boards (Zero 2 W, Pi 4, Pi 5/CM5), playing video and images on any HDMI-connected screen. Upload content through a local web UI or REST API, or connect to [Agora CMS](https://github.com/sslivins/agora-cms) for centralized scheduling and fleet management across dozens of displays.
 
 **No cloud services, no subscriptions, no vendor lock-in.** Everything runs on your own hardware.
 
 ### Highlights
 
 - **Zero-config setup** — Flash an SD card, plug in, and connect via your phone's Wi-Fi
-- **Hardware-accelerated playback** — H.264 video decoded in hardware via V4L2, smooth 1080p on a $15 board
+- **Hardware-accelerated playback** — H.264/HEVC video decoded in hardware via V4L2, smooth 1080p on all supported boards
+- **Multi-board support** — Runs on Pi Zero 2 W, Pi 4, and Pi 5/CM5 with automatic hardware detection
 - **Web UI + REST API** — Upload assets, control playback, and monitor status from any browser or script
 - **Fleet-ready** — Optional CMS connection for centralized scheduling, remote control, and over-the-air updates
 - **Captive portal provisioning** — On first boot, the device creates a Wi-Fi hotspot with a guided setup wizard
 - **Self-healing** — Automatic reconnection, schedule caching, and graceful fallback to splash screens
 
-## Install on Raspberry Pi Zero 2 W
+## Install
+
+### Supported Boards
+
+| Board | Image Name | Notes |
+|-------|-----------|-------|
+| Raspberry Pi Zero 2 W | `agora-v{version}-pi-zero2w.img.xz` | WiFi only, H.264 |
+| Raspberry Pi 4 Model B | `agora-v{version}-pi4.img.xz` | WiFi + Ethernet, H.264 + HEVC |
+| Raspberry Pi 5 / CM5 | `agora-v{version}-pi5.img.xz` | Ethernet (CM5: no WiFi), HEVC only |
 
 ### Option 1: Pre-Built Image (Recommended)
 
-Download the latest release image from [GitHub Releases](https://github.com/sslivins/agora/releases) — the file is named `agora-v{version}-pi-zero2w.img.xz`.
+Download the image for your board from [GitHub Releases](https://github.com/sslivins/agora/releases).
 
 Flash it to an SD card using [Raspberry Pi Imager](https://www.raspberrypi.com/software/):
 
@@ -30,7 +39,9 @@ Flash it to an SD card using [Raspberry Pi Imager](https://www.raspberrypi.com/s
 2. Choose **Use custom** and select the downloaded `.img.xz` file
 3. Select your SD card and write
 
-On first boot the device starts a Wi-Fi access point (**Agora-XXXX**) with a captive-portal web UI for configuring Wi-Fi, device name, and CMS connection. No SSH or manual config needed.
+On first boot:
+- **WiFi boards (Zero 2 W, Pi 4):** Start a Wi-Fi access point (**Agora-XXXX**) with a captive-portal web UI for configuring Wi-Fi, device name, and CMS connection.
+- **Ethernet boards (Pi 4, Pi 5/CM5):** If connected via Ethernet, skip the WiFi setup and go straight online. The IP address and mDNS hostname are shown on the HDMI display.
 
 ### Option 2: Install on Existing Raspberry Pi OS
 
@@ -65,7 +76,7 @@ FastAPI application running via systemd. Provides:
 GStreamer-based media player running natively via systemd to access hardware:
 
 - Watches `desired.json` via inotify (2s polling fallback)
-- Builds GStreamer pipelines for video (`v4l2h264dec` → `kmssink` + HDMI audio via ALSA) and images (`decodebin` → `imagefreeze` → `kmssink`)
+- Builds per-board GStreamer pipelines: HEVC (`v4l2h265dec`) on Pi 4/5, H.264 (`v4l2h264dec`) on Zero 2 W/Pi 4, KMS display sink (`kmssink`), HDMI audio via ALSA
 - Supports looping, automatic splash screen fallback on EOS/error
 - Reports actual state to `current.json`
 
@@ -73,7 +84,7 @@ GStreamer-based media player running natively via systemd to access hardware:
 
 WebSocket client that maintains a persistent connection to [Agora CMS](https://github.com/sslivins/agora-cms):
 
-- Registers device by CPU serial number with auth token
+- Registers device by CPU serial number with auth token and supported codecs
 - Receives schedule windows and caches them locally
 - Evaluates schedules locally every 15 seconds
 - Pre-fetches upcoming assets with budget-aware LRU eviction
@@ -89,13 +100,15 @@ CMS Client receives schedule → writes desired.json → Player acts
 
 ### Provisioning (First Boot)
 
-On a fresh image with no Wi-Fi configured, the device enters **AP mode** (access point named `Agora-XXXX`). A captive-portal web UI lets the user:
+On a fresh image with no Wi-Fi configured, WiFi-capable boards enter **AP mode** (access point named `Agora-XXXX`). A captive-portal web UI lets the user:
 
 1. Scan and select a Wi-Fi network
 2. Set a device name
 3. Optionally configure CMS connection
 
 After saving, the device reboots into client mode and connects to the chosen network. If Wi-Fi is lost later, the device cycles between retry and temporary AP mode until connectivity is restored.
+
+Ethernet-connected devices (Pi 4, Pi 5/CM5) skip the AP mode entirely and are immediately reachable on the LAN. The IP address and mDNS hostname are displayed on the HDMI output.
 
 ## Web UI Pages
 
@@ -149,7 +162,7 @@ Keys are auto-generated on first boot if not set. See `config/agora-config.examp
 
 ## Supported Formats
 
-- **Video:** `.mp4` (H.264, hardware-decoded via V4L2)
+- **Video:** `.mp4` (H.264 hardware-decoded on Zero 2 W and Pi 4; HEVC/H.265 hardware-decoded on Pi 4 and Pi 5)
 - **Images:** `.jpg`, `.jpeg`, `.png`
 
 ## CMS Protocol (WebSocket)
@@ -160,7 +173,7 @@ Protocol version: **1**
 
 | Type | Description |
 |------|-------------|
-| `register` | Device ID, auth token, firmware version, storage capacity |
+| `register` | Device ID, auth token, firmware version, storage capacity, supported codecs |
 | `status` | Heartbeat: playback state, disk usage, uptime, CPU temp (every 30s) |
 | `fetch_request` | Request an asset from CMS |
 | `fetch_failed` | Download failed with reason and budget info |
@@ -198,7 +211,7 @@ pytest tests/ --tb=short -q
 
 ### Releasing
 
-The **Create Release** workflow (Actions → Create Release → Run workflow) reads the version from `api/__init__.py`, creates a git tag, builds the `.deb` package, publishes a GitHub Release with the `.deb` and the Pi image (`agora-v{version}-pi-zero2w.img.xz`), and updates the apt repository.
+The **Create Release** workflow (Actions → Create Release → Run workflow) reads the version from `api/__init__.py`, creates a git tag, builds the `.deb` package, publishes a GitHub Release with the `.deb`, and updates the apt repository. Use the **Build Pi Image** workflow to build SD card images for each board (zero2w, pi4, pi5) and attach them to the release.
 
 Bump the version in `api/__init__.py` before running.
 

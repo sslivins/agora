@@ -68,6 +68,37 @@ sed -i 's/console=tty1/console=tty3/g' /boot/firmware/cmdline.txt 2>/dev/null ||
 # Force HDMI connector detection with 1080p mode on kernel cmdline
 sed -i 's/rootwait/rootwait video=HDMI-A-1:1920x1080@60D/' /boot/firmware/cmdline.txt 2>/dev/null || true
 
+# ── Per-board config.txt adjustments ──
+# AGORA_BOARD is set by the pi-gen build config (zero2w, pi4, pi5)
+BOARD="${AGORA_BOARD:-zero2w}"
+echo "Agora: configuring for board=${BOARD}"
+
+case "${BOARD}" in
+  pi4)
+    # Pi 4: enable both HDMI ports, force hotplug
+    cat >> /boot/firmware/config.txt <<'PI4CFG'
+
+# Agora: Pi 4 display config
+hdmi_force_hotplug:0=1
+hdmi_force_hotplug:1=1
+PI4CFG
+    ;;
+  pi5)
+    # Pi 5: enable both HDMI ports via KMS
+    cat >> /boot/firmware/config.txt <<'PI5CFG'
+
+# Agora: Pi 5 display config
+# Pi 5 uses RP1 chip for HDMI — KMS handles hotplug natively
+PI5CFG
+    ;;
+  *)
+    # Zero 2 W: single HDMI, keep defaults
+    ;;
+esac
+
+# Write board identifier for runtime detection fallback
+echo "${BOARD}" > /opt/agora/persist/board
+
 # ── Configure NTP with public pools (Pi has no battery-backed RTC) ──
 mkdir -p /etc/systemd/timesyncd.conf.d
 cat > /etc/systemd/timesyncd.conf.d/agora.conf <<'NTP_EOF'

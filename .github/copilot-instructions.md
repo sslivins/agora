@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Agora is a media playback system for **Raspberry Pi Zero 2 W**. It plays video/images on a TV via HDMI, with content uploaded and controlled through a REST API and web UI.
+Agora is a media playback system for **Raspberry Pi** boards (Zero 2 W, Pi 4, Pi 5/CM5). It plays video/images on a TV via HDMI, with content uploaded and controlled through a REST API and web UI.
 
 ## Architecture
 
@@ -10,7 +10,7 @@ Two processes, communicating via JSON state files on disk (`desired.json` and `c
 
 1. **API service** — FastAPI app running via systemd on port 8000. Handles asset management (upload, list, delete), playback control (play/stop/splash), status reporting, and a Jinja2 web UI. Auth via `X-API-Key` header or signed session cookies.
 
-2. **Player service** — Runs natively via systemd to access hardware. Uses GStreamer for media playback: `v4l2h264dec` + `kmssink` for H.264 video, `imagefreeze` + `kmssink` for images, ALSA for HDMI audio. Watches `desired.json` via inotify, writes `current.json` to report actual state.
+2. **Player service** — Runs natively via systemd to access hardware. Uses GStreamer for media playback with per-board codec selection: Zero 2 W and Pi 4 use `v4l2h264dec` for H.264, Pi 4 and Pi 5 use `v4l2h265dec` for HEVC (H.265). All boards use `kmssink` for KMS display output and ALSA for HDMI audio. Watches `desired.json` via inotify, writes `current.json` to report actual state.
 
 ## Key Design Decisions
 
@@ -24,7 +24,7 @@ Two processes, communicating via JSON state files on disk (`desired.json` and `c
 - `api/` — FastAPI application (main.py, config.py, auth.py, ui.py, routers/, static/, templates/)
 - `player/` — GStreamer player service (main.py, service.py)
 - `cms_client/` — WebSocket client for CMS connection (service.py, main.py)
-- `shared/` — Pydantic models and state file I/O shared between API and player
+- `shared/` — Shared modules: Pydantic models, state file I/O, and board detection (`board.py`)
 - `config/` — Example configuration
 - `systemd/` — systemd unit files for all services
 
@@ -83,6 +83,18 @@ All commit messages **must** use [Conventional Commits](https://www.conventional
 - Keep the first line under 72 characters.
 - Add a blank line + body for complex changes.
 
-## Hardware Target
+## Hardware Targets
 
-Raspberry Pi Zero 2 W — ARM Cortex-A53, limited RAM/CPU. Keep resource usage minimal. GStreamer pipelines use hardware H.264 decoding (`v4l2h264dec`) and KMS display sink (`kmssink`).
+Agora supports multiple Raspberry Pi boards, detected at runtime via `shared/board.py`:
+
+| Board | Codecs | HDMI Ports | Connectivity | Max FPS |
+|-------|--------|------------|-------------|---------|
+| **Zero 2 W** | H.264 (v4l2h264dec) | 1 (mini) | WiFi | 30 |
+| **Pi 4** | H.264 + HEVC (v4l2h264dec, v4l2h265dec) | 2 (micro) | WiFi + Ethernet | 30 |
+| **Pi 5 / CM5** | HEVC only (v4l2h265dec) | 2 (micro) | Ethernet (CM5: no WiFi) | 60 |
+
+Key differences:
+- **Pi 5 has no hardware H.264 decode** — CMS must transcode to HEVC for Pi 5 devices
+- **Ethernet devices skip OOBE** — they go straight to LAN mode on first boot
+- **I2C bus numbers differ per board** — `shared/board.py` maps the correct bus for HDMI detection
+- **CPU temperature**: `vcgencmd` on Zero 2 W / Pi 4, sysfs fallback on Pi 5
