@@ -1362,7 +1362,7 @@ class TestBuildMpvCommand:
             cmd = svc._build_mpv_command(Path("/opt/agora/assets/videos/test.mp4"))
             assert cmd[0] == "mpv"
             assert "--vo=drm" in cmd
-            assert "--hwdec=auto" in cmd
+            assert "--hwdec=drm-copy" in cmd
             assert "--drm-connector=HDMI-A-1" in cmd
             assert "--fullscreen" in cmd
             assert "--no-terminal" in cmd

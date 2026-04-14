@@ -38,6 +38,7 @@ _BOARD_CONFIG: dict[Board, dict] = {
         "has_ethernet": False,
         "max_fps": 30,
         "player_backend": "gstreamer",
+        "alsa_card": "vc4hdmi",
     },
     Board.PI_4: {
         "hdmi_ports": [
@@ -49,6 +50,7 @@ _BOARD_CONFIG: dict[Board, dict] = {
         "has_ethernet": True,
         "max_fps": 30,
         "player_backend": "mpv",
+        "alsa_card": "vc4hdmi",
     },
     Board.PI_5: {
         "hdmi_ports": [
@@ -60,6 +62,7 @@ _BOARD_CONFIG: dict[Board, dict] = {
         "has_ethernet": True,
         "max_fps": 60,
         "player_backend": "mpv",
+        "alsa_card": "vc4hdmi0",
     },
 }
 
@@ -71,6 +74,7 @@ _UNKNOWN_CONFIG: dict = {
     "has_ethernet": False,
     "max_fps": 30,
     "player_backend": "gstreamer",
+    "alsa_card": "vc4hdmi",
 }
 
 # Cached board detection result
@@ -168,6 +172,11 @@ def player_backend() -> str:
     (uses GStreamer pipeline with V4L2 decoder and kmssink).
     """
     return _config()["player_backend"]
+
+
+def alsa_card() -> str:
+    """Return the ALSA card name for HDMI audio on the current board."""
+    return _config()["alsa_card"]
 
 
 def _detect_wifi_interface() -> bool:

@@ -16,7 +16,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-from shared.board import Board, get_board, get_i2c_bus, player_backend, supported_codecs  # noqa: E402
+from shared.board import Board, alsa_card, get_board, get_i2c_bus, player_backend, supported_codecs  # noqa: E402
 from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
 
@@ -34,12 +34,13 @@ def _build_video_pipeline_str(board: Board) -> str:
     else:
         decode = "h264parse ! v4l2h264dec"
 
+    _card = alsa_card()
     return (
         'filesrc location="{path}" ! '
         "qtdemux name=dmux "
         f"dmux.video_0 ! queue ! {decode} ! kmssink driver-name=vc4 sync=true "
         "dmux.audio_0 ! queue ! decodebin ! audioconvert ! audioresample ! "
-        'alsasink device="hdmi:CARD=vc4hdmi,DEV=0"'
+        f'alsasink device="hdmi:CARD={_card},DEV=0"'
     )
 
 
@@ -71,7 +72,7 @@ def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) ->
     cmd = [
         "mpv",
         "--vo=drm",
-        "--hwdec=auto",
+        "--hwdec=drm-copy",
         "--drm-connector=HDMI-A-1",
         "--fullscreen",
         "--no-terminal",
@@ -81,7 +82,7 @@ def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) ->
     if not audio:
         cmd.append("--no-audio")
     else:
-        cmd.extend(["--ao=alsa", "--audio-device=alsa/hdmi:CARD=vc4hdmi,DEV=0"])
+        cmd.extend(["--ao=alsa", f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0"])
     if loop:
         cmd.append("--loop=inf")
     cmd.append(str(path))
@@ -276,8 +277,7 @@ class AgoraPlayer:
         self._quit_plymouth()
         self._stop_mpv()
 
-        audio = self._has_audio(path)
-        cmd = _build_mpv_command(path, audio=audio, loop=loop)
+        cmd = _build_mpv_command(path, audio=True, loop=loop)
         logger.info("Starting mpv: %s", " ".join(cmd))
         try:
             self._mpv_process = subprocess.Popen(
@@ -525,8 +525,25 @@ class AgoraPlayer:
             is_video = splash.suffix.lower() == ".mp4"
             self._current_path = splash
             self._current_mtime = splash.stat().st_mtime
-            self.pipeline = self._build_pipeline(splash, is_video)
-            self.pipeline.set_state(Gst.State.PLAYING)
+            # Use mpv for video splash on Pi 4/5, GStreamer for images and Zero 2 W
+            if is_video and self._player_backend == "mpv":
+                self._quit_plymouth()
+                self._stop_mpv()
+                cmd = _build_mpv_command(splash, audio=False, loop=True)
+                logger.info("Showing splash via mpv: %s", splash.name)
+                try:
+                    self._mpv_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+                except (FileNotFoundError, OSError) as e:
+                    logger.error("mpv splash failed: %s — falling back to GStreamer", e)
+                    self.pipeline = self._build_pipeline(splash, is_video)
+                    self.pipeline.set_state(Gst.State.PLAYING)
+            else:
+                self.pipeline = self._build_pipeline(splash, is_video)
+                self.pipeline.set_state(Gst.State.PLAYING)
             # Update desired state so _on_state_changed uses correct mode
             self.current_desired = DesiredState(
                 mode=PlaybackMode.SPLASH, loop=is_video

@@ -111,25 +111,27 @@ jobs:
           COMPRESSION_LEVEL=1
           STAGE_LIST="stage0 stage1 stage2 stage-agora"
           ENABLE_CLOUD_INIT=0
-          AGORA_BOARD=${{ matrix.board }}
+          export AGORA_BOARD=${{ matrix.board }}
           EOF
 
           # Append optional build-time configuration
+          # Custom AGORA_* variables must use 'export' so pi-gen passes them
+          # through to stage scripts (00-run.sh) that run as subprocesses.
           # Values are single-quoted to handle special characters (e.g. apostrophes in SSIDs)
           if [ -n "${INPUT_CMS_URL}" ]; then
             ESCAPED=$(printf '%s' "${INPUT_CMS_URL}" | sed "s/'/'\\\\''/g")
-            echo "AGORA_CMS_URL='${ESCAPED}'" >> /tmp/pi-gen/config
+            echo "export AGORA_CMS_URL='${ESCAPED}'" >> /tmp/pi-gen/config
           fi
           if [ -n "${INPUT_WIFI_SSID}" ]; then
             ESCAPED=$(printf '%s' "${INPUT_WIFI_SSID}" | sed "s/'/'\\\\''/g")
-            echo "AGORA_WIFI_SSID='${ESCAPED}'" >> /tmp/pi-gen/config
+            echo "export AGORA_WIFI_SSID='${ESCAPED}'" >> /tmp/pi-gen/config
           fi
           if [ -n "${INPUT_WIFI_PASS}" ]; then
             ESCAPED=$(printf '%s' "${INPUT_WIFI_PASS}" | sed "s/'/'\\\\''/g")
-            echo "AGORA_WIFI_PASS='${ESCAPED}'" >> /tmp/pi-gen/config
+            echo "export AGORA_WIFI_PASS='${ESCAPED}'" >> /tmp/pi-gen/config
           fi
           if [ "${INPUT_DISABLE_WIFI}" = "true" ]; then
-            echo "AGORA_DISABLE_WIFI=1" >> /tmp/pi-gen/config
+            echo "export AGORA_DISABLE_WIFI=1" >> /tmp/pi-gen/config
           fi
 
           # Remove leading whitespace from heredoc
