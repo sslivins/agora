@@ -16,6 +16,7 @@ from shared.board import (
     has_wifi,
     hdmi_port_count,
     max_fps,
+    player_backend,
     supported_codecs,
 )
 
@@ -243,3 +244,28 @@ class TestGetCpuTemp:
         with patch("shared.board.subprocess.run", return_value=result):
             # sysfs will also fail on Windows, so expect None
             assert get_cpu_temp() is None
+
+
+# ── Player backend ──
+
+
+class TestPlayerBackend:
+    def test_zero_2w_uses_gstreamer(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi Zero 2 W"):
+            assert player_backend() == "gstreamer"
+
+    def test_pi_4_uses_mpv(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            assert player_backend() == "mpv"
+
+    def test_pi_5_uses_mpv(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 5"):
+            assert player_backend() == "mpv"
+
+    def test_cm5_uses_mpv(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi Compute Module 5"):
+            assert player_backend() == "mpv"
+
+    def test_unknown_board_uses_gstreamer(self):
+        with patch.object(board_module, "_read_model_string", return_value="Something Else"):
+            assert player_backend() == "gstreamer"

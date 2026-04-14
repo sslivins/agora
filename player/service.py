@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -15,7 +16,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-from shared.board import Board, get_board, get_i2c_bus, supported_codecs  # noqa: E402
+from shared.board import Board, get_board, get_i2c_bus, player_backend, supported_codecs  # noqa: E402
 from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
 
@@ -23,7 +24,10 @@ logger = logging.getLogger("agora.player")
 
 
 def _build_video_pipeline_str(board: Board) -> str:
-    """Return the GStreamer pipeline string for video playback with audio."""
+    """Return the GStreamer pipeline string for video playback with audio.
+
+    Used only on boards with player_backend='gstreamer' (Zero 2 W).
+    """
     codecs = supported_codecs()
     if "hevc" in codecs:
         decode = "h265parse ! v4l2h265dec"
@@ -40,7 +44,10 @@ def _build_video_pipeline_str(board: Board) -> str:
 
 
 def _build_video_pipeline_no_audio_str(board: Board) -> str:
-    """Return the GStreamer pipeline string for video playback without audio."""
+    """Return the GStreamer pipeline string for video playback without audio.
+
+    Used only on boards with player_backend='gstreamer' (Zero 2 W).
+    """
     codecs = supported_codecs()
     if "hevc" in codecs:
         decode = "h265parse ! v4l2h265dec"
@@ -54,8 +61,39 @@ def _build_video_pipeline_no_audio_str(board: Board) -> str:
     )
 
 
+def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) -> list[str]:
+    """Build the mpv command for video playback via DRM output.
+
+    Used on Pi 4 and Pi 5 where GStreamer's kmssink cannot handle the
+    hardware decoder's tiled output format. mpv uses ffmpeg internally
+    with drm-copy hwdec which handles format conversion correctly.
+    """
+    cmd = [
+        "mpv",
+        "--vo=drm",
+        "--hwdec=auto",
+        "--drm-connector=HDMI-A-1",
+        "--fullscreen",
+        "--no-terminal",
+        "--no-input-terminal",
+        "--no-osc",
+    ]
+    if not audio:
+        cmd.append("--no-audio")
+    else:
+        cmd.extend(["--ao=alsa", "--audio-device=alsa/hdmi:CARD=vc4hdmi,DEV=0"])
+    if loop:
+        cmd.append("--loop=inf")
+    cmd.append(str(path))
+    return cmd
+
+
 class AgoraPlayer:
-    """Manages GStreamer pipelines driven by desired state file changes."""
+    """Manages media playback driven by desired state file changes.
+
+    Uses GStreamer pipelines on Zero 2 W (and for images/splash on all boards),
+    and mpv subprocess on Pi 4/Pi 5 for video playback with hardware decoding.
+    """
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -88,8 +126,10 @@ class AgoraPlayer:
 
         self._board = get_board()
         self._i2c_bus = get_i2c_bus()
+        self._player_backend = player_backend()
 
         self.pipeline: Optional[Gst.Pipeline] = None
+        self._mpv_process: Optional[subprocess.Popen] = None
         self.loop = GLib.MainLoop()
         self.current_desired: Optional[DesiredState] = None
         self._current_path: Optional[Path] = None  # file being played
@@ -185,6 +225,7 @@ class AgoraPlayer:
             return True
 
     def _teardown(self) -> None:
+        self._stop_mpv()
         if self.pipeline:
             bus = self.pipeline.get_bus()
             if bus:
@@ -223,6 +264,132 @@ class AgoraPlayer:
         bus.connect("message::state-changed", self._on_state_changed)
 
         return pipeline
+
+    # ── mpv subprocess management ──
+
+    def _start_mpv(self, path: Path, *, loop: bool = False) -> None:
+        """Launch mpv subprocess for video playback via DRM output.
+
+        Used on Pi 4 and Pi 5 where GStreamer's kmssink cannot handle the
+        hardware decoder's tiled output format.
+        """
+        self._quit_plymouth()
+        self._stop_mpv()
+
+        audio = self._has_audio(path)
+        cmd = _build_mpv_command(path, audio=audio, loop=loop)
+        logger.info("Starting mpv: %s", " ".join(cmd))
+        try:
+            self._mpv_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            self._current_path = path
+            self._current_mtime = path.stat().st_mtime
+            started = datetime.now(timezone.utc)
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=self.current_desired.asset if self.current_desired else path.name,
+                started_at=started,
+            )
+            logger.info("mpv started (pid %d) for %s", self._mpv_process.pid, path.name)
+            # Schedule periodic monitoring to detect EOS / errors
+            GLib.timeout_add_seconds(2, self._monitor_mpv, path.name)
+        except FileNotFoundError:
+            logger.error("mpv not found — is it installed?")
+            self._update_current(error="mpv not installed")
+            self._show_splash()
+        except Exception as e:
+            logger.error("Failed to start mpv: %s", e)
+            self._update_current(error=f"mpv start failed: {e}")
+            self._show_splash()
+
+    def _stop_mpv(self) -> None:
+        """Stop the mpv subprocess if running."""
+        if self._mpv_process is None:
+            return
+        if self._mpv_process.poll() is None:
+            logger.info("Stopping mpv (pid %d)", self._mpv_process.pid)
+            self._mpv_process.terminate()
+            try:
+                self._mpv_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("mpv did not stop, killing")
+                self._mpv_process.kill()
+                self._mpv_process.wait(timeout=3)
+        self._mpv_process = None
+
+    def _monitor_mpv(self, asset_name: str) -> bool:
+        """Periodic check for mpv process exit. Returns False to stop timer."""
+        if self._mpv_process is None:
+            return False
+
+        # Check if still supposed to be playing this asset
+        if (
+            not self.current_desired
+            or self.current_desired.asset != asset_name
+            or self.current_desired.mode != PlaybackMode.PLAY
+        ):
+            return False
+
+        retcode = self._mpv_process.poll()
+        if retcode is None:
+            # Still running — keep monitoring
+            return True
+
+        # mpv exited
+        stderr_output = ""
+        try:
+            stderr_output = self._mpv_process.stderr.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        self._mpv_process = None
+
+        if retcode == 0:
+            # Normal exit — EOS
+            logger.info("mpv finished playing %s", asset_name)
+            if self.current_desired and self.current_desired.loop:
+                self._loops_completed += 1
+                if (
+                    self.current_desired.loop_count is not None
+                    and self._loops_completed >= self.current_desired.loop_count
+                ):
+                    logger.info(
+                        "Completed %d/%d loops, switching to splash",
+                        self._loops_completed, self.current_desired.loop_count,
+                    )
+                    self._show_splash()
+                    return False
+                # Infinite loop but mpv exited (shouldn't happen with --loop=inf)
+                # Restart playback
+                path = self._resolve_asset(asset_name)
+                if path:
+                    self._start_mpv(path, loop=True)
+                else:
+                    self._show_splash()
+            else:
+                logger.info("Playback complete (no loop), switching to splash")
+                self._show_splash()
+        else:
+            # Error exit
+            error_msg = f"mpv exited with code {retcode}"
+            if stderr_output:
+                # Take last meaningful line from stderr
+                lines = [l.strip() for l in stderr_output.splitlines() if l.strip()]
+                if lines:
+                    error_msg = f"mpv error: {lines[-1]}"
+            logger.error("mpv error for %s: %s", asset_name, error_msg)
+            self._update_current(error=error_msg)
+            delay = self._error_retry_delay
+            self._error_retry_delay = min(
+                self._error_retry_delay * 2, self._RETRY_DELAY_MAX,
+            )
+            self._pending_error = error_msg
+            self._show_splash()
+            GLib.timeout_add_seconds(delay, self._retry_desired)
+
+        return False
 
     def _on_state_changed(self, bus, message) -> None:
         """Track pipeline state transitions and update current.json."""
@@ -399,7 +566,9 @@ class AgoraPlayer:
         started_at: Optional[datetime] = None,
     ) -> None:
         pipeline_state = "NULL"
-        if self.pipeline:
+        if self._mpv_process and self._mpv_process.poll() is None:
+            pipeline_state = "PLAYING"
+        elif self.pipeline:
             try:
                 _, state, _ = self.pipeline.get_state(0)
                 pipeline_state = state.value_nick.upper()
@@ -422,8 +591,12 @@ class AgoraPlayer:
 
     def _update_position(self) -> bool:
         """Periodic callback to update playback position in current.json."""
+        is_active = (
+            self.pipeline
+            or (self._mpv_process and self._mpv_process.poll() is None)
+        )
         if (
-            not self.pipeline
+            not is_active
             or not self.current_desired
             or self.current_desired.mode != PlaybackMode.PLAY
         ):
@@ -471,7 +644,11 @@ class AgoraPlayer:
         # Compare resolved file path + mtime to detect content changes even if
         # the filename is reused.  Also compares loop_count since that affects
         # video playback behaviour.
-        if self.pipeline and self._current_path and desired.asset:
+        is_active = (
+            self.pipeline
+            or (self._mpv_process and self._mpv_process.poll() is None)
+        )
+        if is_active and self._current_path and desired.asset:
             new_path = self._resolve_asset(desired.asset)
             cur_loop_count = self.current_desired.loop_count if self.current_desired else None
             if (
@@ -532,18 +709,28 @@ class AgoraPlayer:
             self._teardown()
             self._health_retries = 0
             is_video = path.suffix.lower() == ".mp4"
-            self._current_path = path
-            self._current_mtime = path.stat().st_mtime
-            self.pipeline = self._build_pipeline(path, is_video)
             self._loops_completed = 0
-            self.pipeline.set_state(Gst.State.PLAYING)
-            self._update_current(mode=PlaybackMode.PLAY, asset=desired.asset)
-            # Schedule a health check to verify the pipeline actually started
-            GLib.timeout_add_seconds(
-                5, self._check_pipeline_health, desired.asset,
-            )
-            # Periodic position updates for CMS status reporting
-            GLib.timeout_add_seconds(10, self._update_position)
+
+            # Dispatch to mpv for video on Pi 4/5, GStreamer for everything else
+            if is_video and self._player_backend == "mpv":
+                loop = bool(desired.loop)
+                # For finite loop count, let mpv handle it naturally
+                if desired.loop_count is not None and desired.loop_count > 0:
+                    loop = False  # Don't use --loop=inf; monitor exits instead
+                self._start_mpv(path, loop=loop)
+                GLib.timeout_add_seconds(10, self._update_position)
+            else:
+                self._current_path = path
+                self._current_mtime = path.stat().st_mtime
+                self.pipeline = self._build_pipeline(path, is_video)
+                self.pipeline.set_state(Gst.State.PLAYING)
+                self._update_current(mode=PlaybackMode.PLAY, asset=desired.asset)
+                # Schedule a health check to verify the pipeline actually started
+                GLib.timeout_add_seconds(
+                    5, self._check_pipeline_health, desired.asset,
+                )
+                # Periodic position updates for CMS status reporting
+                GLib.timeout_add_seconds(10, self._update_position)
 
     _HEALTH_CHECK_MAX_RETRIES = 3
 

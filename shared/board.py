@@ -37,6 +37,7 @@ _BOARD_CONFIG: dict[Board, dict] = {
         "has_wifi": True,
         "has_ethernet": False,
         "max_fps": 30,
+        "player_backend": "gstreamer",
     },
     Board.PI_4: {
         "hdmi_ports": [
@@ -47,6 +48,7 @@ _BOARD_CONFIG: dict[Board, dict] = {
         "has_wifi": True,
         "has_ethernet": True,
         "max_fps": 30,
+        "player_backend": "mpv",
     },
     Board.PI_5: {
         "hdmi_ports": [
@@ -57,6 +59,7 @@ _BOARD_CONFIG: dict[Board, dict] = {
         "has_wifi": False,  # CM5 has no WiFi; Pi 5 board does — detected at runtime
         "has_ethernet": True,
         "max_fps": 60,
+        "player_backend": "mpv",
     },
 }
 
@@ -67,6 +70,7 @@ _UNKNOWN_CONFIG: dict = {
     "has_wifi": True,
     "has_ethernet": False,
     "max_fps": 30,
+    "player_backend": "gstreamer",
 }
 
 # Cached board detection result
@@ -154,6 +158,16 @@ def has_ethernet() -> bool:
 def max_fps() -> int:
     """Return the maximum framerate for the current board."""
     return _config()["max_fps"]
+
+
+def player_backend() -> str:
+    """Return the video player backend for the current board.
+
+    Returns 'mpv' for Pi 4 and Pi 5 (uses mpv subprocess with DRM output
+    and hardware decoding), or 'gstreamer' for Zero 2 W and unknown boards
+    (uses GStreamer pipeline with V4L2 decoder and kmssink).
+    """
+    return _config()["player_backend"]
 
 
 def _detect_wifi_interface() -> bool:
