@@ -1477,8 +1477,8 @@ class TestMpvBackendSelection:
             mock_start_mpv.assert_called_once()
             mock_gst.parse_launch.assert_not_called()
 
-    def test_pi5_uses_gstreamer_for_images(self, mpv_player, tmp_path):
-        """Pi 5 should still use GStreamer for image playback."""
+    def test_pi5_uses_mpv_for_images(self, mpv_player, tmp_path):
+        """Pi 5 should use mpv for image playback (avoids GStreamer teardown delay)."""
         image = tmp_path / "test.png"
         image.write_bytes(b"\x89PNG" + b"\x00" * 100)
 
@@ -1504,15 +1504,14 @@ class TestMpvBackendSelection:
 
         with patch("player.service.Gst") as mock_gst, \
              patch("player.service.GLib") as mock_glib, \
+             patch.object(mpv_player, "_start_mpv") as mock_start_mpv, \
              patch.object(mpv_player, "_update_current"), \
              patch.object(mpv_player, "_quit_plymouth"):
-            mock_gst.parse_launch.return_value = MagicMock()
             mpv_player.apply_desired()
 
-            # Should have used GStreamer for image, even on Pi 5
-            mock_gst.parse_launch.assert_called_once()
-            pipeline_str = mock_gst.parse_launch.call_args[0][0]
-            assert "imagefreeze" in pipeline_str
+            # Should use mpv for images on Pi 5, NOT GStreamer
+            mock_start_mpv.assert_called_once()
+            mock_gst.parse_launch.assert_not_called()
 
 
 # ── mpv process lifecycle ──

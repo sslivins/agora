@@ -1,4 +1,4 @@
-"""Agora Player Service — watches desired state and manages GStreamer pipelines."""
+"""Agora Player Service — watches desired state and manages media playback."""
 
 import json
 import logging
@@ -63,26 +63,32 @@ def _build_video_pipeline_no_audio_str(board: Board) -> str:
 
 
 def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) -> list[str]:
-    """Build the mpv command for video playback via DRM output.
+    """Build the mpv command for media playback via DRM output.
 
-    Used on Pi 4 and Pi 5 where GStreamer's kmssink cannot handle the
-    hardware decoder's tiled output format. mpv uses ffmpeg internally
-    with drm-copy hwdec which handles format conversion correctly.
+    Used on Pi 4 and Pi 5 for both video and image playback.
+    For video: uses drm-copy hwdec for hardware decoding.
+    For images: uses image-display-duration=inf to hold the frame.
+    Includes IPC socket for seamless content switching via loadfile.
     """
+    is_image = path.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
     cmd = [
         "mpv",
         "--vo=drm",
-        "--hwdec=drm-copy",
         "--drm-connector=HDMI-A-1",
         "--fullscreen",
         "--no-terminal",
         "--no-input-terminal",
         "--no-osc",
     ]
-    if not audio:
+    if is_image:
+        cmd.append("--image-display-duration=inf")
         cmd.append("--no-audio")
     else:
-        cmd.extend(["--ao=alsa", f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0"])
+        cmd.append("--hwdec=drm-copy")
+        if not audio:
+            cmd.append("--no-audio")
+        else:
+            cmd.extend(["--ao=alsa", f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0"])
     if loop:
         cmd.append("--loop=inf")
     cmd.append(str(path))
@@ -269,10 +275,9 @@ class AgoraPlayer:
     # ── mpv subprocess management ──
 
     def _start_mpv(self, path: Path, *, loop: bool = False) -> None:
-        """Launch mpv subprocess for video playback via DRM output.
+        """Launch mpv subprocess for media playback via DRM output.
 
-        Used on Pi 4 and Pi 5 where GStreamer's kmssink cannot handle the
-        hardware decoder's tiled output format.
+        Used on Pi 4 and Pi 5 for both video and image playback.
         """
         self._quit_plymouth()
         self._stop_mpv()
@@ -525,10 +530,9 @@ class AgoraPlayer:
             is_video = splash.suffix.lower() == ".mp4"
             self._current_path = splash
             self._current_mtime = splash.stat().st_mtime
-            # Use mpv for video splash on Pi 4/5, GStreamer for images and Zero 2 W
-            if is_video and self._player_backend == "mpv":
+            # Use mpv on Pi 4/5 for both video and image splash, GStreamer on Zero 2 W
+            if self._player_backend == "mpv":
                 self._quit_plymouth()
-                self._stop_mpv()
                 cmd = _build_mpv_command(splash, audio=False, loop=True)
                 logger.info("Showing splash via mpv: %s", splash.name)
                 try:
@@ -723,20 +727,20 @@ class AgoraPlayer:
                 self._show_splash()
                 return
             self.current_desired = desired
-            self._teardown()
             self._health_retries = 0
             is_video = path.suffix.lower() == ".mp4"
             self._loops_completed = 0
 
-            # Dispatch to mpv for video on Pi 4/5, GStreamer for everything else
-            if is_video and self._player_backend == "mpv":
+            # Dispatch to mpv on Pi 4/5 (video and images), GStreamer on Zero 2 W
+            if self._player_backend == "mpv":
                 loop = bool(desired.loop)
                 # For finite loop count, let mpv handle it naturally
-                if desired.loop_count is not None and desired.loop_count > 0:
+                if is_video and desired.loop_count is not None and desired.loop_count > 0:
                     loop = False  # Don't use --loop=inf; monitor exits instead
                 self._start_mpv(path, loop=loop)
                 GLib.timeout_add_seconds(10, self._update_position)
             else:
+                self._teardown()
                 self._current_path = path
                 self._current_mtime = path.stat().st_mtime
                 self.pipeline = self._build_pipeline(path, is_video)
