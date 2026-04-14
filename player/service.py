@@ -307,18 +307,31 @@ class AgoraPlayer:
             sock.sendall(json.dumps({"command": ["loadfile", str(path), "replace"]}).encode() + b"\n")
             time.sleep(0.3)  # allow mpv to process and queue response + events
             resp = sock.recv(4096)
-            sock.close()
             # Parse response lines — look for the loadfile result, skip events
+            success = False
             for line in resp.decode().strip().split("\n"):
                 try:
                     msg = json.loads(line)
                     if "event" not in msg and msg.get("error") == "success":
-                        logger.info("mpv IPC loadfile succeeded for %s", path.name)
-                        return True
+                        success = True
+                        break
                 except json.JSONDecodeError:
                     continue
-            logger.warning("mpv IPC loadfile — no success in response: %s", resp[:200])
-            return False
+            if not success:
+                sock.close()
+                logger.warning("mpv IPC loadfile — no success in response: %s", resp[:200])
+                return False
+            # When loading an image, toggle fullscreen to force DRM plane refresh
+            if is_image:
+                time.sleep(0.2)
+                for _ in range(3):
+                    sock.sendall(json.dumps({"command": ["set_property", "fullscreen", False]}).encode() + b"\n")
+                    sock.recv(512)
+                    sock.sendall(json.dumps({"command": ["set_property", "fullscreen", True]}).encode() + b"\n")
+                    sock.recv(512)
+            sock.close()
+            logger.info("mpv IPC loadfile succeeded for %s", path.name)
+            return True
         except (OSError, json.JSONDecodeError, IndexError, KeyError) as e:
             logger.warning("mpv IPC loadfile failed: %s — will restart mpv", e)
             return False
