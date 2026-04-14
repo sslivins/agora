@@ -39,6 +39,7 @@ def _make_settings(tmp_path: Path, initial_cms_url: str = "") -> object:
         persist_dir = persist
         cms_config_path = persist / "cms_config.json"
         auth_token_path = persist / "auth_token"
+        splash_config_path = persist / "splash"
         cms_status_path = state / "cms_status.json"
         manifest_path = state / "assets.json"
         schedule_path = state / "schedule.json"
