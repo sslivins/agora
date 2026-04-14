@@ -569,23 +569,21 @@ class CMSClient:
             self._apply_timezone(tz_name)
         logger.info("SYNC step 3: timezone done")
 
-        # Evaluate schedule FIRST — writes desired.json to tmpfs, triggering
-        # the player immediately.  The splash persist write (step 5) is
-        # deferred because it hits NVMe disk and can stall for seconds during
-        # ext4 journal commits.
+        # Persist splash config BEFORE evaluate — the player reads the splash
+        # config file when desired.json triggers a splash transition (via
+        # inotify).  If we wrote desired.json first, the player could read a
+        # stale splash config and show the wrong asset.
+        await self._persist_splash(msg.get("splash"))
+        logger.info("SYNC step 4: splash persist done")
+
+        # Evaluate schedule — writes desired.json to tmpfs, triggering
+        # the player immediately via inotify.
         prev_state = self._last_eval_state
         self._evaluate_schedule(msg)
 
         # Wake the eval loop so it picks up changes immediately
         self._eval_wake.set()
-        logger.info("SYNC step 4: evaluate done, eval_wake set")
-
-        # Persist splash config for offline boot.  This writes to NVMe
-        # (/opt/agora/persist/splash) which can stall on ext4 journal
-        # commits, so we skip unchanged values and run in a thread to
-        # avoid blocking the event loop.
-        await self._persist_splash(msg.get("splash"))
-        logger.info("SYNC step 5: splash persist done")
+        logger.info("SYNC step 5: evaluate done, eval_wake set")
 
         # If the schedule evaluation changed desired state, send an immediate
         # status and enter rapid mode so the CMS dashboard picks up the
