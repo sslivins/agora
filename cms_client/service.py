@@ -891,6 +891,14 @@ class CMSClient:
 
     # ── Asset management ──
 
+    def _read_api_key(self) -> str:
+        """Read the current device API key from the persist directory."""
+        key_path = self.settings.persist_dir / "api_key"
+        try:
+            return key_path.read_text().strip()
+        except FileNotFoundError:
+            return ""
+
     async def _handle_fetch_asset(self, msg: dict, ws) -> None:
         """CMS tells us to download an asset — with budget-aware eviction."""
         asset_name = msg.get("asset_name", "")
@@ -957,7 +965,11 @@ class CMSClient:
             target_path = target_dir / asset_name
 
             async with aiohttp.ClientSession() as session:
-                async with session.get(download_url) as resp:
+                headers = {}
+                api_key = self._read_api_key()
+                if api_key:
+                    headers["X-Device-API-Key"] = api_key
+                async with session.get(download_url, headers=headers) as resp:
                     if resp.status != 200:
                         logger.error("Failed to download %s: HTTP %d", asset_name, resp.status)
                         return
