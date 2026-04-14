@@ -1,5 +1,6 @@
 """Tests for player service — pipeline selection logic."""
 
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock, call
 
@@ -1757,38 +1758,40 @@ class TestLoadfileMpv:
         assert b'"hwdec"' in sends[2]
         assert b'"no"' in sends[2]
 
-    @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_image_loadfile_triggers_fullscreen_toggle(self, mock_time, mock_socket_mod, mpv_player):
+    def test_image_loadfile_triggers_fullscreen_toggle(self, mpv_player):
         """Image loadfile should toggle fullscreen 3x for DRM plane refresh."""
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mpv_player._mpv_process = mock_proc
+        # Patch inside test body to avoid decorator/fixture ordering issues on CI
+        svc = sys.modules["player.service"]
+        with patch.object(svc, "time") as mock_time, \
+             patch.object(svc, "socket") as mock_socket_mod:
+            mock_proc = MagicMock()
+            mock_proc.poll.return_value = None
+            mpv_player._mpv_process = mock_proc
 
-        mock_sock = MagicMock()
-        mock_socket_mod.socket.return_value = mock_sock
-        mock_socket_mod.AF_UNIX = 1
-        mock_socket_mod.SOCK_STREAM = 1
-        mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # image-display-duration
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            self._make_success_response(),             # loadfile
-        ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle
+            mock_sock = MagicMock()
+            mock_socket_mod.socket.return_value = mock_sock
+            mock_socket_mod.AF_UNIX = 1
+            mock_socket_mod.SOCK_STREAM = 1
+            mock_sock.recv.side_effect = [
+                b'{"request_id":0,"error":"success"}\n',  # loop-file
+                b'{"request_id":0,"error":"success"}\n',  # image-display-duration
+                b'{"request_id":0,"error":"success"}\n',  # hwdec
+                self._make_success_response(),             # loadfile
+            ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle
 
-        result = mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
-        assert result is True
+            result = mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
+            assert result is True
 
-        sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # Filter to only fullscreen commands
-        fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
-        assert len(fullscreen_sends) == 6
-        # Alternating: false, true, false, true, false, true
-        for i, s in enumerate(fullscreen_sends):
-            if i % 2 == 0:
-                assert b"false" in s
-            else:
-                assert b"true" in s
+            sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+            # Filter to only fullscreen commands
+            fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
+            assert len(fullscreen_sends) == 6
+            # Alternating: false, true, false, true, false, true
+            for i, s in enumerate(fullscreen_sends):
+                if i % 2 == 0:
+                    assert b"false" in s
+                else:
+                    assert b"true" in s
 
     @patch("player.service.socket")
     @patch("player.service.time")
