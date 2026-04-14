@@ -74,13 +74,18 @@ def player():
 
         p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
         p.pipeline = None
+        p._mpv_process = None
         p.current_desired = None
         p._loops_completed = 0
+        p._health_retries = 0
+        p._error_retry_delay = 3
+        p._pending_error = None
         p._plymouth_quit = False
         p._current_path = None
         p._current_mtime = None
         p._board = svc.Board.ZERO_2W
         p._i2c_bus = "/dev/i2c-2"
+        p._player_backend = "gstreamer"
         yield p
 
 

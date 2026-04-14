@@ -22,6 +22,7 @@ def player():
 
         p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
         p.pipeline = None
+        p._mpv_process = None
         p.current_desired = None
         p._plymouth_quit = False
         p._current_path = None
@@ -32,6 +33,35 @@ def player():
         p._loops_completed = 0
         p._board = svc.Board.ZERO_2W
         p._i2c_bus = "/dev/i2c-2"
+        p._player_backend = "gstreamer"
+        yield p
+
+
+@pytest.fixture
+def mpv_player():
+    """Create an AgoraPlayer instance configured for mpv backend (Pi 4/5)."""
+    with patch.dict("sys.modules", {
+        "gi": MagicMock(),
+        "gi.repository": MagicMock(),
+    }):
+        import importlib
+        import player.service as svc
+        importlib.reload(svc)
+
+        p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
+        p.pipeline = None
+        p._mpv_process = None
+        p.current_desired = None
+        p._plymouth_quit = False
+        p._current_path = None
+        p._current_mtime = None
+        p._health_retries = 0
+        p._error_retry_delay = 3
+        p._pending_error = None
+        p._loops_completed = 0
+        p._board = svc.Board.PI_5
+        p._i2c_bus = "/dev/i2c-3"
+        p._player_backend = "mpv"
         yield p
 
 
@@ -1314,3 +1344,323 @@ class TestDisplayDetection:
              patch("player.service.logger") as mock_logger:
             player._update_position()
             mock_logger.warning.assert_not_called()
+
+
+# ── mpv command building ──
+
+
+class TestBuildMpvCommand:
+    def test_basic_command_with_audio(self):
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import player.service as svc
+            importlib.reload(svc)
+
+            cmd = svc._build_mpv_command(Path("/opt/agora/assets/videos/test.mp4"))
+            assert cmd[0] == "mpv"
+            assert "--vo=drm" in cmd
+            assert "--hwdec=auto" in cmd
+            assert "--drm-connector=HDMI-A-1" in cmd
+            assert "--fullscreen" in cmd
+            assert "--no-terminal" in cmd
+            assert "--no-audio" not in cmd
+            assert "--ao=alsa" in cmd
+            assert "--loop=inf" not in cmd
+            assert "test.mp4" in cmd[-1]
+
+    def test_command_without_audio(self):
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import player.service as svc
+            importlib.reload(svc)
+
+            cmd = svc._build_mpv_command(Path("/test.mp4"), audio=False)
+            assert "--no-audio" in cmd
+            assert "--ao=alsa" not in cmd
+
+    def test_command_with_loop(self):
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import player.service as svc
+            importlib.reload(svc)
+
+            cmd = svc._build_mpv_command(Path("/test.mp4"), loop=True)
+            assert "--loop=inf" in cmd
+
+
+# ── mpv player backend selection ──
+
+
+class TestMpvBackendSelection:
+    """Verify that mpv backend is used for video on Pi 4/5 and GStreamer for Zero 2W."""
+
+    def test_zero_2w_uses_gstreamer_for_video(self, player, tmp_path):
+        """Zero 2W should use GStreamer pipeline for video playback."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+
+        player.base = tmp_path
+        player.state_dir = tmp_path / "state"
+        player.state_dir.mkdir()
+        player.assets_dir = tmp_path / "assets"
+        (player.assets_dir / "videos").mkdir(parents=True)
+
+        import shutil
+        asset_video = player.assets_dir / "videos" / "test.mp4"
+        shutil.copy2(video, asset_video)
+
+        player.desired_path = player.state_dir / "desired.json"
+        player.current_path = player.state_dir / "current.json"
+        player.persist_dir = tmp_path / "persist"
+        player.persist_dir.mkdir()
+        player.splash_config_path = player.persist_dir / "splash"
+
+        desired = DesiredState(mode=PlaybackMode.PLAY, asset="test.mp4", loop=True)
+        from shared.state import write_state
+        write_state(player.desired_path, desired)
+
+        with patch.object(type(player), "_has_audio", return_value=True), \
+             patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib, \
+             patch.object(player, "_update_current"), \
+             patch.object(player, "_quit_plymouth"):
+            mock_gst.parse_launch.return_value = MagicMock()
+            player.apply_desired()
+
+            # Should have used GStreamer (parse_launch called)
+            mock_gst.parse_launch.assert_called_once()
+            assert player._mpv_process is None
+
+    def test_pi5_uses_mpv_for_video(self, mpv_player, tmp_path):
+        """Pi 5 should use mpv subprocess for video playback."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+
+        mpv_player.base = tmp_path
+        mpv_player.state_dir = tmp_path / "state"
+        mpv_player.state_dir.mkdir()
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "videos").mkdir(parents=True)
+
+        import shutil
+        asset_video = mpv_player.assets_dir / "videos" / "test.mp4"
+        shutil.copy2(video, asset_video)
+
+        mpv_player.desired_path = mpv_player.state_dir / "desired.json"
+        mpv_player.current_path = mpv_player.state_dir / "current.json"
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+
+        desired = DesiredState(mode=PlaybackMode.PLAY, asset="test.mp4", loop=True)
+        from shared.state import write_state
+        write_state(mpv_player.desired_path, desired)
+
+        with patch.object(type(mpv_player), "_has_audio", return_value=True), \
+             patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib, \
+             patch.object(mpv_player, "_start_mpv") as mock_start_mpv, \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(mpv_player, "_quit_plymouth"):
+            mpv_player.apply_desired()
+
+            # Should have used mpv (start_mpv called), NOT GStreamer
+            mock_start_mpv.assert_called_once()
+            mock_gst.parse_launch.assert_not_called()
+
+    def test_pi5_uses_gstreamer_for_images(self, mpv_player, tmp_path):
+        """Pi 5 should still use GStreamer for image playback."""
+        image = tmp_path / "test.png"
+        image.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        mpv_player.base = tmp_path
+        mpv_player.state_dir = tmp_path / "state"
+        mpv_player.state_dir.mkdir()
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "images").mkdir(parents=True)
+
+        import shutil
+        asset_image = mpv_player.assets_dir / "images" / "test.png"
+        shutil.copy2(image, asset_image)
+
+        mpv_player.desired_path = mpv_player.state_dir / "desired.json"
+        mpv_player.current_path = mpv_player.state_dir / "current.json"
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+
+        desired = DesiredState(mode=PlaybackMode.PLAY, asset="test.png")
+        from shared.state import write_state
+        write_state(mpv_player.desired_path, desired)
+
+        with patch("player.service.Gst") as mock_gst, \
+             patch("player.service.GLib") as mock_glib, \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(mpv_player, "_quit_plymouth"):
+            mock_gst.parse_launch.return_value = MagicMock()
+            mpv_player.apply_desired()
+
+            # Should have used GStreamer for image, even on Pi 5
+            mock_gst.parse_launch.assert_called_once()
+            pipeline_str = mock_gst.parse_launch.call_args[0][0]
+            assert "imagefreeze" in pipeline_str
+
+
+# ── mpv process lifecycle ──
+
+
+class TestMpvProcessLifecycle:
+    def test_stop_mpv_terminates_process(self, mpv_player):
+        """_stop_mpv should terminate the mpv subprocess."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # Still running
+        mpv_player._mpv_process = mock_proc
+
+        mpv_player._stop_mpv()
+
+        mock_proc.terminate.assert_called_once()
+        mock_proc.wait.assert_called_once()
+        assert mpv_player._mpv_process is None
+
+    def test_stop_mpv_noop_when_not_running(self, mpv_player):
+        """_stop_mpv should do nothing if no mpv process exists."""
+        mpv_player._mpv_process = None
+        mpv_player._stop_mpv()  # Should not raise
+
+    def test_stop_mpv_kills_on_timeout(self, mpv_player):
+        """If mpv doesn't respond to terminate, kill it."""
+        import subprocess as sp
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.wait.side_effect = [sp.TimeoutExpired("mpv", 5), None]
+        mpv_player._mpv_process = mock_proc
+
+        mpv_player._stop_mpv()
+
+        mock_proc.terminate.assert_called_once()
+        mock_proc.kill.assert_called_once()
+
+    def test_teardown_stops_both_mpv_and_pipeline(self, mpv_player):
+        """_teardown should stop both mpv and GStreamer if running."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+        mpv_player.pipeline = MagicMock()
+
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+            mpv_player._teardown()
+
+        mock_proc.terminate.assert_called_once()
+        assert mpv_player._mpv_process is None
+        assert mpv_player.pipeline is None
+
+    def test_monitor_mpv_continues_when_running(self, mpv_player):
+        """_monitor_mpv should return True (keep timer) when mpv is still running."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # Still running
+        mpv_player._mpv_process = mock_proc
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        result = mpv_player._monitor_mpv("test.mp4")
+        assert result is True
+
+    def test_monitor_mpv_eos_with_loop_restarts(self, mpv_player, tmp_path):
+        """When mpv exits cleanly with loop=True (infinite), restart it."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0  # Exited cleanly
+        mock_proc.stderr.read.return_value = b""
+        mpv_player._mpv_process = mock_proc
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        video = tmp_path / "videos" / "test.mp4"
+        video.parent.mkdir(parents=True)
+        video.write_bytes(b"\x00" * 100)
+        mpv_player.assets_dir = tmp_path
+
+        with patch.object(mpv_player, "_start_mpv") as mock_start:
+            result = mpv_player._monitor_mpv("test.mp4")
+
+        assert result is False
+        mock_start.assert_called_once_with(video, loop=True)
+
+    def test_monitor_mpv_eos_no_loop_shows_splash(self, mpv_player):
+        """When mpv exits cleanly with loop=False, show splash."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.stderr.read.return_value = b""
+        mpv_player._mpv_process = mock_proc
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=False
+        )
+
+        with patch.object(mpv_player, "_show_splash") as mock_splash:
+            result = mpv_player._monitor_mpv("test.mp4")
+
+        assert result is False
+        mock_splash.assert_called_once()
+
+    def test_monitor_mpv_error_shows_splash_and_retries(self, mpv_player):
+        """When mpv exits with error, show splash and schedule retry."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # Error exit
+        mock_proc.stderr.read.return_value = b"Error: could not open DRM\n"
+        mpv_player._mpv_process = mock_proc
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(mpv_player, "_show_splash") as mock_splash, \
+             patch.object(mpv_player, "_update_current") as mock_update, \
+             patch("player.service.GLib") as mock_glib:
+            result = mpv_player._monitor_mpv("test.mp4")
+
+        assert result is False
+        mock_splash.assert_called_once()
+        mock_update.assert_called_once()
+        assert "error" in mock_update.call_args[1]
+        mock_glib.timeout_add_seconds.assert_called_once()
+
+    def test_monitor_mpv_finite_loop_count(self, mpv_player):
+        """With finite loop_count, show splash after N completions."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.stderr.read.return_value = b""
+        mpv_player._mpv_process = mock_proc
+        mpv_player._loops_completed = 2  # Already done 2
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True, loop_count=3
+        )
+
+        with patch.object(mpv_player, "_show_splash") as mock_splash:
+            result = mpv_player._monitor_mpv("test.mp4")
+
+        assert result is False
+        # loops_completed incremented to 3 which equals loop_count
+        mock_splash.assert_called_once()
+
+    def test_monitor_mpv_stops_when_asset_changed(self, mpv_player):
+        """_monitor_mpv should stop if a different asset is now desired."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="other.mp4", loop=True
+        )
+
+        result = mpv_player._monitor_mpv("test.mp4")
+        assert result is False
