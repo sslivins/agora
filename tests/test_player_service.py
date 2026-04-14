@@ -1776,15 +1776,15 @@ class TestLoadfileMpv:
             self._make_success_response(),             # loadfile
         ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle
 
-        mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
+        assert result is True
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # After loadfile (index 3), should have 6 fullscreen commands (3 off + 3 on)
-        fullscreen_sends = sends[4:]  # skip loop-file, img-dur, hwdec, loadfile
+        # Filter to only fullscreen commands
+        fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
         assert len(fullscreen_sends) == 6
         # Alternating: false, true, false, true, false, true
         for i, s in enumerate(fullscreen_sends):
-            assert b'"fullscreen"' in s
             if i % 2 == 0:
                 assert b"false" in s
             else:
