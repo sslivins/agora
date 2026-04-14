@@ -1760,10 +1760,18 @@ class TestLoadfileMpv:
 
     def test_image_loadfile_triggers_fullscreen_toggle(self, mpv_player):
         """Image loadfile should toggle fullscreen 3x for DRM plane refresh."""
-        # Patch inside test body to avoid decorator/fixture ordering issues on CI
         svc = sys.modules["player.service"]
+
+        # Verify mock wiring before calling
+        method_globals = mpv_player._loadfile_mpv.__globals__
+        assert method_globals is svc.__dict__, "method __globals__ is not module dict"
+
         with patch.object(svc, "time") as mock_time, \
              patch.object(svc, "socket") as mock_socket_mod:
+
+            assert method_globals.get("socket") is mock_socket_mod, \
+                f"socket in globals is {type(method_globals.get('socket'))}"
+
             mock_proc = MagicMock()
             mock_proc.poll.return_value = None
             mpv_player._mpv_process = mock_proc
@@ -1783,6 +1791,9 @@ class TestLoadfileMpv:
             assert result is True
 
             sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+            # Diagnostic: show all sends if count is wrong
+            assert len(sends) == 10, \
+                f"Expected 10 sends (image path), got {len(sends)}: {[s[:80] for s in sends]}"
             # Filter to only fullscreen commands
             fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
             assert len(fullscreen_sends) == 6
