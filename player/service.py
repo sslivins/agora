@@ -72,7 +72,7 @@ def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) ->
     cmd = [
         "mpv",
         "--vo=drm",
-        "--hwdec=auto",
+        "--hwdec=drm-copy",
         "--drm-connector=HDMI-A-1",
         "--fullscreen",
         "--no-terminal",
