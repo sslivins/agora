@@ -1,9 +1,10 @@
-"""Agora Player Service — watches desired state and manages GStreamer pipelines."""
+"""Agora Player Service — watches desired state and manages media playback."""
 
 import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -62,27 +63,37 @@ def _build_video_pipeline_no_audio_str(board: Board) -> str:
     )
 
 
-def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) -> list[str]:
-    """Build the mpv command for video playback via DRM output.
+MPV_IPC_SOCKET = "/tmp/mpv-socket"
 
-    Used on Pi 4 and Pi 5 where GStreamer's kmssink cannot handle the
-    hardware decoder's tiled output format. mpv uses ffmpeg internally
-    with drm-copy hwdec which handles format conversion correctly.
+
+def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) -> list[str]:
+    """Build the mpv command for media playback via DRM output.
+
+    Used on Pi 4 and Pi 5 for both video and image playback.
+    For video: uses drm-copy hwdec for hardware decoding.
+    For images: uses image-display-duration=inf to hold the frame.
+    Includes IPC socket for seamless content switching via loadfile.
     """
+    is_image = path.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
     cmd = [
         "mpv",
         "--vo=drm",
-        "--hwdec=drm-copy",
         "--drm-connector=HDMI-A-1",
         "--fullscreen",
         "--no-terminal",
         "--no-input-terminal",
         "--no-osc",
+        f"--input-ipc-server={MPV_IPC_SOCKET}",
     ]
-    if not audio:
+    if is_image:
+        cmd.append("--image-display-duration=inf")
         cmd.append("--no-audio")
     else:
-        cmd.extend(["--ao=alsa", f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0"])
+        cmd.append("--hwdec=drm-copy")
+        if not audio:
+            cmd.append("--no-audio")
+        else:
+            cmd.extend(["--ao=alsa", f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0"])
     if loop:
         cmd.append("--loop=inf")
     cmd.append(str(path))
@@ -268,12 +279,82 @@ class AgoraPlayer:
 
     # ── mpv subprocess management ──
 
-    def _start_mpv(self, path: Path, *, loop: bool = False) -> None:
-        """Launch mpv subprocess for video playback via DRM output.
+    _IMAGE_EXTS = frozenset((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"))
 
-        Used on Pi 4 and Pi 5 where GStreamer's kmssink cannot handle the
-        hardware decoder's tiled output format.
+    def _loadfile_mpv(self, path: Path, *, loop: bool = False) -> bool:
+        """Switch content in a running mpv via IPC socket. Returns True on success."""
+        if self._mpv_process is None or self._mpv_process.poll() is not None:
+            return False
+        is_image = path.suffix.lower() in self._IMAGE_EXTS
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect(MPV_IPC_SOCKET)
+            # Set loop property before loading
+            loop_val = "inf" if loop else "no"
+            sock.sendall(json.dumps({"command": ["set_property", "loop-file", loop_val]}).encode() + b"\n")
+            sock.recv(512)  # read response
+            # Set image-display-duration based on content type
+            if is_image:
+                sock.sendall(json.dumps({"command": ["set_property", "image-display-duration", "inf"]}).encode() + b"\n")
+                sock.recv(512)
+                sock.sendall(json.dumps({"command": ["set_property", "hwdec", "no"]}).encode() + b"\n")
+                sock.recv(512)
+            else:
+                sock.sendall(json.dumps({"command": ["set_property", "hwdec", "drm-copy"]}).encode() + b"\n")
+                sock.recv(512)
+            # Load the new file (replace = stop current, play new)
+            sock.sendall(json.dumps({"command": ["loadfile", str(path), "replace"]}).encode() + b"\n")
+            time.sleep(0.3)  # allow mpv to process and queue response + events
+            resp = sock.recv(4096)
+            # Parse response lines — look for the loadfile result, skip events
+            success = False
+            for line in resp.decode().strip().split("\n"):
+                try:
+                    msg = json.loads(line)
+                    if "event" not in msg and msg.get("error") == "success":
+                        success = True
+                        break
+                except json.JSONDecodeError:
+                    continue
+            if not success:
+                sock.close()
+                logger.warning("mpv IPC loadfile — no success in response: %s", resp[:200])
+                return False
+            # When loading an image, toggle fullscreen to force DRM plane refresh
+            if is_image:
+                time.sleep(0.2)
+                for _ in range(3):
+                    sock.sendall(json.dumps({"command": ["set_property", "fullscreen", False]}).encode() + b"\n")
+                    sock.recv(512)
+                    sock.sendall(json.dumps({"command": ["set_property", "fullscreen", True]}).encode() + b"\n")
+                    sock.recv(512)
+            sock.close()
+            logger.info("mpv IPC loadfile succeeded for %s", path.name)
+            return True
+        except (OSError, json.JSONDecodeError, IndexError, KeyError) as e:
+            logger.warning("mpv IPC loadfile failed: %s — will restart mpv", e)
+            return False
+
+    def _start_mpv(self, path: Path, *, loop: bool = False) -> None:
+        """Launch mpv subprocess for media playback via DRM output.
+
+        Used on Pi 4 and Pi 5 for both video and image playback.
+        Tries IPC loadfile first for seamless switching; falls back to
+        full restart if IPC is unavailable.
         """
+        # Try seamless switch via IPC if mpv is already running
+        if self._loadfile_mpv(path, loop=loop):
+            self._current_path = path
+            self._current_mtime = path.stat().st_mtime
+            started = datetime.now(timezone.utc)
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=self.current_desired.asset if self.current_desired else path.name,
+                started_at=started,
+            )
+            return
+
         self._quit_plymouth()
         self._stop_mpv()
 
@@ -319,6 +400,11 @@ class AgoraPlayer:
                 self._mpv_process.kill()
                 self._mpv_process.wait(timeout=3)
         self._mpv_process = None
+        # Clean up IPC socket
+        try:
+            os.unlink(MPV_IPC_SOCKET)
+        except FileNotFoundError:
+            pass
 
     def _monitor_mpv(self, asset_name: str) -> bool:
         """Periodic check for mpv process exit. Returns False to stop timer."""
@@ -517,7 +603,6 @@ class AgoraPlayer:
 
     def _show_splash(self) -> bool:
         """Show splash screen. Returns False to cancel GLib timeout repeat."""
-        self._teardown()
         error = self._pending_error
         self._pending_error = None
         splash = self._find_splash()
@@ -525,23 +610,28 @@ class AgoraPlayer:
             is_video = splash.suffix.lower() == ".mp4"
             self._current_path = splash
             self._current_mtime = splash.stat().st_mtime
-            # Use mpv for video splash on Pi 4/5, GStreamer for images and Zero 2 W
-            if is_video and self._player_backend == "mpv":
-                self._quit_plymouth()
-                self._stop_mpv()
-                cmd = _build_mpv_command(splash, audio=False, loop=True)
-                logger.info("Showing splash via mpv: %s", splash.name)
-                try:
-                    self._mpv_process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                    )
-                except (FileNotFoundError, OSError) as e:
-                    logger.error("mpv splash failed: %s — falling back to GStreamer", e)
-                    self.pipeline = self._build_pipeline(splash, is_video)
-                    self.pipeline.set_state(Gst.State.PLAYING)
+            # Use mpv on Pi 4/5 for both video and image splash, GStreamer on Zero 2 W
+            if self._player_backend == "mpv":
+                # Try seamless IPC switch first
+                if self._loadfile_mpv(splash, loop=True):
+                    logger.info("Showing splash via mpv IPC: %s", splash.name)
+                else:
+                    self._teardown()
+                    self._quit_plymouth()
+                    cmd = _build_mpv_command(splash, audio=False, loop=True)
+                    logger.info("Showing splash via mpv: %s", splash.name)
+                    try:
+                        self._mpv_process = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                    except (FileNotFoundError, OSError) as e:
+                        logger.error("mpv splash failed: %s — falling back to GStreamer", e)
+                        self.pipeline = self._build_pipeline(splash, is_video)
+                        self.pipeline.set_state(Gst.State.PLAYING)
             else:
+                self._teardown()
                 self.pipeline = self._build_pipeline(splash, is_video)
                 self.pipeline.set_state(Gst.State.PLAYING)
             # Update desired state so _on_state_changed uses correct mode
@@ -723,20 +813,20 @@ class AgoraPlayer:
                 self._show_splash()
                 return
             self.current_desired = desired
-            self._teardown()
             self._health_retries = 0
             is_video = path.suffix.lower() == ".mp4"
             self._loops_completed = 0
 
-            # Dispatch to mpv for video on Pi 4/5, GStreamer for everything else
-            if is_video and self._player_backend == "mpv":
+            # Dispatch to mpv on Pi 4/5 (video and images), GStreamer on Zero 2 W
+            if self._player_backend == "mpv":
                 loop = bool(desired.loop)
                 # For finite loop count, let mpv handle it naturally
-                if desired.loop_count is not None and desired.loop_count > 0:
+                if is_video and desired.loop_count is not None and desired.loop_count > 0:
                     loop = False  # Don't use --loop=inf; monitor exits instead
                 self._start_mpv(path, loop=loop)
                 GLib.timeout_add_seconds(10, self._update_position)
             else:
+                self._teardown()
                 self._current_path = path
                 self._current_mtime = path.stat().st_mtime
                 self.pipeline = self._build_pipeline(path, is_video)

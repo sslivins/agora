@@ -212,6 +212,9 @@ class TestPlayerSkipRebuild:
         # Create asset directories and a test image
         (tmp_path / "assets" / "images").mkdir(parents=True, exist_ok=True)
         (tmp_path / "assets" / "images" / "test.jpg").write_bytes(b"fake")
+        # Create default splash so _find_splash() can find it
+        (tmp_path / "assets" / "splash").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "assets" / "splash" / "default.png").write_bytes(b"fake-png")
         return player, mock_gst
 
     def test_same_content_skips_rebuild(self, tmp_path):

@@ -556,28 +556,34 @@ class CMSClient:
         elif device_status:
             # pending, orphaned, etc. — keep as "pending" for the OOBE
             self._write_cms_status("connected", registration="pending")
+        logger.info("SYNC step 1: status written")
 
         try:
             atomic_write(self.settings.schedule_path, json.dumps(msg, indent=2))
         except Exception:
             logger.exception("Failed to cache schedule.json")
-
-        # Persist the CMS-assigned splash so the player uses it on reboot
-        splash = msg.get("splash")
-        try:
-            if splash:
-                atomic_write(self.settings.splash_config_path, splash)
-            elif self.settings.splash_config_path.is_file():
-                self.settings.splash_config_path.unlink()
-        except Exception:
-            logger.debug("Failed to update splash config", exc_info=True)
+        logger.info("SYNC step 2: schedule.json written")
 
         tz_name = msg.get("timezone")
         if tz_name:
             self._apply_timezone(tz_name)
+        logger.info("SYNC step 3: timezone done")
 
+        # Persist splash config BEFORE evaluate — the player reads the splash
+        # config file when desired.json triggers a splash transition (via
+        # inotify).  If we wrote desired.json first, the player could read a
+        # stale splash config and show the wrong asset.
+        await self._persist_splash(msg.get("splash"))
+        logger.info("SYNC step 4: splash persist done")
+
+        # Evaluate schedule — writes desired.json to tmpfs, triggering
+        # the player immediately via inotify.
         prev_state = self._last_eval_state
         self._evaluate_schedule(msg)
+
+        # Wake the eval loop so it picks up changes immediately
+        self._eval_wake.set()
+        logger.info("SYNC step 5: evaluate done, eval_wake set")
 
         # If the schedule evaluation changed desired state, send an immediate
         # status and enter rapid mode so the CMS dashboard picks up the
@@ -590,11 +596,42 @@ class CMSClient:
             except Exception:
                 logger.debug("Failed to send post-sync status", exc_info=True)
 
+    async def _persist_splash(self, splash: str | None) -> None:
+        """Write splash config to persistent storage in a background thread.
+
+        Skips the write when the on-disk value already matches, avoiding
+        sporadic multi-second NVMe stalls caused by ext4 journal commits.
+        When a write is needed, it runs in a thread pool executor so the
+        asyncio event loop is not blocked.
+        """
+        path = self.settings.splash_config_path
+        try:
+            if splash:
+                # Read current value — file is tiny (< 100 bytes), read is fast
+                current = ""
+                try:
+                    current = path.read_text().strip()
+                except (OSError, FileNotFoundError):
+                    pass
+                if current == splash:
+                    logger.debug("Splash unchanged (%s), skipping persist", splash)
+                    return
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, atomic_write, path, splash)
+                logger.info("Splash persisted: %r → %r", current, splash)
+            elif path.is_file():
+                path.unlink()
+                logger.info("Splash config removed")
+        except Exception:
+            logger.debug("Failed to update splash config", exc_info=True)
+
     def _evaluate_schedule(self, sync_data: dict) -> None:
         """Evaluate the cached schedule and update desired state."""
         schedules = sync_data.get("schedules", [])
         default_asset = sync_data.get("default_asset")
         tz_name = sync_data.get("timezone", "UTC")
+        logger.info("EVAL: default_asset=%s, schedules=%d, last_state=%s",
+                     default_asset, len(schedules), self._last_eval_state)
 
         # Check if the player is in an error state — if so, clear the cache
         # so we re-write desired.json and give the player another chance.
@@ -1043,7 +1080,7 @@ class CMSClient:
 
     async def _handle_config(self, msg: dict) -> None:
         if "splash" in msg and msg["splash"]:
-            atomic_write(self.settings.splash_config_path, msg["splash"])
+            await self._persist_splash(msg["splash"])
             logger.info("Splash updated to: %s", msg["splash"])
 
         if "device_name" in msg and msg["device_name"]:
