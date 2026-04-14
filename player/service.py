@@ -277,8 +277,7 @@ class AgoraPlayer:
         self._quit_plymouth()
         self._stop_mpv()
 
-        audio = self._has_audio(path)
-        cmd = _build_mpv_command(path, audio=audio, loop=loop)
+        cmd = _build_mpv_command(path, audio=True, loop=loop)
         logger.info("Starting mpv: %s", " ".join(cmd))
         try:
             self._mpv_process = subprocess.Popen(
