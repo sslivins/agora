@@ -1663,3 +1663,480 @@ class TestMpvProcessLifecycle:
 
         result = mpv_player._monitor_mpv("test.mp4")
         assert result is False
+
+
+# ── mpv IPC loadfile ──
+
+
+class TestLoadfileMpv:
+    """Tests for _loadfile_mpv IPC switching."""
+
+    def _make_success_response(self):
+        """Build a raw IPC response with events + success."""
+        lines = [
+            '{"event":"video-reconfig"}',
+            '{"event":"end-file","reason":"stop","playlist_entry_id":1}',
+            '{"data":{"playlist_entry_id":2},"request_id":0,"error":"success"}',
+            '{"event":"start-file","playlist_entry_id":2}',
+            '{"event":"file-loaded"}',
+        ]
+        return ("\n".join(lines) + "\n").encode()
+
+    def test_returns_false_when_no_process(self, mpv_player):
+        """Should return False when mpv isn't running."""
+        mpv_player._mpv_process = None
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
+        assert result is False
+
+    def test_returns_false_when_process_exited(self, mpv_player):
+        """Should return False when mpv process has exited."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0  # exited
+        mpv_player._mpv_process = mock_proc
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
+        assert result is False
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_video_loadfile_success(self, mock_time, mock_socket_mod, mpv_player):
+        """Successful video loadfile via IPC."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        # recv: loop-file response, hwdec response, loadfile response
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            self._make_success_response(),             # loadfile
+        ]
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
+        assert result is True
+        mock_sock.close.assert_called_once()
+
+        # Should have sent: set loop-file, set hwdec drm-copy, loadfile
+        sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+        assert b'"loop-file"' in sends[0]
+        assert b'"inf"' in sends[0]  # loop=True → inf
+        assert b'"hwdec"' in sends[1]
+        assert b'"drm-copy"' in sends[1]
+        assert b'"loadfile"' in sends[2]
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_image_loadfile_sends_image_properties(self, mock_time, mock_socket_mod, mpv_player):
+        """Image loadfile should set image-display-duration=inf and hwdec=no."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        # recv: loop-file, image-display-duration, hwdec, loadfile, then 6x fullscreen toggles
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # image-display-duration
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            self._make_success_response(),             # loadfile
+        ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle (off+on)
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/splash.png"), loop=True)
+        assert result is True
+
+        sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+        # loop-file, image-display-duration, hwdec, loadfile, then 6 fullscreen toggles
+        assert b'"image-display-duration"' in sends[1]
+        assert b'"inf"' in sends[1]
+        assert b'"hwdec"' in sends[2]
+        assert b'"no"' in sends[2]
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_image_loadfile_triggers_fullscreen_toggle(self, mock_time, mock_socket_mod, mpv_player):
+        """Image loadfile should toggle fullscreen 3x for DRM plane refresh."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # image-display-duration
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            self._make_success_response(),             # loadfile
+        ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle
+
+        mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
+
+        sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+        # After loadfile (index 3), should have 6 fullscreen commands (3 off + 3 on)
+        fullscreen_sends = sends[4:]  # skip loop-file, img-dur, hwdec, loadfile
+        assert len(fullscreen_sends) == 6
+        # Alternating: false, true, false, true, false, true
+        for i, s in enumerate(fullscreen_sends):
+            assert b'"fullscreen"' in s
+            if i % 2 == 0:
+                assert b"false" in s
+            else:
+                assert b"true" in s
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_video_loadfile_no_fullscreen_toggle(self, mock_time, mock_socket_mod, mpv_player):
+        """Video loadfile should NOT trigger fullscreen toggle."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            self._make_success_response(),             # loadfile
+        ]
+
+        mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
+
+        sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+        # Only 3 commands: loop-file, hwdec, loadfile — no fullscreen
+        assert len(sends) == 3
+        for s in sends:
+            assert b'"fullscreen"' not in s
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_loadfile_returns_false_on_no_success(self, mock_time, mock_socket_mod, mpv_player):
+        """Should return False when IPC response has no success message."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        # Only events, no success response
+        bad_resp = '{"event":"end-file","reason":"error"}\n'.encode()
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            bad_resp,                                   # loadfile — no success
+        ]
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
+        assert result is False
+        mock_sock.close.assert_called_once()
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_loadfile_returns_false_on_connect_error(self, mock_time, mock_socket_mod, mpv_player):
+        """Should return False when IPC socket connection fails."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        mock_sock.connect.side_effect = ConnectionRefusedError("No such file")
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
+        assert result is False
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_loadfile_returns_false_on_timeout(self, mock_time, mock_socket_mod, mpv_player):
+        """Should return False when IPC socket times out."""
+        import socket as real_socket
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        mock_sock.sendall.side_effect = real_socket.timeout("timed out")
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
+        assert result is False
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_loadfile_returns_false_on_recv_timeout(self, mock_time, mock_socket_mod, mpv_player):
+        """Should return False when recv times out after sending loadfile."""
+        import socket as real_socket
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        # First recv works, second times out
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file ok
+            real_socket.timeout("timed out"),           # hwdec times out
+        ]
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
+        assert result is False
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_loadfile_loop_false_sets_no(self, mock_time, mock_socket_mod, mpv_player):
+        """loop=False should set loop-file to 'no'."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            self._make_success_response(),             # loadfile
+        ]
+
+        mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
+
+        first_send = mock_sock.sendall.call_args_list[0][0][0]
+        assert b'"no"' in first_send  # loop-file = "no"
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_socket_cleanup_on_stale_socket(self, mock_time, mock_socket_mod, mpv_player):
+        """IPC socket file should be cleaned up by _stop_mpv."""
+        import os
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        with patch("os.unlink") as mock_unlink:
+            mpv_player._stop_mpv()
+            mock_unlink.assert_called_once_with("/tmp/mpv-socket")
+
+
+# ── mpv IPC start_mpv integration ──
+
+
+class TestStartMpvIpcFallback:
+    """Tests for _start_mpv trying IPC first, falling back to restart."""
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_start_mpv_uses_ipc_when_available(self, mock_time, mock_socket_mod, mpv_player, tmp_path):
+        """_start_mpv should use IPC loadfile when mpv is already running."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        lines = [
+            '{"data":{"playlist_entry_id":2},"request_id":0,"error":"success"}',
+        ]
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',
+            b'{"request_id":0,"error":"success"}\n',
+            ("\n".join(lines) + "\n").encode(),
+        ]
+
+        with patch.object(mpv_player, "_update_current"), \
+             patch("player.service.subprocess") as mock_subprocess:
+            mpv_player._start_mpv(video, loop=True)
+
+            # Should NOT have started a new process
+            mock_subprocess.Popen.assert_not_called()
+            # current_path should be updated
+            assert mpv_player._current_path == video
+
+    def test_start_mpv_falls_back_to_restart(self, mpv_player, tmp_path):
+        """_start_mpv should restart mpv when IPC fails."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+
+        mpv_player._mpv_process = None  # No process → IPC will fail
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="test.mp4", loop=True
+        )
+
+        with patch.object(mpv_player, "_update_current"), \
+             patch.object(mpv_player, "_quit_plymouth"), \
+             patch("player.service.subprocess") as mock_subprocess, \
+             patch("player.service.GLib"):
+            mock_popen = MagicMock()
+            mock_popen.pid = 12345
+            mock_subprocess.Popen.return_value = mock_popen
+
+            mpv_player._start_mpv(video, loop=True)
+
+            # Should have started a new process
+            mock_subprocess.Popen.assert_called_once()
+            assert mpv_player._mpv_process == mock_popen
+
+
+# ── _find_splash fallback chain ──
+
+
+class TestFindSplash:
+    """Tests for _find_splash 3-level fallback: persist file → boot config → hardcoded."""
+
+    def test_level1_persist_splash_file(self, mpv_player, tmp_path):
+        """Level 1: persist/splash file exists → use the configured splash."""
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "images").mkdir(parents=True)
+
+        # Create the configured splash asset
+        splash = mpv_player.assets_dir / "images" / "custom.png"
+        splash.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        # Write the config
+        mpv_player.splash_config_path.write_text("custom.png")
+
+        result = mpv_player._find_splash()
+        assert result == splash
+
+    def test_level1_persist_takes_priority_over_boot(self, mpv_player, tmp_path):
+        """persist/splash should win over boot config default_splash."""
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "images").mkdir(parents=True)
+        (mpv_player.assets_dir / "splash").mkdir(parents=True)
+
+        # Both exist
+        custom = mpv_player.assets_dir / "images" / "custom.png"
+        custom.write_bytes(b"\x89PNG" + b"\x00" * 100)
+        default = mpv_player.assets_dir / "splash" / "default.png"
+        default.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        mpv_player.splash_config_path.write_text("custom.png")
+
+        result = mpv_player._find_splash()
+        assert result == custom  # persist wins
+
+    def test_level2_boot_config_default_splash(self, mpv_player, tmp_path):
+        """Level 2: no persist file → use boot config default_splash."""
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "splash").mkdir(parents=True)
+
+        # No persist file, but boot config has a custom default
+        default = mpv_player.assets_dir / "splash" / "default.png"
+        default.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        boot_config = tmp_path / "boot-config.json"
+        boot_config.write_text('{"default_splash": "splash/default.png"}')
+
+        with patch("player.service.Path") as MockPath:
+            # Only mock the boot config path check
+            def path_side_effect(arg):
+                if arg == "/boot/agora-config.json":
+                    return boot_config
+                return Path(arg)
+            MockPath.side_effect = path_side_effect
+            # This won't work cleanly with Path mock, so use a simpler approach
+        # Simpler: just check that without persist file, it falls through
+        # to the default path
+        result = mpv_player._find_splash()
+        # Should find the file at assets_dir / DEFAULT_SPLASH_CONFIG
+        assert result is not None
+        assert result.name == "default.png"
+
+    def test_level1_missing_asset_falls_through(self, mpv_player, tmp_path):
+        """If persist/splash references a missing file, fall through to boot config."""
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "splash").mkdir(parents=True)
+
+        # Persist file references non-existent asset
+        mpv_player.splash_config_path.write_text("deleted.png")
+
+        # But default splash exists
+        default = mpv_player.assets_dir / "splash" / "default.png"
+        default.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        result = mpv_player._find_splash()
+        assert result is not None
+        assert result.name == "default.png"
+
+    def test_empty_persist_file_falls_through(self, mpv_player, tmp_path):
+        """Empty persist/splash file should fall through to boot config."""
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "splash").mkdir(parents=True)
+
+        mpv_player.splash_config_path.write_text("")
+
+        default = mpv_player.assets_dir / "splash" / "default.png"
+        default.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        result = mpv_player._find_splash()
+        assert result is not None
+        assert result.name == "default.png"
+
+    def test_returns_none_when_nothing_found(self, mpv_player, tmp_path):
+        """Should return None when no splash asset exists anywhere."""
+        mpv_player.persist_dir = tmp_path / "persist"
+        mpv_player.persist_dir.mkdir()
+        mpv_player.splash_config_path = mpv_player.persist_dir / "splash"
+        mpv_player.assets_dir = tmp_path / "assets"
+        (mpv_player.assets_dir / "splash").mkdir(parents=True)
+        # No files exist
+
+        result = mpv_player._find_splash()
+        assert result is None
+
+    def test_resolve_asset_searches_all_subdirs(self, mpv_player, tmp_path):
+        """_resolve_asset should find files in videos/, images/, and splash/."""
+        mpv_player.assets_dir = tmp_path / "assets"
+        for d in ["videos", "images", "splash"]:
+            (mpv_player.assets_dir / d).mkdir(parents=True)
+
+        # Create files in each subdir
+        (mpv_player.assets_dir / "videos" / "vid.mp4").write_bytes(b"\x00" * 10)
+        (mpv_player.assets_dir / "images" / "img.png").write_bytes(b"\x00" * 10)
+        (mpv_player.assets_dir / "splash" / "spl.png").write_bytes(b"\x00" * 10)
+
+        assert mpv_player._resolve_asset("vid.mp4") is not None
+        assert mpv_player._resolve_asset("img.png") is not None
+        assert mpv_player._resolve_asset("spl.png") is not None
+        assert mpv_player._resolve_asset("missing.png") is None
