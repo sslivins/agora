@@ -669,6 +669,39 @@ class CMSClient:
             new_schedule_id = winner.get("id")
             new_schedule_name = winner.get("name", "")
 
+            # Webpage schedule — render URL via Cage+Chromium, no file on disk
+            if winner.get("asset_type") == "webpage" and winner.get("url"):
+                url = winner["url"]
+                state_key = ("webpage", url)
+                if self._last_eval_state == state_key:
+                    return
+
+                self._end_current_playback()
+
+                desired = DesiredState(
+                    mode=PlaybackMode.PLAY,
+                    asset=url,
+                    url=url,
+                    loop=False,
+                    loop_count=None,
+                )
+                write_state(self.settings.desired_state_path, desired)
+                self._last_eval_state = state_key
+
+                self._current_schedule_id = new_schedule_id
+                self._current_schedule_name = new_schedule_name
+                self._current_asset = url
+                if new_schedule_id:
+                    self._send_playback_event(
+                        "playback_started", new_schedule_id, new_schedule_name, url,
+                    )
+
+                logger.info(
+                    "Schedule: rendering webpage %s (priority %d)",
+                    url, winner.get("priority", 0),
+                )
+                return
+
             if not self.asset_manager.has_asset(asset, checksum):
                 # Asset not on device yet — request fetch and show splash
                 logger.info(

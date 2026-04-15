@@ -142,6 +142,7 @@ class AgoraPlayer:
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self._mpv_process: Optional[subprocess.Popen] = None
+        self._cage_process: Optional[subprocess.Popen] = None
         self.loop = GLib.MainLoop()
         self.current_desired: Optional[DesiredState] = None
         self._current_path: Optional[Path] = None  # file being played
@@ -238,6 +239,7 @@ class AgoraPlayer:
 
     def _teardown(self) -> None:
         self._stop_mpv()
+        self._stop_cage()
         if self.pipeline:
             bus = self.pipeline.get_bus()
             if bus:
@@ -250,6 +252,62 @@ class AgoraPlayer:
             self.pipeline = None
         self._current_path = None
         self._current_mtime = None
+
+    # ── Cage+Chromium (webpage rendering) ──
+
+    def _start_cage(self, url: str) -> None:
+        """Launch Cage + Chromium in kiosk mode to render a URL."""
+        self._stop_cage()
+        self._teardown()  # Stop any mpv/gstreamer pipeline
+
+        env = os.environ.copy()
+        env["XDG_RUNTIME_DIR"] = "/tmp/cage-run"
+        os.makedirs("/tmp/cage-run", exist_ok=True)
+
+        cmd = [
+            "cage", "-d", "--",
+            "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
+            "--disable-translate", "--disable-infobars", "--incognito",
+            "--hide-scrollbars", "--autoplay-policy=no-user-gesture-required",
+            url,
+        ]
+
+        logger.info("Starting Cage+Chromium for URL: %s", url)
+        try:
+            self._cage_process = subprocess.Popen(
+                cmd, env=env,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._current_path = None
+            self._current_mtime = None
+            self._update_current(mode=PlaybackMode.PLAY, asset=url)
+        except Exception as e:
+            logger.error("Failed to start Cage+Chromium: %s", e)
+            self._update_current(error=f"Cage startup failed: {e}")
+            self._show_splash()
+
+    def _stop_cage(self) -> None:
+        """Stop Cage+Chromium process if running."""
+        proc = getattr(self, '_cage_process', None)
+        if proc and proc.poll() is None:
+            logger.info("Stopping Cage+Chromium (PID %d)", proc.pid)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+        self._cage_process = None
 
     def _build_pipeline(self, path: Path, is_video: bool) -> Gst.Pipeline:
         # Quit Plymouth before GStreamer claims the DRM device
@@ -603,6 +661,7 @@ class AgoraPlayer:
 
     def _show_splash(self) -> bool:
         """Show splash screen. Returns False to cancel GLib timeout repeat."""
+        self._stop_cage()
         error = self._pending_error
         self._pending_error = None
         splash = self._find_splash()
@@ -754,6 +813,7 @@ class AgoraPlayer:
         is_active = (
             self.pipeline
             or (self._mpv_process and self._mpv_process.poll() is None)
+            or (self._cage_process and self._cage_process.poll() is None)
         )
         if is_active and self._current_path and desired.asset:
             new_path = self._resolve_asset(desired.asset)
@@ -783,6 +843,18 @@ class AgoraPlayer:
         if desired.mode == PlaybackMode.SPLASH:
             self.current_desired = desired
             self._show_splash()
+            return
+
+        if desired.mode == PlaybackMode.PLAY and desired.url:
+            # Webpage rendering via Cage+Chromium
+            cage_proc = getattr(self, '_cage_process', None)
+            if cage_proc and cage_proc.poll() is None:
+                if self.current_desired and self.current_desired.url == desired.url:
+                    logger.info("Same webpage already rendering (%s), skipping", desired.url)
+                    self.current_desired = desired
+                    return
+            self.current_desired = desired
+            self._start_cage(desired.url)
             return
 
         if desired.mode == PlaybackMode.PLAY and desired.asset:
