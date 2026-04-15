@@ -92,6 +92,38 @@ if command -v plymouth-set-default-theme &>/dev/null; then
     plymouth-set-default-theme splash 2>/dev/null || true
 fi
 
+# ── Transparent cursor for Cage (webpage rendering) ──
+# Cage uses Adwaita cursors via wlroots and ignores XCURSOR_THEME env vars.
+# The only reliable way to hide the cursor is to overwrite the Adwaita cursor
+# files with transparent ones generated via xcursorgen.
+ADWAITA_DIR="/usr/share/icons/Adwaita/cursors"
+if [ -d "${ADWAITA_DIR}" ] && command -v xcursorgen &>/dev/null; then
+    CURSOR_TMP=$(mktemp -d)
+    # Create a 1x1 transparent PNG (minimal valid PNG, base64-encoded)
+    echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAB" \
+         "NjN8GgAAAABJRU5ErkJggg==" | tr -d ' ' | base64 -d > "${CURSOR_TMP}/blank.png"
+    echo "1 0 0 ${CURSOR_TMP}/blank.png" > "${CURSOR_TMP}/blank.cursor"
+    BLANK_XCURSOR="${CURSOR_TMP}/blank_xcursor"
+    if xcursorgen "${CURSOR_TMP}/blank.cursor" "${BLANK_XCURSOR}" 2>/dev/null; then
+        # Back up originals (only once)
+        if [ ! -f "${ADWAITA_DIR}/.agora-backup-done" ]; then
+            cp -a "${ADWAITA_DIR}" "${ADWAITA_DIR}.bak" 2>/dev/null || true
+            touch "${ADWAITA_DIR}/.agora-backup-done"
+        fi
+        # Overwrite all cursor files with the transparent one
+        for cursor_file in "${ADWAITA_DIR}"/*; do
+            [ -f "${cursor_file}" ] && [ "$(basename "${cursor_file}")" != ".agora-backup-done" ] && \
+                cp "${BLANK_XCURSOR}" "${cursor_file}"
+        done
+        echo "Agora: installed transparent cursors for Cage/Wayland kiosk mode"
+    else
+        echo "Agora: warning — xcursorgen failed, Cage cursor will be visible"
+    fi
+    rm -rf "${CURSOR_TMP}"
+elif [ -d "${ADWAITA_DIR}" ]; then
+    echo "Agora: warning — xcursorgen not found (install x11-apps), Cage cursor will be visible"
+fi
+
 # ── Kernel command line: quiet boot + splash ──
 CMDLINE="/boot/firmware/cmdline.txt"
 if [ -f "${CMDLINE}" ]; then

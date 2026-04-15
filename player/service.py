@@ -282,6 +282,8 @@ class AgoraPlayer:
             self._current_path = None
             self._current_mtime = None
             self._update_current(mode=PlaybackMode.PLAY, asset=url)
+            # Schedule periodic monitoring to detect Cage/Chromium crashes
+            GLib.timeout_add_seconds(3, self._monitor_cage, url)
         except Exception as e:
             logger.error("Failed to start Cage+Chromium: %s", e)
             self._update_current(error=f"Cage startup failed: {e}")
@@ -289,7 +291,7 @@ class AgoraPlayer:
 
     def _stop_cage(self) -> None:
         """Stop Cage+Chromium process if running."""
-        proc = getattr(self, '_cage_process', None)
+        proc = self._cage_process
         if proc and proc.poll() is None:
             logger.info("Stopping Cage+Chromium (PID %d)", proc.pid)
             try:
@@ -308,6 +310,40 @@ class AgoraPlayer:
                 except subprocess.TimeoutExpired:
                     pass
         self._cage_process = None
+
+    def _monitor_cage(self, url: str) -> bool:
+        """Periodic check for Cage process exit. Returns False to stop timer."""
+        if self._cage_process is None:
+            return False
+
+        # Stop monitoring if desired state no longer wants this URL
+        if (
+            not self.current_desired
+            or self.current_desired.url != url
+            or self.current_desired.mode != PlaybackMode.PLAY
+        ):
+            return False
+
+        retcode = self._cage_process.poll()
+        if retcode is None:
+            # Still running
+            return True
+
+        # Cage exited unexpectedly
+        self._cage_process = None
+        error_msg = f"Cage exited unexpectedly (code {retcode})"
+        logger.error("Cage crashed for %s: %s", url, error_msg)
+        self._update_current(error=error_msg)
+
+        # Retry with exponential backoff (same pattern as mpv)
+        delay = self._error_retry_delay
+        self._error_retry_delay = min(
+            self._error_retry_delay * 2, self._RETRY_DELAY_MAX,
+        )
+        self._pending_error = error_msg
+        self._show_splash()
+        GLib.timeout_add_seconds(delay, self._retry_desired)
+        return False
 
     def _build_pipeline(self, path: Path, is_video: bool) -> Gst.Pipeline:
         # Quit Plymouth before GStreamer claims the DRM device
@@ -732,7 +768,9 @@ class AgoraPlayer:
         started_at: Optional[datetime] = None,
     ) -> None:
         pipeline_state = "NULL"
-        if self._mpv_process and self._mpv_process.poll() is None:
+        if self._cage_process and self._cage_process.poll() is None:
+            pipeline_state = "PLAYING"
+        elif self._mpv_process and self._mpv_process.poll() is None:
             pipeline_state = "PLAYING"
         elif self.pipeline:
             try:
@@ -760,6 +798,7 @@ class AgoraPlayer:
         is_active = (
             self.pipeline
             or (self._mpv_process and self._mpv_process.poll() is None)
+            or (self._cage_process and self._cage_process.poll() is None)
         )
         if (
             not is_active
@@ -847,12 +886,14 @@ class AgoraPlayer:
 
         if desired.mode == PlaybackMode.PLAY and desired.url:
             # Webpage rendering via Cage+Chromium
-            cage_proc = getattr(self, '_cage_process', None)
+            cage_proc = self._cage_process
             if cage_proc and cage_proc.poll() is None:
+                # Cage is still running — skip if same URL
                 if self.current_desired and self.current_desired.url == desired.url:
                     logger.info("Same webpage already rendering (%s), skipping", desired.url)
                     self.current_desired = desired
                     return
+            # Cage not running or different URL — (re)start
             self.current_desired = desired
             self._start_cage(desired.url)
             return

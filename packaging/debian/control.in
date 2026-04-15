@@ -26,7 +26,8 @@ Depends: python3 (>= 3.11),
  mpv,
  cage,
  chromium
-Recommends: gstreamer1.0-v4l2
+Recommends: gstreamer1.0-v4l2,
+ x11-apps
 Maintainer: sslivins
 Description: Agora media playback system for Raspberry Pi
  Agora plays video and images on a TV via HDMI, with content uploaded

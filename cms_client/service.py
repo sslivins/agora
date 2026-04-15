@@ -672,6 +672,17 @@ class CMSClient:
             # Webpage schedule — render URL via Cage+Chromium, no file on disk
             if winner.get("asset_type") == "webpage" and winner.get("url"):
                 url = winner["url"]
+
+                # Validate URL scheme — only allow http/https
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                if parsed.scheme not in ("http", "https"):
+                    logger.warning(
+                        "Schedule: ignoring webpage with invalid URL scheme %r: %s",
+                        parsed.scheme, url,
+                    )
+                    return
+
                 state_key = ("webpage", url)
                 if self._last_eval_state == state_key:
                     return
