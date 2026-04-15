@@ -682,6 +682,14 @@ class CMSClient:
                         parsed.scheme, url,
                     )
                     return
+                # Block loopback/internal addresses (SSRF protection)
+                hostname = parsed.hostname or ""
+                if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or hostname.endswith(".local"):
+                    logger.warning(
+                        "Schedule: ignoring webpage with blocked hostname %r: %s",
+                        hostname, url,
+                    )
+                    return
 
                 state_key = ("webpage", url)
                 if self._last_eval_state == state_key:
