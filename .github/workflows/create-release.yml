@@ -34,9 +34,16 @@ jobs:
       - name: Read version from source
         id: version
         run: |
-          version=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
+          base_version=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
+          if [ "${{ steps.check-branch.outputs.is-main }}" = "true" ]; then
+            version="$base_version"
+          else
+            # Append ~rc.<short-sha> so dpkg treats it as lower than the release version
+            short_sha=$(git rev-parse --short=7 HEAD)
+            version="${base_version}~rc.g${short_sha}"
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v${base_version}" >> "$GITHUB_OUTPUT"
           echo "Detected version: $version"
 
       - name: Check tag does not already exist
