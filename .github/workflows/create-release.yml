@@ -1,4 +1,4 @@
-name: Create Release
+name: Build & Release
 
 on:
   workflow_dispatch:
@@ -9,14 +9,27 @@ permissions:
   id-token: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      is-main: ${{ steps.check-branch.outputs.is-main }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Determine branch context
+        id: check-branch
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "is-main=true" >> "$GITHUB_OUTPUT"
+            echo "🚀 Main branch — will create release"
+          else
+            echo "is-main=false" >> "$GITHUB_OUTPUT"
+            echo "🔧 Feature branch — will build artifact only"
+          fi
 
       - name: Read version from source
         id: version
@@ -27,23 +40,33 @@ jobs:
           echo "Detected version: $version"
 
       - name: Check tag does not already exist
+        if: steps.check-branch.outputs.is-main == 'true'
         run: |
           if git rev-parse "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
             echo "::error::Tag ${{ steps.version.outputs.tag }} already exists. Bump the version in api/__init__.py first."
             exit 1
           fi
 
+      - name: Build .deb package
+        run: bash packaging/build-deb.sh "${{ steps.version.outputs.version }}"
+
+      - name: Upload .deb as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agora-${{ steps.version.outputs.version }}-deb
+          path: build/*.deb
+          retention-days: 30
+
       - name: Create and push tag
+        if: steps.check-branch.outputs.is-main == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
-      - name: Build .deb package
-        run: bash packaging/build-deb.sh "${{ steps.version.outputs.version }}"
-
       - name: Generate changelog
+        if: steps.check-branch.outputs.is-main == 'true'
         id: changelog
         run: |
           TAG="${{ steps.version.outputs.tag }}"
@@ -136,6 +159,7 @@ jobs:
           cat /tmp/release_body.md
 
       - name: Create GitHub Release
+        if: steps.check-branch.outputs.is-main == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -144,7 +168,8 @@ jobs:
           files: build/*.deb
 
   publish-apt:
-    needs: release
+    needs: build
+    if: needs.build.outputs.is-main == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -167,7 +192,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p pool
-          gh release download "${{ needs.release.outputs.tag }}" --pattern "*.deb" --dir pool/ --clobber
+          gh release download "${{ needs.build.outputs.tag }}" --pattern "*.deb" --dir pool/ --clobber
 
       - name: Generate APT repository metadata
         run: |
@@ -196,5 +221,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Update apt repo: ${{ needs.release.outputs.tag }}"
+          git commit -m "Update apt repo: ${{ needs.build.outputs.tag }}"
           git push origin gh-pages
