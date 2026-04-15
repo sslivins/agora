@@ -669,6 +669,76 @@ class CMSClient:
             new_schedule_id = winner.get("id")
             new_schedule_name = winner.get("name", "")
 
+            # Webpage schedule — render URL via Cage+Chromium, no file on disk
+            if winner.get("asset_type") == "webpage" and winner.get("url"):
+                url = winner["url"]
+
+                # Validate URL scheme — only allow http/https
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                if parsed.scheme not in ("http", "https"):
+                    logger.warning(
+                        "Schedule: ignoring webpage with invalid URL scheme %r: %s",
+                        parsed.scheme, url,
+                    )
+                    return
+                # Block loopback/internal addresses (SSRF protection)
+                hostname = parsed.hostname or ""
+                if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or hostname.endswith(".local"):
+                    logger.warning(
+                        "Schedule: ignoring webpage with blocked hostname %r: %s",
+                        hostname, url,
+                    )
+                    return
+                # Block URLs pointing to this device's own IP addresses
+                try:
+                    import socket
+                    resolved = socket.gethostbyname(hostname)
+                    local_ips = {
+                        addr[4][0]
+                        for info in socket.getaddrinfo(socket.gethostname(), None)
+                        for addr in [info]
+                    }
+                    local_ips.update(("127.0.0.1", "::1", "0.0.0.0"))
+                    if resolved in local_ips:
+                        logger.warning(
+                            "Schedule: ignoring webpage pointing to this device's IP %s: %s",
+                            resolved, url,
+                        )
+                        return
+                except OSError:
+                    pass  # DNS resolution failed — let Chromium handle the error
+
+                state_key = ("webpage", url)
+                if self._last_eval_state == state_key:
+                    return
+
+                self._end_current_playback()
+
+                desired = DesiredState(
+                    mode=PlaybackMode.PLAY,
+                    asset=url,
+                    url=url,
+                    loop=False,
+                    loop_count=None,
+                )
+                write_state(self.settings.desired_state_path, desired)
+                self._last_eval_state = state_key
+
+                self._current_schedule_id = new_schedule_id
+                self._current_schedule_name = new_schedule_name
+                self._current_asset = url
+                if new_schedule_id:
+                    self._send_playback_event(
+                        "playback_started", new_schedule_id, new_schedule_name, url,
+                    )
+
+                logger.info(
+                    "Schedule: rendering webpage %s (priority %d)",
+                    url, winner.get("priority", 0),
+                )
+                return
+
             if not self.asset_manager.has_asset(asset, checksum):
                 # Asset not on device yet — request fetch and show splash
                 logger.info(
@@ -778,10 +848,12 @@ class CMSClient:
         """Fire-and-forget a playback_started or playback_ended event."""
         ws = self._ws
         if not ws:
+            logger.warning("Cannot send %s — no WebSocket connection", event_type)
             return
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
+            logger.warning("Cannot send %s — no event loop", event_type)
             return
         msg = json.dumps({
             "type": event_type,
@@ -792,7 +864,15 @@ class CMSClient:
             "asset": asset,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
-        loop.create_task(ws.send(msg))
+        logger.info("Sending %s for schedule %s (%s)", event_type, schedule_name, asset)
+
+        async def _send():
+            try:
+                await ws.send(msg)
+            except Exception:
+                logger.exception("Failed to send %s event", event_type)
+
+        loop.create_task(_send())
 
     async def _schedule_eval_loop(self) -> None:
         """Local schedule evaluator — re-evaluates on timer or when woken early."""

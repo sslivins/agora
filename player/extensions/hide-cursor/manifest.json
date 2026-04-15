@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Hide Cursor",
+  "version": "1.0",
+  "description": "Hides the mouse cursor for kiosk/signage mode",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "css": ["hide-cursor.css"],
+      "run_at": "document_start"
+    }
+  ]
+}
