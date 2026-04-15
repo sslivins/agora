@@ -822,10 +822,12 @@ class CMSClient:
         """Fire-and-forget a playback_started or playback_ended event."""
         ws = self._ws
         if not ws:
+            logger.warning("Cannot send %s — no WebSocket connection", event_type)
             return
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
+            logger.warning("Cannot send %s — no event loop", event_type)
             return
         msg = json.dumps({
             "type": event_type,
@@ -836,7 +838,15 @@ class CMSClient:
             "asset": asset,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
-        loop.create_task(ws.send(msg))
+        logger.info("Sending %s for schedule %s (%s)", event_type, schedule_name, asset)
+
+        async def _send():
+            try:
+                await ws.send(msg)
+            except Exception:
+                logger.exception("Failed to send %s event", event_type)
+
+        loop.create_task(_send())
 
     async def _schedule_eval_loop(self) -> None:
         """Local schedule evaluator — re-evaluates on timer or when woken early."""
