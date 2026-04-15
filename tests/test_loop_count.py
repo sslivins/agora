@@ -75,6 +75,7 @@ def player():
         p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
         p.pipeline = None
         p._mpv_process = None
+        p._cage_process = None
         p.current_desired = None
         p._loops_completed = 0
         p._health_retries = 0
