@@ -269,6 +269,7 @@ class AgoraPlayer:
             "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
             "--disable-translate", "--disable-infobars", "--incognito",
             "--hide-scrollbars", "--autoplay-policy=no-user-gesture-required",
+            "--load-extension=/opt/agora/src/player/extensions/hide-cursor",
             url,
         ]
 

@@ -25,8 +25,7 @@ Depends: python3 (>= 3.11),
  avahi-daemon,
  mpv,
  cage,
- chromium,
- x11-apps
+ chromium
 Recommends: gstreamer1.0-v4l2
 Maintainer: sslivins
 Description: Agora media playback system for Raspberry Pi
