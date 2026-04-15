@@ -690,6 +690,24 @@ class CMSClient:
                         hostname, url,
                     )
                     return
+                # Block URLs pointing to this device's own IP addresses
+                try:
+                    import socket
+                    resolved = socket.gethostbyname(hostname)
+                    local_ips = {
+                        addr[4][0]
+                        for info in socket.getaddrinfo(socket.gethostname(), None)
+                        for addr in [info]
+                    }
+                    local_ips.update(("127.0.0.1", "::1", "0.0.0.0"))
+                    if resolved in local_ips:
+                        logger.warning(
+                            "Schedule: ignoring webpage pointing to this device's IP %s: %s",
+                            resolved, url,
+                        )
+                        return
+                except OSError:
+                    pass  # DNS resolution failed — let Chromium handle the error
 
                 state_key = ("webpage", url)
                 if self._last_eval_state == state_key:
