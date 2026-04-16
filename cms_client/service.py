@@ -739,6 +739,77 @@ class CMSClient:
                 )
                 return
 
+            # Stream schedule — play URL directly via mpv (HLS, DASH, RTMP, etc.)
+            if winner.get("asset_type") == "stream" and winner.get("url"):
+                url = winner["url"]
+
+                # Validate URL scheme — allow streaming protocols
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                if parsed.scheme not in ("http", "https", "rtmp", "rtmps", "rtsp", "rtsps", "mms", "mmsh"):
+                    logger.warning(
+                        "Schedule: ignoring stream with invalid URL scheme %r: %s",
+                        parsed.scheme, url,
+                    )
+                    return
+                # Block loopback/internal addresses (SSRF protection)
+                hostname = parsed.hostname or ""
+                if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or hostname.endswith(".local"):
+                    logger.warning(
+                        "Schedule: ignoring stream with blocked hostname %r: %s",
+                        hostname, url,
+                    )
+                    return
+                # Block URLs pointing to this device's own IP addresses
+                try:
+                    import socket
+                    resolved = socket.gethostbyname(hostname)
+                    local_ips = {
+                        addr[4][0]
+                        for info in socket.getaddrinfo(socket.gethostname(), None)
+                        for addr in [info]
+                    }
+                    local_ips.update(("127.0.0.1", "::1", "0.0.0.0"))
+                    if resolved in local_ips:
+                        logger.warning(
+                            "Schedule: ignoring stream pointing to this device's IP %s: %s",
+                            resolved, url,
+                        )
+                        return
+                except OSError:
+                    pass  # DNS resolution failed — let mpv handle the error
+
+                state_key = ("stream", url)
+                if self._last_eval_state == state_key:
+                    return
+
+                self._end_current_playback()
+
+                desired = DesiredState(
+                    mode=PlaybackMode.PLAY,
+                    asset=url,
+                    url=url,
+                    asset_type="stream",
+                    loop=False,
+                    loop_count=None,
+                )
+                write_state(self.settings.desired_state_path, desired)
+                self._last_eval_state = state_key
+
+                self._current_schedule_id = new_schedule_id
+                self._current_schedule_name = new_schedule_name
+                self._current_asset = url
+                if new_schedule_id:
+                    self._send_playback_event(
+                        "playback_started", new_schedule_id, new_schedule_name, url,
+                    )
+
+                logger.info(
+                    "Schedule: playing stream %s (priority %d)",
+                    url, winner.get("priority", 0),
+                )
+                return
+
             if not self.asset_manager.has_asset(asset, checksum):
                 # Asset not on device yet — request fetch and show splash
                 logger.info(
@@ -1071,13 +1142,23 @@ class CMSClient:
         try:
             import aiohttp
 
-            ext = Path(asset_name).suffix.lower()
-            if ext == ".mp4":
+            # Determine target directory using asset_type from CMS (issue #110),
+            # falling back to extension-based detection for older CMS versions.
+            asset_type = msg.get("asset_type", "")
+            if asset_type in ("video", "saved_stream"):
                 target_dir = self.settings.videos_dir
-            elif ext in (".jpg", ".jpeg", ".png"):
+            elif asset_type == "image":
                 target_dir = self.settings.images_dir
             else:
-                target_dir = self.settings.assets_dir
+                # Fallback: route by file extension (expanded list)
+                ext = Path(asset_name).suffix.lower()
+                if ext in (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts"):
+                    target_dir = self.settings.videos_dir
+                elif ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
+                    target_dir = self.settings.images_dir
+                else:
+                    # Default to videos/ — player searches there (never root assets/)
+                    target_dir = self.settings.videos_dir
 
             target_path = target_dir / asset_name
 

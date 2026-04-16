@@ -100,6 +100,36 @@ def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) ->
     return cmd
 
 
+def _build_stream_command(url: str) -> list[str]:
+    """Build the mpv command for streaming video playback (HLS, DASH, RTMP, etc.).
+
+    mpv handles adaptive bitrate (ABR) streaming natively via FFmpeg's
+    demuxers. For live streams we disable looping; for VOD streams the
+    caller can pass --loop=inf via IPC later if needed.
+    """
+    cmd = [
+        "mpv",
+        "--vo=drm",
+        "--drm-connector=HDMI-A-1",
+        "--fullscreen",
+        "--no-terminal",
+        "--no-input-terminal",
+        "--no-osc",
+        f"--input-ipc-server={MPV_IPC_SOCKET}",
+        "--hwdec=drm-copy",
+        # Stream-specific cache settings for smooth playback
+        "--cache=yes",
+        "--demuxer-max-bytes=50MiB",
+        "--demuxer-max-back-bytes=25MiB",
+        # Loop for VOD streams (harmless for live — they don't end)
+        "--loop=inf",
+        "--ao=alsa",
+        f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0",
+        url,
+    ]
+    return cmd
+
+
 class AgoraPlayer:
     """Manages media playback driven by desired state file changes.
 
@@ -481,6 +511,44 @@ class AgoraPlayer:
             self._update_current(error=f"mpv start failed: {e}")
             self._show_splash()
 
+    def _start_stream(self, url: str) -> None:
+        """Launch mpv for streaming video playback (HLS, DASH, RTMP, etc.).
+
+        Stops any existing player (mpv, Cage, GStreamer) and starts mpv
+        with stream-optimised settings.  Monitoring reuses _monitor_mpv
+        with the URL as the asset name for retry/splash fallback.
+        """
+        self._quit_plymouth()
+        self._teardown()
+        self._stop_mpv()
+
+        cmd = _build_stream_command(url)
+        logger.info("Starting stream: %s", " ".join(cmd))
+        try:
+            self._mpv_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            self._current_path = None
+            self._current_mtime = None
+            started = datetime.now(timezone.utc)
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=self.current_desired.asset if self.current_desired else url,
+                started_at=started,
+            )
+            logger.info("mpv stream started (pid %d) for %s", self._mpv_process.pid, url)
+            GLib.timeout_add_seconds(2, self._monitor_mpv, url)
+        except FileNotFoundError:
+            logger.error("mpv not found — is it installed?")
+            self._update_current(error="mpv not installed")
+            self._show_splash()
+        except Exception as e:
+            logger.error("Failed to start stream: %s", e)
+            self._update_current(error=f"Stream start failed: {e}")
+            self._show_splash()
+
     def _stop_mpv(self) -> None:
         """Stop the mpv subprocess if running."""
         if self._mpv_process is None:
@@ -530,7 +598,15 @@ class AgoraPlayer:
         if retcode == 0:
             # Normal exit — EOS
             logger.info("mpv finished playing %s", asset_name)
-            if self.current_desired and self.current_desired.loop:
+            # Live streams: auto-restart on EOS (stream may have dropped)
+            if (
+                self.current_desired
+                and getattr(self.current_desired, "asset_type", None) == "stream"
+            ):
+                logger.info("Stream ended, restarting: %s", asset_name)
+                delay = 5  # brief pause before reconnecting
+                GLib.timeout_add_seconds(delay, self._retry_desired)
+            elif self.current_desired and self.current_desired.loop:
                 self._loops_completed += 1
                 if (
                     self.current_desired.loop_count is not None
@@ -886,6 +962,18 @@ class AgoraPlayer:
             return
 
         if desired.mode == PlaybackMode.PLAY and desired.url:
+            # Stream assets → mpv (handles HLS/DASH/RTMP natively)
+            if desired.asset_type == "stream":
+                mpv_proc = self._mpv_process
+                if mpv_proc and mpv_proc.poll() is None:
+                    if self.current_desired and self.current_desired.url == desired.url:
+                        logger.info("Same stream already playing (%s), skipping", desired.url)
+                        self.current_desired = desired
+                        return
+                self.current_desired = desired
+                self._start_stream(desired.url)
+                return
+
             # Webpage rendering via Cage+Chromium
             cage_proc = self._cage_process
             if cage_proc and cage_proc.poll() is None:

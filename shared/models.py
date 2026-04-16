@@ -20,6 +20,7 @@ class DesiredState(BaseModel):
     loop_count: Optional[int] = None  # None = infinite, N = play exactly N times
     expected_checksum: Optional[str] = None  # SHA-256 from CMS schedule
     url: Optional[str] = None  # Webpage URL for Cage+Chromium rendering
+    asset_type: Optional[str] = None  # "video", "image", "webpage", "stream"
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
