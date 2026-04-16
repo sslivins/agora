@@ -1142,13 +1142,23 @@ class CMSClient:
         try:
             import aiohttp
 
-            ext = Path(asset_name).suffix.lower()
-            if ext == ".mp4":
+            # Determine target directory using asset_type from CMS (issue #110),
+            # falling back to extension-based detection for older CMS versions.
+            asset_type = msg.get("asset_type", "")
+            if asset_type in ("video", "saved_stream"):
                 target_dir = self.settings.videos_dir
-            elif ext in (".jpg", ".jpeg", ".png"):
+            elif asset_type == "image":
                 target_dir = self.settings.images_dir
             else:
-                target_dir = self.settings.assets_dir
+                # Fallback: route by file extension (expanded list)
+                ext = Path(asset_name).suffix.lower()
+                if ext in (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts"):
+                    target_dir = self.settings.videos_dir
+                elif ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
+                    target_dir = self.settings.images_dir
+                else:
+                    # Default to videos/ — player searches there (never root assets/)
+                    target_dir = self.settings.videos_dir
 
             target_path = target_dir / asset_name
 
