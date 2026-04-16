@@ -714,7 +714,7 @@ class AgoraPlayer:
                 else:
                     self._teardown()
                     self._quit_plymouth()
-                    cmd = _build_mpv_command(splash, audio=False, loop=True)
+                    cmd = _build_mpv_command(splash, audio=True, loop=True)
                     logger.info("Showing splash via mpv: %s", splash.name)
                     try:
                         self._mpv_process = subprocess.Popen(
