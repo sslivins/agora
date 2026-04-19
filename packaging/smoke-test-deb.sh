@@ -53,31 +53,40 @@ for f in "${REQUIRED_FILES[@]}"; do
 done
 echo "  all ${#REQUIRED_FILES[@]} required paths present"
 
-echo "=== Verifying systemd unit ExecStart paths resolve inside package ==="
+echo "=== Verifying systemd unit ExecStart script paths resolve inside package ==="
+# ExecStart comes in several shapes:
+#   ExecStart=/usr/bin/python3 /opt/agora/src/player/main.py
+#   ExecStart=/usr/bin/python3 -m cms_client.main
+#   ExecStart=/bin/bash -c 'exec /usr/bin/python3 -u /opt/agora/src/provision/service.py ...'
+# For script-path forms we assert the file exists inside the .deb. For
+# `-m module` forms we rely on the "Import smoke: systemd entry points"
+# step below — if the module is broken, that step will catch it.
 for unit in "$STAGE"/etc/systemd/system/agora-*.service; do
-    script=$(awk -F'=' '/^ExecStart=/{
-        # ExecStart=/usr/bin/python3 /opt/agora/src/player/main.py
-        split($2, parts, " ")
-        print parts[2]
-        exit
-    }' "$unit")
-    if [[ -z "$script" ]]; then
-        echo "FAIL: $(basename "$unit") has no ExecStart"
-        exit 1
+    checked=0
+    while read -r script; do
+        [[ -z "$script" ]] && continue
+        rel="${script#/}"
+        if [[ ! -f "$STAGE/$rel" ]]; then
+            echo "FAIL: $(basename "$unit") references $script but $STAGE/$rel missing"
+            exit 1
+        fi
+        echo "  $(basename "$unit") → $script ✓"
+        checked=1
+    done < <(grep -oE '/opt/agora/src/[^ '"'"'"]+\.py' "$unit" || true)
+    if [[ $checked -eq 0 ]]; then
+        # No script path — must be `-m module`. Verified by import smoke below.
+        echo "  $(basename "$unit") → (uses python -m, verified by import smoke)"
     fi
-    rel="${script#/}"
-    if [[ ! -f "$STAGE/$rel" ]]; then
-        echo "FAIL: $(basename "$unit") ExecStart=$script but $STAGE/$rel missing"
-        exit 1
-    fi
-    echo "  $(basename "$unit") → $script ✓"
 done
 
 echo "=== Byte-compiling all shipped Python sources ==="
 python3 -m compileall -q "$SRC"
 
 echo "=== Creating venv + installing runtime requirements ==="
-python3 -m venv "$VENV"
+# --system-site-packages so the venv inherits apt-installed native
+# bindings (python3-gi / python3-cairo / PangoCairo) which are what
+# the Pi runtime uses and cannot be installed from pip wheels.
+python3 -m venv --system-site-packages "$VENV"
 # shellcheck disable=SC1091
 . "$VENV/bin/activate"
 pip install --quiet --upgrade pip
@@ -104,10 +113,11 @@ for pkg in "${PACKAGES[@]}"; do
 done
 
 echo "=== Import smoke: systemd entry points ==="
-# These four imports match the four systemd units' ExecStart targets.
+# These four imports match the four systemd units' ExecStart targets
+# (player/main.py, uvicorn api.main:app, cms_client.main, provision/service.py).
 # If any top-level import chain is broken (like the v1.11.2 missing
 # hardware/ module), one of these will fail the same way the Pi did.
-for entry in player.main api.main cms_client.main provision.main; do
+for entry in player.main api.main cms_client.main provision.service; do
     python3 -c "import importlib; importlib.import_module('$entry'); print('ok: $entry')"
 done
 
