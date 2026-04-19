@@ -61,6 +61,7 @@ def test_drm_sysfs_connected(tmp_path):
     card_dir = tmp_path / "card1-HDMI-A-1"
     card_dir.mkdir()
     (card_dir / "status").write_text("connected\n")
+    (card_dir / "edid").write_bytes(b"\x00" * 128)
 
     with patch("hardware.display.drm_sysfs._SYSFS_ROOT", tmp_path):
         probe = _drm_probe([HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1")])
@@ -71,6 +72,31 @@ def test_drm_sysfs_disconnected(tmp_path):
     card_dir = tmp_path / "card1-HDMI-A-1"
     card_dir.mkdir()
     (card_dir / "status").write_text("disconnected\n")
+
+    with patch("hardware.display.drm_sysfs._SYSFS_ROOT", tmp_path):
+        probe = _drm_probe([HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1")])
+        assert probe.probe_all() == [PortStatus(name="HDMI-0", connected=False)]
+
+
+def test_drm_sysfs_status_connected_but_edid_empty_treated_as_disconnected(tmp_path):
+    # Pi 5 / VC4 false-positive: sysfs says connected but no display responded
+    # on DDC, so the EDID blob is empty. Trust EDID over status.
+    card_dir = tmp_path / "card1-HDMI-A-1"
+    card_dir.mkdir()
+    (card_dir / "status").write_text("connected\n")
+    (card_dir / "edid").write_bytes(b"")  # 0 bytes
+
+    with patch("hardware.display.drm_sysfs._SYSFS_ROOT", tmp_path):
+        probe = _drm_probe([HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1")])
+        assert probe.probe_all() == [PortStatus(name="HDMI-0", connected=False)]
+
+
+def test_drm_sysfs_status_connected_edid_missing_treated_as_disconnected(tmp_path):
+    # Same false-positive case, but the edid file doesn't exist at all.
+    card_dir = tmp_path / "card1-HDMI-A-1"
+    card_dir.mkdir()
+    (card_dir / "status").write_text("connected\n")
+    # no edid file created
 
     with patch("hardware.display.drm_sysfs._SYSFS_ROOT", tmp_path):
         probe = _drm_probe([HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1")])
@@ -103,6 +129,7 @@ def test_drm_sysfs_empty_connector_returns_none(tmp_path):
 def test_drm_sysfs_multiple_ports(tmp_path):
     (tmp_path / "card1-HDMI-A-1").mkdir()
     (tmp_path / "card1-HDMI-A-1" / "status").write_text("connected")
+    (tmp_path / "card1-HDMI-A-1" / "edid").write_bytes(b"\x00" * 256)
     (tmp_path / "card1-HDMI-A-2").mkdir()
     (tmp_path / "card1-HDMI-A-2" / "status").write_text("disconnected")
 
@@ -113,6 +140,27 @@ def test_drm_sysfs_multiple_ports(tmp_path):
         ])
         assert probe.probe_all() == [
             PortStatus(name="HDMI-0", connected=True),
+            PortStatus(name="HDMI-1", connected=False),
+        ]
+
+
+def test_drm_sysfs_false_positive_primary_real_secondary(tmp_path):
+    # Real-world Pi 5 scenario: HDMI-A-1 sysfs lies (connected, edid empty),
+    # HDMI-A-2 honestly reports disconnected. Both should read as disconnected.
+    (tmp_path / "card1-HDMI-A-1").mkdir()
+    (tmp_path / "card1-HDMI-A-1" / "status").write_text("connected")
+    (tmp_path / "card1-HDMI-A-1" / "edid").write_bytes(b"")
+    (tmp_path / "card1-HDMI-A-2").mkdir()
+    (tmp_path / "card1-HDMI-A-2" / "status").write_text("disconnected")
+    (tmp_path / "card1-HDMI-A-2" / "edid").write_bytes(b"")
+
+    with patch("hardware.display.drm_sysfs._SYSFS_ROOT", tmp_path):
+        probe = _drm_probe([
+            HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1"),
+            HdmiPort("HDMI-1", "/dev/i2c-4", "HDMI-A-2"),
+        ])
+        assert probe.probe_all() == [
+            PortStatus(name="HDMI-0", connected=False),
             PortStatus(name="HDMI-1", connected=False),
         ]
 

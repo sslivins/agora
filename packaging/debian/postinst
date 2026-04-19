@@ -138,7 +138,15 @@ if [ -f "${BOOT_CFG}" ]; then
         sed -i 's/^disable_fw_kms_setup=1/disable_fw_kms_setup=0/' "${BOOT_CFG}"
         echo "Agora: fixed disable_fw_kms_setup=0 in ${BOOT_CFG}"
     fi
-    for setting in disable_fw_kms_setup=0 disable_overscan=1 hdmi_force_hotplug=1 hdmi_force_edid_audio=1; do
+    # Scrub legacy hdmi_force_hotplug=1. On Pi 5 (RP1) it makes sysfs lie about
+    # connection state (status=connected with no display attached); on current
+    # Bookworm firmware it is unnecessary for Pi 3/4 hotplug too. The display
+    # probe now cross-checks EDID, so this flag is pure noise either way.
+    if grep -q '^hdmi_force_hotplug=1$' "${BOOT_CFG}"; then
+        sed -i '/^hdmi_force_hotplug=1$/d' "${BOOT_CFG}"
+        echo "Agora: removed legacy hdmi_force_hotplug=1 from ${BOOT_CFG}"
+    fi
+    for setting in disable_fw_kms_setup=0 disable_overscan=1 hdmi_force_edid_audio=1; do
         key="${setting%%=*}"
         if ! grep -q "^${key}=" "${BOOT_CFG}"; then
             echo "${setting}" >> "${BOOT_CFG}"

@@ -1400,6 +1400,94 @@ class TestDisplayDetection:
         # None -> True commits immediately (no debounce for endpoint transitions).
         assert data["display_connected"] is True
 
+    # ── _probe_display_tick ──
+    # This timer runs for the lifetime of the player, regardless of playback
+    # state, so display_connected in current.json stays fresh during splash/idle
+    # when _update_position is not running.
+
+    def test_probe_display_tick_updates_during_splash(self, player, tmp_path):
+        """Display flip is persisted even when no playback pipeline is active."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState, PortStatus as PortStatusModel
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.SPLASH, asset="default.png",
+            pipeline_state="PLAYING",
+            display_connected=False,
+            display_ports=[PortStatusModel(name="HDMI-0", connected=False)],
+        )
+        write_state(state_file, initial)
+
+        # Splash: no GStreamer pipeline, no mpv or cage process.
+        player.pipeline = None
+        player.current_desired = DesiredState(mode=PlaybackMode.SPLASH)
+        self._mock_probe(player, [("HDMI-0", True)])
+
+        # Debounce: takes two consistent readings to commit.
+        assert player._probe_display_tick() is True
+        assert player._probe_display_tick() is True
+
+        import json
+        data = json.loads(state_file.read_text())
+        assert data["display_connected"] is True
+        assert data["display_ports"] == [{"name": "HDMI-0", "connected": True}]
+
+    def test_probe_display_tick_always_returns_true(self, player, tmp_path):
+        """Tick must keep the GLib timer running even when nothing changes."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState, PortStatus as PortStatusModel
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.SPLASH, asset="default.png",
+            pipeline_state="PLAYING",
+            display_connected=True,
+            display_ports=[PortStatusModel(name="HDMI-0", connected=True)],
+        )
+        write_state(state_file, initial)
+        player.pipeline = None
+        player.current_desired = DesiredState(mode=PlaybackMode.SPLASH)
+        self._mock_probe(player, [("HDMI-0", True)])
+
+        # Several ticks with no change — all return True.
+        for _ in range(5):
+            assert player._probe_display_tick() is True
+
+    def test_probe_display_tick_swallows_exceptions(self, player, tmp_path):
+        """A failure inside the tick must not crash the timer."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        # No file written → read_state will raise. Tick should still return True.
+        self._mock_probe(player, [("HDMI-0", True)])
+        assert player._probe_display_tick() is True
+
+    def test_probe_display_tick_no_write_when_unchanged(self, player, tmp_path):
+        """Idempotent: if probe matches last state, current.json is not rewritten."""
+        state_file = tmp_path / "current.json"
+        player.current_path = state_file
+
+        from shared.models import CurrentState, PortStatus as PortStatusModel
+        from shared.state import write_state
+        initial = CurrentState(
+            mode=PlaybackMode.SPLASH, asset="default.png",
+            pipeline_state="PLAYING",
+            display_connected=True,
+            display_ports=[PortStatusModel(name="HDMI-0", connected=True)],
+        )
+        write_state(state_file, initial)
+        mtime_before = state_file.stat().st_mtime_ns
+
+        player.pipeline = None
+        player.current_desired = DesiredState(mode=PlaybackMode.SPLASH)
+        self._mock_probe(player, [("HDMI-0", True)])
+
+        player._probe_display_tick()
+        assert state_file.stat().st_mtime_ns == mtime_before
+
 
 # ── mpv command building ──
 

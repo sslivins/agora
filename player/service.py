@@ -965,6 +965,43 @@ class AgoraPlayer:
             logger.debug("Failed to update playback position")
         return True  # Keep the timer running
 
+    def _probe_display_tick(self) -> bool:
+        """Periodic display probe that runs regardless of playback state.
+
+        `_update_position` only runs while a pipeline is active, so during
+        splash/idle the display connection state in current.json would go
+        stale and the CMS would keep reporting whatever was last observed on
+        a playback transition. This tick re-probes HDMI at a steady cadence
+        and writes updates to current.json so the next heartbeat reflects
+        reality. Always returns True to keep the GLib timer running for the
+        lifetime of the service.
+        """
+        try:
+            current = read_state(self.current_path, CurrentState)
+            _, raw_ports = self._probe_display()
+            ports = self._debounce_display(raw_ports, current.display_ports)
+            primary = ports[0].connected if ports else None
+            changed = False
+            if current.display_connected != primary:
+                if primary is not None and current.display_connected is not None:
+                    logger.warning(
+                        "Display %s",
+                        "connected" if primary else "disconnected",
+                    )
+                current.display_connected = primary
+                changed = True
+            old_map = {p.name: p.connected for p in (current.display_ports or [])}
+            new_map = {p.name: p.connected for p in ports}
+            if old_map != new_map:
+                current.display_ports = ports or None
+                changed = True
+            if changed:
+                current.updated_at = datetime.now(timezone.utc)
+                write_state(self.current_path, current)
+        except Exception:
+            logger.debug("Display probe tick failed", exc_info=True)
+        return True  # Keep the timer running for the lifetime of the service
+
     def apply_desired(self) -> None:
         """Read desired state and apply it to the player."""
         if not self.desired_path.exists():
@@ -1286,6 +1323,10 @@ class AgoraPlayer:
         # Re-apply: desired.json may have been written while the initial splash
         # pipeline was loading (before inotify was watching).
         self.apply_desired()
+
+        # Periodic display probe: runs regardless of playback state so
+        # display_connected in current.json stays fresh during splash/idle.
+        GLib.timeout_add_seconds(10, self._probe_display_tick)
 
         # Signal handlers for clean shutdown
         def on_shutdown(signum, frame):
