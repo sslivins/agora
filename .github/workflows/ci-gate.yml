@@ -1,0 +1,26 @@
+name: CI Gate
+
+# Always-green sentinel that runs on every PR to main, regardless of
+# which paths changed. Exists so we can point branch protection's
+# required check here instead of at `test`, which is gated by path
+# filters (or may be intentionally skipped on docs-only PRs in the
+# future).
+#
+# The idea: every PR *must* have at least one required check that
+# actually runs and reports a conclusion. Without this, a PR that
+# happens to skip all path-filtered checks would merge through
+# auto-merge with no gate at all — which is exactly the slip-up
+# that motivated this file.
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci-gate:
+    name: ci-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Pass
+        run: echo "PR reached the merge queue; path-filtered checks (if any) reported separately."
