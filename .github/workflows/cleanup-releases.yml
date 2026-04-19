@@ -1,0 +1,163 @@
+name: Cleanup Old Releases
+
+# Keeps the newest N GitHub Releases (with their tags + assets) and removes
+# any matching .deb files from the APT pool on gh-pages, then regenerates
+# the APT index.
+#
+# Runs weekly (Monday 09:00 UTC) and can be triggered manually with a
+# custom `keep` value or a dry-run.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "How many most-recent releases to keep"
+        required: false
+        default: "15"
+      dry_run:
+        description: "Dry run (list what would be deleted, change nothing)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+jobs:
+  prune-releases:
+    runs-on: ubuntu-latest
+    outputs:
+      removed-versions: ${{ steps.prune.outputs.removed-versions }}
+    steps:
+      - name: Prune old releases and tags
+        id: prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ github.event.inputs.keep || '15' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          echo "Keeping last $KEEP releases (dry_run=$DRY_RUN)"
+
+          # List releases newest-first, skip the first $KEEP, collect tags of the rest.
+          mapfile -t OLD_TAGS < <(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+              --json tagName,createdAt \
+              --jq "sort_by(.createdAt) | reverse | .[$KEEP:] | .[].tagName"
+          )
+
+          if [ "${#OLD_TAGS[@]}" -eq 0 ]; then
+            echo "Nothing to prune."
+            echo "removed-versions=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Will delete ${#OLD_TAGS[@]} release(s):"
+          printf '  %s\n' "${OLD_TAGS[@]}"
+
+          removed_versions=""
+          for tag in "${OLD_TAGS[@]}"; do
+            # Strip leading "v" to match .deb version string (vX.Y.Z -> X.Y.Z).
+            version="${tag#v}"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would delete release+tag $tag (version=$version)"
+            else
+              # --cleanup-tag also deletes the underlying git tag.
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || \
+                echo "::warning::Failed to delete release $tag (may already be gone)"
+            fi
+            removed_versions="${removed_versions}${version}"$'\n'
+          done
+
+          # Write newline-separated versions to a file for the next job to consume.
+          printf '%s' "$removed_versions" > /tmp/removed-versions.txt
+          {
+            echo "removed-versions<<EOF"
+            cat /tmp/removed-versions.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload removed-versions list
+        if: steps.prune.outputs.removed-versions != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: removed-versions
+          path: /tmp/removed-versions.txt
+          retention-days: 7
+
+  prune-apt-pool:
+    needs: prune-releases
+    if: needs.prune-releases.outputs.removed-versions != '' && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Download removed-versions list
+        uses: actions/download-artifact@v4
+        with:
+          name: removed-versions
+          path: /tmp
+
+      - name: Delete matching .deb files from pool/
+        id: delete
+        run: |
+          set -euo pipefail
+          deleted=0
+          while IFS= read -r version; do
+            [ -z "$version" ] && continue
+            # Match any arch: agora_${version}_*.deb
+            for f in pool/agora_${version}_*.deb; do
+              if [ -f "$f" ]; then
+                echo "Removing $f"
+                rm -f "$f"
+                deleted=$((deleted + 1))
+              fi
+            done
+          done < /tmp/removed-versions.txt
+          echo "deleted=$deleted" >> "$GITHUB_OUTPUT"
+          echo "Deleted $deleted .deb file(s)"
+
+      - name: Regenerate APT repository metadata
+        if: steps.delete.outputs.deleted != '0'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev apt-utils
+
+          mkdir -p dists/stable/main/binary-arm64
+          dpkg-scanpackages --arch arm64 pool/ > dists/stable/main/binary-arm64/Packages
+          gzip -kf dists/stable/main/binary-arm64/Packages
+
+          cd dists/stable
+          cat > Release <<EOF
+          Origin: sslivins
+          Label: Agora
+          Suite: stable
+          Codename: stable
+          Architectures: arm64
+          Components: main
+          Description: Agora media playback system for Raspberry Pi
+          EOF
+          apt-ftparchive release . >> Release
+
+      - name: Commit and push
+        if: steps.delete.outputs.deleted != '0'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: prune ${{ steps.delete.outputs.deleted }} old .deb(s) from APT pool"
+          git push origin gh-pages
