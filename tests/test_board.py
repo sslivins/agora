@@ -105,21 +105,21 @@ class TestI2CBus:
         with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi Zero 2 W"):
             buses = get_i2c_buses()
             assert len(buses) == 1
-            assert buses[0] == HdmiPort("HDMI-0", "/dev/i2c-2")
+            assert buses[0] == HdmiPort("HDMI-0", "/dev/i2c-2", "HDMI-A-1")
 
     def test_pi_4_dual_ports(self):
         with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
             buses = get_i2c_buses()
             assert len(buses) == 2
-            assert buses[0] == HdmiPort("HDMI-0", "/dev/i2c-1")
-            assert buses[1] == HdmiPort("HDMI-1", "/dev/i2c-10")
+            assert buses[0] == HdmiPort("HDMI-0", "/dev/i2c-1", "HDMI-A-1")
+            assert buses[1] == HdmiPort("HDMI-1", "/dev/i2c-10", "HDMI-A-2")
 
     def test_pi_5_dual_ports(self):
         with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 5"):
             buses = get_i2c_buses()
             assert len(buses) == 2
-            assert buses[0] == HdmiPort("HDMI-0", "/dev/i2c-3")
-            assert buses[1] == HdmiPort("HDMI-1", "/dev/i2c-4")
+            assert buses[0] == HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1")
+            assert buses[1] == HdmiPort("HDMI-1", "/dev/i2c-4", "HDMI-A-2")
 
 
 # ── HDMI port count ──
