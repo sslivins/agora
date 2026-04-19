@@ -2,6 +2,14 @@ name: Build & Release
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/**'
+      - 'tests/**'
+      - '.gitleaks.toml'
 
 permissions:
   contents: write
