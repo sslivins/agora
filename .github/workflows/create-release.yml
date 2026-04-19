@@ -230,3 +230,42 @@ jobs:
           git add -A
           git commit -m "Update apt repo: ${{ needs.build.outputs.tag }}"
           git push origin gh-pages
+
+  # Commit the auto-incremented version back to main so the next release
+  # starts from a fresh version. Runs only after publish-apt succeeds,
+  # so a failed release does not advance the version on main. The commit
+  # uses "[skip ci]" to avoid re-triggering Tests/etc on the bump itself.
+  bump-main:
+    needs: [build, publish-apt]
+    if: needs.build.outputs.is-main == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # GITHUB_TOKEN works if main is unprotected, or if
+          # github-actions[bot] is on the branch-protection bypass list.
+          # If main is PR-protected and the bot can't bypass, the repo
+          # secret VERSION_BUMP_TOKEN (a fine-grained PAT with contents:
+          # write on this repo) is used instead.
+          token: ${{ secrets.VERSION_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Bump patch version and push
+        run: |
+          set -euo pipefail
+          current=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
+          IFS=. read -r major minor patch <<< "$current"
+          next="${major}.${minor}.$((patch + 1))"
+          echo "Bumping: $current → $next"
+          if [ "$current" = "$next" ]; then
+            echo "api/__init__.py is already at $next — nothing to commit."
+            exit 0
+          fi
+          sed -i "s/^__version__ = .*/__version__ = \"$next\"/" api/__init__.py
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add api/__init__.py
+          git commit -m "chore: bump version to $next [skip ci]" \
+                     -m "Auto-bumped by create-release.yml after ${{ needs.build.outputs.tag }}." \
+                     -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          git push origin HEAD:main

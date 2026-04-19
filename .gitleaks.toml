@@ -1,0 +1,38 @@
+# gitleaks configuration for agora (Pi device).
+#
+# Extends the default gitleaks ruleset with repo-specific allowlists for
+# known non-secret patterns (placeholder strings, test fixtures, CI
+# service credentials).
+#
+# Run locally:   gitleaks detect --config .gitleaks.toml
+# Scan history:  gitleaks detect --config .gitleaks.toml --log-opts="--all"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known non-secret placeholders and test-fixture credentials."
+
+# Files that exist specifically to document secret shapes or contain
+# test-only fixtures. Provisioning templates render real creds at
+# runtime and are not checked in with actual values.
+paths = [
+    '''\.env\.example''',
+    '''docs/.*''',
+    '''README.*''',
+    '''tests/.*fixtures?/.*''',
+    '''provision/templates/.*\.j2$''',
+]
+
+# Specific literal values that look secret-shaped but are either
+# placeholders or test-only.
+regexes = [
+    '''change-me-(to-)?a?-?(random|secure|in-production)[a-z0-9-]*''',
+    '''wss?://cms\.example\.(com|local)''',   # docs/examples
+    '''your[-_](api[-_])?key[-_]here''',
+    '''REPLACE[-_]ME''',
+]
+
+# Commit SHAs can be added here if history cleanup reveals a false
+# positive that rulesets can't target:
+# commits = ["abcdef0123..."]
