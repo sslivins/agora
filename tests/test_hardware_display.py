@@ -103,6 +103,30 @@ def test_drm_sysfs_status_connected_edid_missing_treated_as_disconnected(tmp_pat
         assert probe.probe_all() == [PortStatus(name="HDMI-0", connected=False)]
 
 
+def test_drm_sysfs_trusts_edid_read_not_stat_size(tmp_path):
+    # Regression for v1.11.4: the DRM edid sysfs attribute reports
+    # st_size=0 via stat() regardless of whether a monitor is attached.
+    # We must determine presence by reading the file, not stat'ing it.
+    card_dir = tmp_path / "card1-HDMI-A-1"
+    card_dir.mkdir()
+    (card_dir / "status").write_text("connected\n")
+    (card_dir / "edid").write_bytes(b"\x00\xff\xff\xff\xff\xff\xff\x00" + b"\x00" * 120)
+
+    fake_stat = MagicMock()
+    fake_stat.st_size = 0  # mimic sysfs bin_attribute behaviour
+    real_stat = Path.stat
+
+    def _stat_lying_about_edid(self, *args, **kwargs):
+        if self.name == "edid":
+            return fake_stat
+        return real_stat(self, *args, **kwargs)
+
+    with patch("hardware.display.drm_sysfs._SYSFS_ROOT", tmp_path), \
+         patch.object(Path, "stat", _stat_lying_about_edid):
+        probe = _drm_probe([HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1")])
+        assert probe.probe_all() == [PortStatus(name="HDMI-0", connected=True)]
+
+
 def test_drm_sysfs_unknown_status_is_none(tmp_path):
     card_dir = tmp_path / "card1-HDMI-A-1"
     card_dir.mkdir()

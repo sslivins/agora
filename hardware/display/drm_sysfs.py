@@ -13,6 +13,12 @@ Empirical behaviour on Pi 5 / RP1 (verified 2026-04):
   No display attached:  status=connected, edid=0 bytes   → connected=False
   Display attached:     status=connected, edid=256 bytes → connected=True
   status=disconnected:  always trusted → connected=False
+
+Note: the DRM ``edid`` sysfs attribute is a dynamic binary attribute declared
+with ``size = 0`` in the kernel, so ``stat(2)`` on it **always** reports
+``st_size = 0`` regardless of whether a monitor is attached.  We therefore
+read a small prefix of the file to determine whether EDID data is actually
+present, rather than trusting the inode size.
 """
 from __future__ import annotations
 
@@ -57,12 +63,22 @@ def _read_status(path: Path) -> Optional[bool]:
     return None
 
 
-def _edid_size(connector_dir: Path) -> int:
-    """Return the byte size of the connector's EDID blob (0 if missing/empty)."""
+def _edid_has_data(connector_dir: Path) -> bool:
+    """Return True if the connector's EDID blob contains real data.
+
+    We read a small prefix of the ``edid`` file (rather than calling
+    ``stat``) because the sysfs binary attribute reports ``st_size=0``
+    unconditionally.  Only an actual ``read`` yields the 128+ bytes
+    published by a real monitor.  Any non-empty read is treated as
+    "EDID present"; we don't require a valid header because partial
+    reads from flaky HDMI links still indicate a responsive sink.
+    """
     try:
-        return (connector_dir / "edid").stat().st_size
-    except (FileNotFoundError, PermissionError, OSError):
-        return 0
+        with (connector_dir / "edid").open("rb") as f:
+            return bool(f.read(8))
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        logger.debug("DRM sysfs EDID read failed for %s: %s", connector_dir, e)
+        return False
 
 
 class DrmSysfsDisplayProbe(DisplayProbe):
@@ -94,7 +110,7 @@ class DrmSysfsDisplayProbe(DisplayProbe):
                 out.append(PortStatus(name=port.name, connected=None))
                 continue
             status = _read_status(connector_dir / "status")
-            if status is True and _edid_size(connector_dir) == 0:
+            if status is True and not _edid_has_data(connector_dir):
                 logger.debug(
                     "%s: sysfs status=connected but EDID empty — treating as disconnected",
                     connector,
