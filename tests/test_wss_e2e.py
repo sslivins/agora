@@ -24,11 +24,22 @@ import uvicorn
 
 
 @pytest.fixture(scope="module")
-def provision_server():
-    """Start the provision app on a local port for Playwright tests."""
-    from provision.app import app
+def provision_server(tmp_path_factory):
+    """Start the provision app on a local port for Playwright tests.
 
-    config = uvicorn.Config(app, host="127.0.0.1", port=18081, log_level="error", ws="none")
+    Isolates ``provision.app.PERSIST_DIR`` to a fresh tmp path so the
+    test run is independent of any persisted ``cms_config.json`` that
+    may exist on the developer/CI machine (e.g. from a prior provisioning
+    session). Without this, ``/api/cms/config`` leaks real state into the
+    reconfigure page and pre-checks the TLS checkbox.
+    """
+    import provision.app as provision_app
+
+    persist = tmp_path_factory.mktemp("provision_persist")
+    original_persist = provision_app.PERSIST_DIR
+    provision_app.PERSIST_DIR = persist
+
+    config = uvicorn.Config(provision_app.app, host="127.0.0.1", port=18081, log_level="error", ws="none")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -40,8 +51,11 @@ def provision_server():
         except (httpx.ConnectError, httpx.ReadTimeout):
             time.sleep(0.2)
 
-    yield "http://127.0.0.1:18081"
-    server.should_exit = True
+    try:
+        yield "http://127.0.0.1:18081"
+    finally:
+        server.should_exit = True
+        provision_app.PERSIST_DIR = original_persist
 
 
 @pytest.fixture(scope="module")

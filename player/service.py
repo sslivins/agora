@@ -66,13 +66,19 @@ def _build_video_pipeline_no_audio_str(board: Board) -> str:
 MPV_IPC_SOCKET = "/tmp/mpv-socket"
 
 
-def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) -> list[str]:
+def _build_mpv_command(path: Path, *, muted: bool = True, loop: bool = False) -> list[str]:
     """Build the mpv command for media playback via DRM output.
 
     Used on Pi 4 and Pi 5 for both video and image playback.
     For video: uses drm-copy hwdec for hardware decoding.
     For images: uses image-display-duration=inf to hold the frame.
     Includes IPC socket for seamless content switching via loadfile.
+
+    The ALSA HDMI audio device is always bound at launch so that later
+    IPC ``loadfile`` swaps can carry audio (mpv cannot add an audio
+    output after the process is running). Mute state is runtime-toggleable
+    via ``set_property mute …`` — splash is muted, scheduled assets are
+    unmuted.
     """
     is_image = path.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
     cmd = [
@@ -84,16 +90,15 @@ def _build_mpv_command(path: Path, *, audio: bool = True, loop: bool = False) ->
         "--no-input-terminal",
         "--no-osc",
         f"--input-ipc-server={MPV_IPC_SOCKET}",
+        "--ao=alsa",
+        f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0",
     ]
     if is_image:
         cmd.append("--image-display-duration=inf")
-        cmd.append("--no-audio")
     else:
         cmd.append("--hwdec=drm-copy")
-        if not audio:
-            cmd.append("--no-audio")
-        else:
-            cmd.extend(["--ao=alsa", f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0"])
+    if muted:
+        cmd.append("--mute=yes")
     if loop:
         cmd.append("--loop=inf")
     cmd.append(str(path))
@@ -406,8 +411,15 @@ class AgoraPlayer:
 
     _IMAGE_EXTS = frozenset((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"))
 
-    def _loadfile_mpv(self, path: Path, *, loop: bool = False) -> bool:
-        """Switch content in a running mpv via IPC socket. Returns True on success."""
+    def _loadfile_mpv(self, path: Path, *, loop: bool = False, muted: bool = True) -> bool:
+        """Switch content in a running mpv via IPC socket. Returns True on success.
+
+        ``muted`` controls the runtime ``mute`` property after the file is
+        loaded. Splash calls pass ``muted=True``; scheduled-asset calls pass
+        ``muted=False``. Because the underlying mpv process always launches
+        with ``--ao=alsa --audio-device=…`` bound (see ``_build_mpv_command``),
+        toggling mute via IPC is sufficient — no respawn needed.
+        """
         if self._mpv_process is None or self._mpv_process.poll() is not None:
             return False
         is_image = path.suffix.lower() in self._IMAGE_EXTS
@@ -419,6 +431,9 @@ class AgoraPlayer:
             loop_val = "inf" if loop else "no"
             sock.sendall(json.dumps({"command": ["set_property", "loop-file", loop_val]}).encode() + b"\n")
             sock.recv(512)  # read response
+            # Toggle mute to match the policy for the incoming content
+            sock.sendall(json.dumps({"command": ["set_property", "mute", bool(muted)]}).encode() + b"\n")
+            sock.recv(512)
             # Set image-display-duration based on content type
             if is_image:
                 sock.sendall(json.dumps({"command": ["set_property", "image-display-duration", "inf"]}).encode() + b"\n")
@@ -446,6 +461,9 @@ class AgoraPlayer:
                 sock.close()
                 logger.warning("mpv IPC loadfile — no success in response: %s", resp[:200])
                 return False
+            # Re-assert mute after loadfile — mpv can reset per-file audio state
+            sock.sendall(json.dumps({"command": ["set_property", "mute", bool(muted)]}).encode() + b"\n")
+            sock.recv(512)
             # When loading an image, toggle fullscreen to force DRM plane refresh
             if is_image:
                 time.sleep(0.2)
@@ -455,7 +473,9 @@ class AgoraPlayer:
                     sock.sendall(json.dumps({"command": ["set_property", "fullscreen", True]}).encode() + b"\n")
                     sock.recv(512)
             sock.close()
-            logger.info("mpv IPC loadfile succeeded for %s", path.name)
+            logger.info(
+                "mpv IPC loadfile succeeded for %s (mute=%s)", path.name, muted,
+            )
             return True
         except (OSError, json.JSONDecodeError, IndexError, KeyError) as e:
             logger.warning("mpv IPC loadfile failed: %s — will restart mpv", e)
@@ -468,8 +488,10 @@ class AgoraPlayer:
         Tries IPC loadfile first for seamless switching; falls back to
         full restart if IPC is unavailable.
         """
-        # Try seamless switch via IPC if mpv is already running
-        if self._loadfile_mpv(path, loop=loop):
+        # Try seamless switch via IPC if mpv is already running.
+        # Scheduled assets always play unmuted (policy: only scheduled
+        # content may produce audio; splash is always silent).
+        if self._loadfile_mpv(path, loop=loop, muted=False):
             self._current_path = path
             self._current_mtime = path.stat().st_mtime
             started = datetime.now(timezone.utc)
@@ -483,7 +505,7 @@ class AgoraPlayer:
         self._quit_plymouth()
         self._stop_mpv()
 
-        cmd = _build_mpv_command(path, audio=True, loop=loop)
+        cmd = _build_mpv_command(path, muted=False, loop=loop)
         logger.info("Starting mpv: %s", " ".join(cmd))
         try:
             self._mpv_process = subprocess.Popen(
@@ -784,13 +806,15 @@ class AgoraPlayer:
             self._current_mtime = splash.stat().st_mtime
             # Use mpv on Pi 4/5 for both video and image splash, GStreamer on Zero 2 W
             if self._player_backend == "mpv":
-                # Try seamless IPC switch first
-                if self._loadfile_mpv(splash, loop=True):
+                # Try seamless IPC switch first. Splash is always muted,
+                # regardless of whether the splash asset is an image or a
+                # video — only scheduled assets are allowed to produce audio.
+                if self._loadfile_mpv(splash, loop=True, muted=True):
                     logger.info("Showing splash via mpv IPC: %s", splash.name)
                 else:
                     self._teardown()
                     self._quit_plymouth()
-                    cmd = _build_mpv_command(splash, audio=True, loop=True)
+                    cmd = _build_mpv_command(splash, muted=True, loop=True)
                     logger.info("Showing splash via mpv: %s", splash.name)
                     try:
                         self._mpv_process = subprocess.Popen(
