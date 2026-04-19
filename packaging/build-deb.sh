@@ -37,7 +37,26 @@ mkdir -p "${BUILD_DIR}/etc/systemd/system"
 mkdir -p "${BUILD_DIR}/usr/share/plymouth/themes/splash"
 
 # ── Source code ──
-for dir in api player shared cms_client hardware provision scripts; do
+# Auto-discover every top-level Python package (any directory with __init__.py),
+# plus the `scripts/` helper directory. Using discovery instead of a hardcoded
+# allowlist means newly added packages (like hardware/ in v1.11.2) ship
+# automatically — a missing package at runtime is exactly the class of bug
+# the v1.11.2 outage was caused by.
+SRC_DIRS=()
+for init in "${REPO_ROOT}"/*/__init__.py; do
+    [[ -f "$init" ]] || continue
+    pkg="$(basename "$(dirname "$init")")"
+    case "$pkg" in
+        tests|build|docs|smoke_artifacts) continue ;;
+    esac
+    SRC_DIRS+=("$pkg")
+done
+# Explicit non-package directories that must also ship
+for extra in scripts; do
+    [[ -d "${REPO_ROOT}/${extra}" ]] && SRC_DIRS+=("$extra")
+done
+echo "Packaging source dirs: ${SRC_DIRS[*]}"
+for dir in "${SRC_DIRS[@]}"; do
     cp -r "${REPO_ROOT}/${dir}" "${BUILD_DIR}/opt/agora/src/"
 done
 # Remove dev-only tools not needed at runtime
