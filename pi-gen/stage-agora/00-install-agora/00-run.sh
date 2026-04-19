@@ -69,8 +69,8 @@ case "${BOARD}" in
     cat >> "${ROOTFS_DIR}/boot/firmware/config.txt" <<'PI4CFG'
 
 # Agora: Pi 4 display config
-hdmi_force_hotplug:0=1
-hdmi_force_hotplug:1=1
+# Current Bookworm firmware handles HDMI hotplug natively on Pi 4;
+# hdmi_force_hotplug was historically needed but now just adds noise.
 PI4CFG
     ;;
   pi5)
