@@ -64,6 +64,27 @@ jobs:
           path: build/*.deb
           retention-days: 30
 
+      - name: Smoke-test .deb before publishing
+        # Gates the release: if the .deb can't be extracted, has broken
+        # systemd ExecStart paths, or any entry point fails to import,
+        # we must not tag or publish. Runs inside debian:trixie-slim
+        # (the pi-gen image base) for a faithful import environment.
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            debian:trixie-slim \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                python3 python3-venv python3-pip dpkg-dev \
+                python3-gi python3-cairo \
+                gir1.2-glib-2.0 gir1.2-pango-1.0 gir1.2-gstreamer-1.0
+              bash packaging/smoke-test-deb.sh \
+                "build/agora_${{ steps.version.outputs.version }}_arm64.deb"
+            '
+
       - name: Create and push tag
         if: steps.check-branch.outputs.is-main == 'true'
         run: |

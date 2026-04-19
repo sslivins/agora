@@ -1,0 +1,46 @@
+name: Package Smoke
+
+# Builds the .deb on every PR/push to main and verifies that the
+# resulting package is actually runnable:
+#   - every top-level Python package can be imported
+#   - every systemd unit's ExecStart path exists inside the .deb
+#   - all runtime requirements install cleanly
+#
+# Exists to catch packaging regressions like the v1.11.2 outage where
+# a new package (hardware/) was omitted from the .deb, crash-looping
+# agora-player on every device after upgrade.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  package-smoke:
+    name: package-smoke
+    # arm64 runner so the smoke runs natively on the same architecture
+    # we ship to the Pi, and so a future extension can install the .deb
+    # for real via `dpkg -i` without emulation.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    # debian:trixie-slim matches the pi-gen base image — same Python
+    # 3.13, same libc, same apt sources as what actually runs on the Pi.
+    container: debian:trixie-slim
+    steps:
+      - name: Install build + smoke dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            ca-certificates git python3 python3-venv python3-pip \
+            dpkg-dev \
+            python3-gi python3-cairo \
+            gir1.2-glib-2.0 gir1.2-pango-1.0 gir1.2-gstreamer-1.0
+
+      - uses: actions/checkout@v4
+
+      - name: Build .deb
+        run: bash packaging/build-deb.sh 0.0.0-smoke
+
+      - name: Smoke-test .deb
+        run: bash packaging/smoke-test-deb.sh build/agora_0.0.0-smoke_arm64.deb
