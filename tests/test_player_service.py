@@ -1353,7 +1353,8 @@ class TestDisplayDetection:
 
 
 class TestBuildMpvCommand:
-    def test_basic_command_with_audio(self):
+    def test_default_command_is_muted_with_audio_device_bound(self):
+        """Default mpv spawn (splash-style) has the ALSA device bound but is muted."""
         with patch.dict("sys.modules", {
             "gi": MagicMock(),
             "gi.repository": MagicMock(),
@@ -1369,12 +1370,15 @@ class TestBuildMpvCommand:
             assert "--drm-connector=HDMI-A-1" in cmd
             assert "--fullscreen" in cmd
             assert "--no-terminal" in cmd
-            assert "--no-audio" not in cmd
+            assert "--no-audio" not in cmd, "audio device must be bound at launch"
             assert "--ao=alsa" in cmd
+            assert any(a.startswith("--audio-device=alsa/hdmi:") for a in cmd)
+            assert "--mute=yes" in cmd, "default spawn must be muted (splash policy)"
             assert "--loop=inf" not in cmd
             assert "test.mp4" in cmd[-1]
 
-    def test_command_without_audio(self):
+    def test_unmuted_command_for_scheduled_asset(self):
+        """Scheduled assets spawn unmuted but still bind the ALSA device."""
         with patch.dict("sys.modules", {
             "gi": MagicMock(),
             "gi.repository": MagicMock(),
@@ -1383,9 +1387,27 @@ class TestBuildMpvCommand:
             import player.service as svc
             importlib.reload(svc)
 
-            cmd = svc._build_mpv_command(Path("/test.mp4"), audio=False)
-            assert "--no-audio" in cmd
-            assert "--ao=alsa" not in cmd
+            cmd = svc._build_mpv_command(Path("/test.mp4"), muted=False)
+            assert "--no-audio" not in cmd
+            assert "--ao=alsa" in cmd
+            assert "--mute=yes" not in cmd
+
+    def test_image_splash_still_binds_audio_device(self):
+        """Image splash used to pass --no-audio; now it must keep the ALSA device
+        bound so a later IPC loadfile for a scheduled video can play audio."""
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import player.service as svc
+            importlib.reload(svc)
+
+            cmd = svc._build_mpv_command(Path("/opt/agora/splash/default.png"))
+            assert "--no-audio" not in cmd
+            assert "--ao=alsa" in cmd
+            assert "--mute=yes" in cmd
+            assert "--image-display-duration=inf" in cmd
 
     def test_command_with_loop(self):
         with patch.dict("sys.modules", {
@@ -1711,11 +1733,13 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # recv: loop-file response, hwdec response, loadfile response
+        # recv: loop-file, mute (pre-load), hwdec, loadfile, mute (post-load)
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
             b'{"request_id":0,"error":"success"}\n',  # hwdec
             self._make_success_response(),             # loadfile
+            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
         ]
 
         result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
@@ -1726,9 +1750,10 @@ class TestLoadfileMpv:
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
         assert b'"loop-file"' in sends[0]
         assert b'"inf"' in sends[0]  # loop=True → inf
-        assert b'"hwdec"' in sends[1]
-        assert b'"drm-copy"' in sends[1]
-        assert b'"loadfile"' in sends[2]
+        assert b'"mute"' in sends[1]
+        assert b'"hwdec"' in sends[2]
+        assert b'"drm-copy"' in sends[2]
+        assert b'"loadfile"' in sends[3]
 
     @patch("player.service.socket")
     @patch("player.service.time")
@@ -1742,23 +1767,25 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # recv: loop-file, image-display-duration, hwdec, loadfile, then 6x fullscreen toggles
+        # recv: loop-file, mute, image-display-duration, hwdec, loadfile, mute (post-load), 6x fullscreen toggles
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
             b'{"request_id":0,"error":"success"}\n',  # image-display-duration
             b'{"request_id":0,"error":"success"}\n',  # hwdec
             self._make_success_response(),             # loadfile
+            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
         ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle (off+on)
 
         result = mpv_player._loadfile_mpv(Path("/tmp/splash.png"), loop=True)
         assert result is True
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # loop-file, image-display-duration, hwdec, loadfile, then 6 fullscreen toggles
-        assert b'"image-display-duration"' in sends[1]
-        assert b'"inf"' in sends[1]
-        assert b'"hwdec"' in sends[2]
-        assert b'"no"' in sends[2]
+        # loop-file, mute, image-display-duration, hwdec, loadfile, mute (post-load), 6x fullscreen
+        assert b'"image-display-duration"' in sends[2]
+        assert b'"inf"' in sends[2]
+        assert b'"hwdec"' in sends[3]
+        assert b'"no"' in sends[3]
 
     def test_image_loadfile_triggers_fullscreen_toggle(self, mpv_player):
         """Image loadfile should toggle fullscreen 3x for DRM plane refresh."""
@@ -1775,16 +1802,19 @@ class TestLoadfileMpv:
             mock_socket_mod.SOCK_STREAM = 1
             mock_sock.recv.side_effect = [
                 b'{"request_id":0,"error":"success"}\n',  # loop-file
+                b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
                 b'{"request_id":0,"error":"success"}\n',  # image-display-duration
                 b'{"request_id":0,"error":"success"}\n',  # hwdec
                 self._make_success_response(),             # loadfile
+                b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
             ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle
 
             result = mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
             assert result is True
 
             sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-            assert len(sends) == 10
+            # loop-file, mute, img-dur, hwdec, loadfile, mute (post-load), 6x fullscreen
+            assert len(sends) == 12
             # Filter to only fullscreen commands
             fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
             assert len(fullscreen_sends) == 6
@@ -1809,15 +1839,17 @@ class TestLoadfileMpv:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
             b'{"request_id":0,"error":"success"}\n',  # hwdec
             self._make_success_response(),             # loadfile
+            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
         ]
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # Only 3 commands: loop-file, hwdec, loadfile — no fullscreen
-        assert len(sends) == 3
+        # 5 commands: loop-file, mute, hwdec, loadfile, mute (post-load) — no fullscreen
+        assert len(sends) == 5
         for s in sends:
             assert b'"fullscreen"' not in s
 
@@ -1837,6 +1869,7 @@ class TestLoadfileMpv:
         bad_resp = '{"event":"end-file","reason":"error"}\n'.encode()
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
             b'{"request_id":0,"error":"success"}\n',  # hwdec
             bad_resp,                                   # loadfile — no success
         ]
@@ -1895,9 +1928,10 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # First recv works, second times out
+        # First recv works, mute works, then hwdec times out
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file ok
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load) ok
             real_socket.timeout("timed out"),           # hwdec times out
         ]
 
@@ -1918,8 +1952,10 @@ class TestLoadfileMpv:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
             b'{"request_id":0,"error":"success"}\n',  # hwdec
             self._make_success_response(),             # loadfile
+            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
         ]
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
@@ -1969,9 +2005,11 @@ class TestStartMpvIpcFallback:
             '{"data":{"playlist_entry_id":2},"request_id":0,"error":"success"}',
         ]
         mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',
-            b'{"request_id":0,"error":"success"}\n',
-            ("\n".join(lines) + "\n").encode(),
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            ("\n".join(lines) + "\n").encode(),       # loadfile
+            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
         ]
 
         with patch.object(mpv_player, "_update_current"), \
@@ -2006,6 +2044,111 @@ class TestStartMpvIpcFallback:
             # Should have started a new process
             mock_subprocess.Popen.assert_called_once()
             assert mpv_player._mpv_process == mock_popen
+            # Regression: scheduled-asset fresh spawn must be unmuted
+            # (otherwise the long-lived mpv silently plays audio-bearing
+            # videos with --mute=yes — the #113 root cause)
+            cmd = mock_subprocess.Popen.call_args[0][0]
+            assert "--mute=yes" not in cmd
+            assert "--ao=alsa" in cmd
+
+
+# ── mute policy (issue #113: no audio after splash) ──
+
+
+class TestMutePolicy:
+    """Scheduled assets must play unmuted; splash must always be muted.
+
+    This ensures the long-lived mpv process is launched with the ALSA audio
+    device bound and that mute state is toggled via IPC across content swaps.
+    """
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_loadfile_for_scheduled_asset_sets_mute_false(self, mock_time, mock_socket_mod, mpv_player):
+        """_loadfile_mpv(muted=False) must send set_property mute false to running mpv."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":1},"request_id":0,"error":"success"}\n',  # loadfile
+            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
+        ]
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/video.mp4"), loop=True, muted=False)
+        assert result is True
+
+        sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+        mute_sends = [s for s in sends if b'"mute"' in s]
+        assert len(mute_sends) >= 2, "expected mute set before and after loadfile"
+        for s in mute_sends:
+            assert b"false" in s or b"False" in s, f"expected mute=false, got {s!r}"
+
+    @patch("player.service.socket")
+    @patch("player.service.time")
+    def test_loadfile_for_splash_sets_mute_true(self, mock_time, mock_socket_mod, mpv_player):
+        """_loadfile_mpv(muted=True) must send set_property mute true to running mpv."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        mock_sock.recv.side_effect = [
+            b'{"request_id":0,"error":"success"}\n',  # loop-file
+            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":0,"error":"success"}\n',  # image-display-duration
+            b'{"request_id":0,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":1},"request_id":0,"error":"success"}\n',  # loadfile
+            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
+        ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # fullscreen toggles
+
+        result = mpv_player._loadfile_mpv(Path("/tmp/splash.png"), loop=True, muted=True)
+        assert result is True
+
+        sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
+        mute_sends = [s for s in sends if b'"mute"' in s]
+        assert len(mute_sends) >= 2, "expected mute set before and after loadfile"
+        for s in mute_sends:
+            assert b"true" in s or b"True" in s, f"expected mute=true, got {s!r}"
+
+    def test_show_splash_fresh_spawn_is_muted(self, mpv_player, tmp_path):
+        """When IPC fails, splash must be spawned with --mute=yes and --ao=alsa."""
+        # Set up a fake splash asset
+        splash_dir = tmp_path / "splash"
+        splash_dir.mkdir()
+        splash = splash_dir / "default.png"
+        splash.write_bytes(b"\x89PNG" + b"\x00" * 100)
+
+        mpv_player._mpv_process = None  # No running mpv → IPC fails → fresh spawn
+        mpv_player._player_backend = "mpv"
+
+        with patch.object(mpv_player, "_find_splash", return_value=splash), \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_quit_plymouth"), \
+             patch.object(mpv_player, "_stop_cage"), \
+             patch("player.service.subprocess") as mock_subprocess:
+            mock_popen = MagicMock()
+            mock_popen.pid = 999
+            mock_subprocess.Popen.return_value = mock_popen
+
+            mpv_player._show_splash()
+
+            mock_subprocess.Popen.assert_called_once()
+            cmd = mock_subprocess.Popen.call_args[0][0]
+            assert "--mute=yes" in cmd, "splash must always be muted"
+            assert "--ao=alsa" in cmd, "audio device must be bound even for splash"
+            assert any(a.startswith("--audio-device=alsa/hdmi:") for a in cmd)
 
 
 # ── _find_splash fallback chain ──
