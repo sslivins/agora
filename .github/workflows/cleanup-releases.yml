@@ -7,12 +7,10 @@ name: Cleanup Old Releases
 # Runs weekly (Monday 09:00 UTC) and can be triggered manually with a
 # custom `keep` value or a dry-run.
 
-# Runs daily at 07:00 UTC (midnight PDT / 23:00 PST — cron doesn't
-# observe DST, so the local wall time drifts by an hour across the
-# DST boundary; that's fine for a cleanup job).
+# Runs weekly on Monday at 09:00 UTC.
 on:
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "0 9 * * 1"
   workflow_dispatch:
     inputs:
       keep:
