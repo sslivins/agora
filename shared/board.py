@@ -24,15 +24,23 @@ class Board(str, enum.Enum):
 
 @dataclass(frozen=True)
 class HdmiPort:
-    """I2C bus path for an HDMI port."""
-    name: str       # e.g. "HDMI-0", "HDMI-1"
-    i2c_bus: str    # e.g. "/dev/i2c-2"
+    """HDMI port metadata: I²C DDC bus path and DRM connector name.
+
+    ``drm_connector`` is the name used by the kernel DRM/KMS subsystem
+    (e.g. ``HDMI-A-1``, ``HDMI-A-2``).  It corresponds to
+    ``/sys/class/drm/card*-{drm_connector}/``.  Not all boards expose a
+    DRM sysfs status that's reliable — see ``hardware.display`` for the
+    board-aware probe selection.
+    """
+    name: str               # e.g. "HDMI-0", "HDMI-1"
+    i2c_bus: str            # e.g. "/dev/i2c-2"
+    drm_connector: str = ""  # e.g. "HDMI-A-1"
 
 
 # Per-board hardware capabilities
 _BOARD_CONFIG: dict[Board, dict] = {
     Board.ZERO_2W: {
-        "hdmi_ports": [HdmiPort("HDMI-0", "/dev/i2c-2")],
+        "hdmi_ports": [HdmiPort("HDMI-0", "/dev/i2c-2", "HDMI-A-1")],
         "codecs": ["h264"],
         "has_wifi": True,
         "has_ethernet": False,
@@ -42,8 +50,8 @@ _BOARD_CONFIG: dict[Board, dict] = {
     },
     Board.PI_4: {
         "hdmi_ports": [
-            HdmiPort("HDMI-0", "/dev/i2c-1"),
-            HdmiPort("HDMI-1", "/dev/i2c-10"),
+            HdmiPort("HDMI-0", "/dev/i2c-1", "HDMI-A-1"),
+            HdmiPort("HDMI-1", "/dev/i2c-10", "HDMI-A-2"),
         ],
         "codecs": ["hevc", "h264"],
         "has_wifi": True,
@@ -54,8 +62,8 @@ _BOARD_CONFIG: dict[Board, dict] = {
     },
     Board.PI_5: {
         "hdmi_ports": [
-            HdmiPort("HDMI-0", "/dev/i2c-3"),
-            HdmiPort("HDMI-1", "/dev/i2c-4"),
+            HdmiPort("HDMI-0", "/dev/i2c-3", "HDMI-A-1"),
+            HdmiPort("HDMI-1", "/dev/i2c-4", "HDMI-A-2"),
         ],
         "codecs": ["hevc"],
         "has_wifi": False,  # CM5 has no WiFi; Pi 5 board does — detected at runtime
@@ -68,7 +76,7 @@ _BOARD_CONFIG: dict[Board, dict] = {
 
 # Fallback for unknown boards
 _UNKNOWN_CONFIG: dict = {
-    "hdmi_ports": [HdmiPort("HDMI-0", "/dev/i2c-2")],
+    "hdmi_ports": [HdmiPort("HDMI-0", "/dev/i2c-2", "HDMI-A-1")],
     "codecs": ["h264"],
     "has_wifi": True,
     "has_ethernet": False,
@@ -129,6 +137,15 @@ def get_i2c_bus() -> str:
 
 def get_i2c_buses() -> list[HdmiPort]:
     """Return all HDMI port I2C bus mappings for the current board."""
+    return list(_config()["hdmi_ports"])
+
+
+def get_hdmi_ports() -> list[HdmiPort]:
+    """Return all :class:`HdmiPort` entries for the current board.
+
+    Alias of :func:`get_i2c_buses` with a name that reflects post-#178
+    usage (the port carries I²C *and* DRM connector metadata).
+    """
     return list(_config()["hdmi_ports"])
 
 

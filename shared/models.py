@@ -24,6 +24,16 @@ class DesiredState(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class PortStatus(BaseModel):
+    """Connection status of a single HDMI port.
+
+    ``connected`` is tri-state: ``True`` (display attached),
+    ``False`` (nothing attached), or ``None`` (status not determinable).
+    """
+    name: str
+    connected: Optional[bool] = None
+
+
 class CurrentState(BaseModel):
     mode: PlaybackMode = PlaybackMode.SPLASH
     asset: Optional[str] = None
@@ -34,6 +44,7 @@ class CurrentState(BaseModel):
     playback_position_ms: Optional[int] = None
     pipeline_state: str = "NULL"
     display_connected: Optional[bool] = None
+    display_ports: Optional[list[PortStatus]] = None
     error: Optional[str] = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

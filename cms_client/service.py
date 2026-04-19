@@ -512,6 +512,7 @@ class CMSClient:
             "ssh_enabled": _is_ssh_enabled(),
             "local_api_enabled": _is_local_api_enabled(self.settings.persist_dir),
             "display_connected": current_data.get("display_connected"),
+            "display_ports": current_data.get("display_ports"),
         }
         await self._ws.send(json.dumps(status_msg))
 

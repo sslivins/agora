@@ -17,7 +17,8 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-from shared.board import Board, alsa_card, get_board, get_i2c_bus, player_backend, supported_codecs  # noqa: E402
+from shared.board import Board, alsa_card, get_board, player_backend, supported_codecs  # noqa: E402
+from hardware.display import PortStatus, get_display_probe  # noqa: E402
 from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
 
@@ -156,10 +157,6 @@ class AgoraPlayer:
         "imagefreeze ! kmssink driver-name=vc4 sync=false"
     )
 
-    # HDMI display detection via DDC/EDID I2C probe
-    _EDID_ADDR = 0x50
-    _I2C_SLAVE = 0x0703  # ioctl request code
-
     DEFAULT_SPLASH_CONFIG = "splash/default.png"
 
     def __init__(self, base_path: str = "/opt/agora"):
@@ -172,7 +169,7 @@ class AgoraPlayer:
         self.splash_config_path = self.persist_dir / "splash"
 
         self._board = get_board()
-        self._i2c_bus = get_i2c_bus()
+        self._display_probe = get_display_probe()
         self._player_backend = player_backend()
 
         self.pipeline: Optional[Gst.Pipeline] = None
@@ -188,6 +185,11 @@ class AgoraPlayer:
         self._pending_error: Optional[str] = None
         self._plymouth_quit: bool = False
         self._running = True
+        # Debounce state for display port connection changes (issue #178).
+        # Maps port name -> (candidate_new_value, consecutive_count).
+        # Only flips between True<->False require confirmation; transitions
+        # involving None (indeterminate) commit immediately.
+        self._display_pending: dict[str, tuple[Optional[bool], int]] = {}
 
         Gst.init(None)
 
@@ -743,29 +745,52 @@ class AgoraPlayer:
         combined = f"{raw} {debug}"
         return any(m in combined for m in cls._DISPLAY_ERROR_MARKERS)
 
-    @classmethod
-    def _is_display_connected(cls) -> Optional[bool]:
-        """Probe the HDMI DDC/EDID I2C bus to detect a connected display.
+    def _probe_display(self) -> tuple[Optional[bool], list[PortStatus]]:
+        """Probe all HDMI ports via the board-specific display probe.
 
-        Reads one byte from the EDID EEPROM at address 0x50 on the board's
-        primary HDMI I2C bus.  Returns True if the device responds (display
-        connected), False if it fails with an I/O error (no display), or
-        None if the I2C bus is not available.
+        Returns ``(primary_connected, all_ports)`` where ``primary_connected``
+        is the ``connected`` value for port 0 (or ``None`` if the board has
+        no ports or probing failed for it).
         """
-        i2c_bus = get_i2c_bus()
         try:
-            fd = os.open(i2c_bus, os.O_RDWR)
-        except OSError:
-            return None
-        try:
-            import fcntl
-            fcntl.ioctl(fd, cls._I2C_SLAVE, cls._EDID_ADDR)
-            os.read(fd, 1)
-            return True
-        except OSError:
-            return False
-        finally:
-            os.close(fd)
+            ports = self._display_probe.probe_all()
+        except Exception:
+            logger.debug("Display probe failed", exc_info=True)
+            return None, []
+        primary = ports[0].connected if ports else None
+        return primary, ports
+
+    def _debounce_display(
+        self, ports: list[PortStatus], previous: Optional[list[PortStatus]]
+    ) -> list[PortStatus]:
+        """Require two consecutive matching probes before flipping True<->False.
+
+        Transitions involving ``None`` (indeterminate) commit immediately.
+        Only applies in periodic polling; explicit ``_update_current`` calls
+        pass the raw probe result through.
+        """
+        prev_by_name: dict[str, Optional[bool]] = {}
+        if previous:
+            for p in previous:
+                prev_by_name[p.name] = p.connected
+        committed: list[PortStatus] = []
+        for port in ports:
+            prev = prev_by_name.get(port.name)
+            new = port.connected
+            if new == prev or new is None or prev is None:
+                # Instantaneous commit: no change, or a None endpoint.
+                self._display_pending.pop(port.name, None)
+                committed.append(port)
+                continue
+            # True<->False flip: require a second matching reading.
+            pending = self._display_pending.get(port.name)
+            if pending and pending[0] == new:
+                self._display_pending.pop(port.name, None)
+                committed.append(port)
+            else:
+                self._display_pending[port.name] = (new, 1)
+                committed.append(PortStatus(name=port.name, connected=prev))
+        return committed
 
     _RETRY_DELAY_MAX = 15
 
@@ -880,6 +905,7 @@ class AgoraPlayer:
             except Exception:
                 pipeline_state = "ERROR"
 
+        primary_connected, ports = self._probe_display()
         state = CurrentState(
             mode=mode,
             asset=asset,
@@ -889,7 +915,8 @@ class AgoraPlayer:
             started_at=started_at,
             playback_position_ms=self._query_position_ms(),
             pipeline_state=pipeline_state,
-            display_connected=self._is_display_connected(),
+            display_connected=primary_connected,
+            display_ports=ports or None,
             error=error,
         )
         write_state(self.current_path, state)
@@ -910,15 +937,26 @@ class AgoraPlayer:
         try:
             current = read_state(self.current_path, CurrentState)
             pos = self._query_position_ms()
-            display = self._is_display_connected()
+            _, raw_ports = self._probe_display()
+            ports = self._debounce_display(raw_ports, current.display_ports)
+            primary = ports[0].connected if ports else None
             changed = False
             if pos is not None and current.playback_position_ms != pos:
                 current.playback_position_ms = pos
                 changed = True
-            if current.display_connected != display:
-                if display is not None and current.display_connected is not None:
-                    logger.warning("Display %s", "connected" if display else "disconnected")
-                current.display_connected = display
+            if current.display_connected != primary:
+                if primary is not None and current.display_connected is not None:
+                    logger.warning(
+                        "Display %s",
+                        "connected" if primary else "disconnected",
+                    )
+                current.display_connected = primary
+                changed = True
+            old_ports = current.display_ports or []
+            old_map = {p.name: p.connected for p in old_ports}
+            new_map = {p.name: p.connected for p in ports}
+            if old_map != new_map:
+                current.display_ports = ports or None
                 changed = True
             if changed:
                 current.updated_at = datetime.now(timezone.utc)
