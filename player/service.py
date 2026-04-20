@@ -292,6 +292,45 @@ class AgoraPlayer:
 
     # ── Cage+Chromium (webpage rendering) ──
 
+    # Boards where aggressive Chromium memory-saver flags are applied.
+    # These boards either have ≤1 GB RAM (Zero 2 W) or are memory-constrained
+    # variants in the supported line (Pi 4 — the 1 GB model is still in use).
+    # Pi 5 is excluded: it has ≥4 GB and hardware-accelerated compositing.
+    # UNKNOWN is included defensively (same rationale as gstreamer fallback).
+    _LOWMEM_BOARDS = frozenset({Board.ZERO_2W, Board.PI_4, Board.UNKNOWN})
+
+    @staticmethod
+    def _chromium_lowmem_flags() -> list[str]:
+        """Chromium flags that reduce RAM footprint on memory-constrained boards.
+
+        Empirically validated on a Pi Zero 2 W (416 MB usable RAM) rendering
+        wikipedia, google, bbc and similar pages without swap thrash. Full
+        rationale and test results are in the PR that introduced this helper.
+        """
+        return [
+            # Bypass the Raspberry Pi OS chromium wrapper's low-RAM zenity
+            # dialog that blocks launch on boards with MemTotal ≤ 512 MB.
+            "--no-memcheck",
+            # Collapse all same-site frames into one renderer and cap it at 1.
+            "--disable-features=site-per-process,IsolateOrigins,SpareRendererForSitePerProcess",
+            "--process-per-site",
+            "--renderer-process-limit=1",
+            # Skip disk cache writes (slow SD, small wins, bloats dirty pages).
+            "--disk-cache-size=1", "--media-cache-size=1",
+            # Don't proactively free memory on pressure events; we're always
+            # under pressure, and the discards cause visible redraw churn.
+            "--memory-pressure-off",
+            # Chromium auto-disables GPU rasterization below 512 MB anyway,
+            # but explicit flags also free upfront EGL/GBM surface allocations
+            # and skip the GPU process, which measurably reduces RSS.
+            "--disable-gpu", "--disable-gpu-compositing", "--disable-accelerated-2d-canvas",
+            # Background chatter that's pointless for signage.
+            "--disable-background-networking", "--disable-sync", "--disable-default-apps",
+            "--disable-component-update", "--disable-domain-reliability",
+            # Cap V8 heap so JS-heavy sites don't eat all RAM before GC.
+            "--js-flags=--max-old-space-size=96 --max-semi-space-size=2",
+        ]
+
     def _start_cage(self, url: str) -> None:
         """Launch Cage + Chromium in kiosk mode to render a URL."""
         self._stop_cage()
@@ -306,9 +345,13 @@ class AgoraPlayer:
             "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
             "--disable-translate", "--disable-infobars", "--incognito",
             "--hide-scrollbars", "--autoplay-policy=no-user-gesture-required",
+        ]
+        if get_board() in self._LOWMEM_BOARDS:
+            cmd.extend(self._chromium_lowmem_flags())
+        cmd.extend([
             "--load-extension=/opt/agora/src/player/extensions/hide-cursor",
             url,
-        ]
+        ])
 
         logger.info("Starting Cage+Chromium for URL: %s", url)
         try:
