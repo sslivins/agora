@@ -2428,3 +2428,76 @@ class TestFindSplash:
         assert mpv_player._resolve_asset("img.png") is not None
         assert mpv_player._resolve_asset("spl.png") is not None
         assert mpv_player._resolve_asset("missing.png") is None
+
+
+class TestChromiumLowMemFlags:
+    """Verify low-memory Chromium flag set is applied only on supported boards."""
+
+    @pytest.fixture
+    def svc_module(self):
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import player.service as svc
+            importlib.reload(svc)
+            yield svc
+
+    def test_lowmem_boards_set(self, svc_module):
+        """Zero 2 W, Pi 4 and UNKNOWN get low-mem flags; Pi 5 does not."""
+        p = svc_module.AgoraPlayer
+        assert svc_module.Board.ZERO_2W in p._LOWMEM_BOARDS
+        assert svc_module.Board.PI_4 in p._LOWMEM_BOARDS
+        assert svc_module.Board.UNKNOWN in p._LOWMEM_BOARDS
+        assert svc_module.Board.PI_5 not in p._LOWMEM_BOARDS
+
+    def test_lowmem_flags_contents(self, svc_module):
+        """Flag list contains the empirically-validated memory-saver switches."""
+        flags = svc_module.AgoraPlayer._chromium_lowmem_flags()
+        assert "--no-memcheck" in flags
+        assert "--process-per-site" in flags
+        assert "--renderer-process-limit=1" in flags
+        assert "--memory-pressure-off" in flags
+        assert "--disable-gpu" in flags
+        assert "--disable-gpu-compositing" in flags
+        assert "--disable-accelerated-2d-canvas" in flags
+        assert any(f.startswith("--js-flags=") and "max-old-space-size" in f for f in flags)
+        assert any(f.startswith("--disable-features=") and "site-per-process" in f for f in flags)
+
+    def test_start_cage_applies_flags_on_zero2w(self, player, svc_module):
+        """On Zero 2 W the low-mem flag set is injected into the cage command."""
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.ZERO_2W), \
+             patch.object(player, "_stop_cage"), \
+             patch.object(player, "_teardown"), \
+             patch.object(player, "_update_current"), \
+             patch("player.service.subprocess.Popen") as mock_popen, \
+             patch("player.service.os.makedirs"):
+            mock_popen.return_value = MagicMock()
+            player._start_cage("https://example.com")
+
+        args, _ = mock_popen.call_args
+        cmd = args[0]
+        assert "--no-memcheck" in cmd
+        assert "--process-per-site" in cmd
+        assert "--disable-gpu" in cmd
+
+    def test_start_cage_omits_flags_on_pi5(self, mpv_player, svc_module):
+        """On Pi 5 the low-mem flag set is NOT applied."""
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
+             patch.object(mpv_player, "_stop_cage"), \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_update_current"), \
+             patch("player.service.subprocess.Popen") as mock_popen, \
+             patch("player.service.os.makedirs"):
+            mock_popen.return_value = MagicMock()
+            mpv_player._start_cage("https://example.com")
+
+        args, _ = mock_popen.call_args
+        cmd = args[0]
+        assert "--no-memcheck" not in cmd
+        assert "--process-per-site" not in cmd
+        assert "--disable-gpu" not in cmd
+        # Baseline flags still present
+        assert "--kiosk" in cmd
+        assert "https://example.com" in cmd
