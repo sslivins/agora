@@ -24,10 +24,11 @@ Select the transport with the ``AGORA_CMS_TRANSPORT`` environment
 variable (``direct`` or ``wps``).  In WPS mode, the device API key
 used to call the connect-token endpoint is sourced from the
 ``AGORA_DEVICE_API_KEY`` env var or, if unset, read from
-``<persist_dir>/cms_device_api_key``.  This key is deliberately
-distinct from the per-device auth_token minted over the register
-handshake — the real Pi fleet uses the same split (API key for
-bootstrap, auth_token for subsequent WS register messages).
+``<persist_dir>/api_key`` — the same file CMS rotates into via the
+config message and that direct-mode transport uses for asset
+downloads.  This key is distinct from the per-device auth_token
+minted over the register handshake (API key for bootstrap,
+auth_token for subsequent WS register messages).
 """
 
 from __future__ import annotations

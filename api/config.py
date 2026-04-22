@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # derived from cms_url (wss://host/ws/... -> https://host).
     cms_api_url: str = ""
     # Device API key used for the connect-token call.  Takes precedence over
-    # the value stored in <persist_dir>/cms_device_api_key.
+    # the value stored in <persist_dir>/api_key.
     device_api_key: str = ""
 
     # Asset budget (0 = 80% of partition)
@@ -88,10 +88,6 @@ class Settings(BaseSettings):
     @property
     def auth_token_path(self) -> Path:
         return self.persist_dir / "cms_auth_token"
-
-    @property
-    def device_api_key_path(self) -> Path:
-        return self.persist_dir / "cms_device_api_key"
 
     @property
     def cms_config_path(self) -> Path:
