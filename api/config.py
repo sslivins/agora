@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     # CMS connection
     cms_url: str = ""  # e.g. ws://192.168.1.100:8080/ws/device
 
+    # Transport selection: "direct" (default) or "wps" (Azure Web PubSub).
+    # When "wps", the device calls POST {cms_api_url}/api/devices/{id}/connect-token
+    # with the X-Device-API-Key header to get a WPS client URL, then connects
+    # via the json.webpubsub.azure.v1 subprotocol.
+    cms_transport: str = "direct"
+    # Optional override for the connect-token HTTP base.  If empty, it is
+    # derived from cms_url (wss://host/ws/... -> https://host).
+    cms_api_url: str = ""
+    # Device API key used for the connect-token call.  Takes precedence over
+    # the value stored in <persist_dir>/cms_device_api_key.
+    device_api_key: str = ""
+
     # Asset budget (0 = 80% of partition)
     asset_budget_mb: int = 0
 
@@ -76,6 +88,10 @@ class Settings(BaseSettings):
     @property
     def auth_token_path(self) -> Path:
         return self.persist_dir / "cms_auth_token"
+
+    @property
+    def device_api_key_path(self) -> Path:
+        return self.persist_dir / "cms_device_api_key"
 
     @property
     def cms_config_path(self) -> Path:

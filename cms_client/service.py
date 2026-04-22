@@ -21,6 +21,7 @@ import websockets
 
 from api.config import Settings
 from cms_client.asset_manager import AssetManager
+from cms_client.transport import TransportError, open_transport
 from shared.board import get_cpu_temp, supported_codecs
 from shared.models import CurrentState, DesiredState, PlaybackMode
 from shared.state import atomic_write, read_state, write_state
@@ -218,6 +219,25 @@ def _save_auth_token(path: Path, token: str) -> None:
         pass
 
 
+def _resolve_device_api_key(settings: Settings) -> str:
+    """Return the WPS device API key.
+
+    Prefers the ``device_api_key`` settings field (which picks up
+    ``AGORA_DEVICE_API_KEY``); falls back to the contents of
+    ``<persist_dir>/cms_device_api_key``.
+    """
+    key = getattr(settings, "device_api_key", "") or ""
+    if key:
+        return key.strip()
+    path = getattr(settings, "device_api_key_path", None)
+    if path is None:
+        return ""
+    try:
+        return path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
 # ── Schedule evaluation helpers ──
 
 def _parse_time(s: str) -> tuple[int, int, int]:
@@ -393,6 +413,7 @@ class CMSClient:
                     websockets.ConnectionClosed,
                     websockets.InvalidURI,
                     websockets.InvalidHandshake,
+                    TransportError,
                     OSError,
                 ) as e:
                     attempt += 1
@@ -459,16 +480,31 @@ class CMSClient:
         """Single connection lifecycle: connect → register → message loop."""
         cms_url = self._get_cms_url()
         self._active_cms_url = cms_url
-        logger.info("Connecting to CMS at %s", cms_url)
+        transport_mode = (getattr(self.settings, "cms_transport", "") or "direct").lower()
+        logger.info(
+            "Connecting to CMS at %s (transport=%s)", cms_url, transport_mode,
+        )
 
-        async with websockets.connect(
-            cms_url,
-            ping_interval=20,
-            ping_timeout=10,
-            close_timeout=5,
-        ) as ws:
+        api_key = ""
+        if transport_mode == "wps":
+            api_key = _resolve_device_api_key(self.settings)
+            if not api_key:
+                raise TransportError(
+                    "AGORA_CMS_TRANSPORT=wps requires AGORA_DEVICE_API_KEY "
+                    "or a provisioned cms_device_api_key file"
+                )
+
+        transport = await open_transport(
+            mode=transport_mode,
+            cms_url=cms_url,
+            device_id=self.device_id,
+            api_key=api_key,
+            api_base=getattr(self.settings, "cms_api_url", "") or None,
+        )
+
+        async with transport as ws:
             self._ws = ws
-            logger.info("WebSocket connected")
+            logger.info("WebSocket connected (transport=%s)", transport_mode)
 
             auth_token = _read_auth_token(self.settings.auth_token_path)
             # Always start as "pending" — actual status comes from the CMS
