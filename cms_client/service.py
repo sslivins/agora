@@ -220,20 +220,19 @@ def _save_auth_token(path: Path, token: str) -> None:
 
 
 def _resolve_device_api_key(settings: Settings) -> str:
-    """Return the WPS device API key.
+    """Return the device API key used for WPS transport auth.
 
-    Prefers the ``device_api_key`` settings field (which picks up
-    ``AGORA_DEVICE_API_KEY``); falls back to the contents of
-    ``<persist_dir>/cms_device_api_key``.
+    Prefers ``AGORA_DEVICE_API_KEY`` (dev/test override);
+    otherwise reads ``<persist_dir>/api_key`` — the same file CMS
+    rotates into via the config message and that direct-mode
+    transport uses for asset downloads.
     """
     key = getattr(settings, "device_api_key", "") or ""
     if key:
         return key.strip()
-    path = getattr(settings, "device_api_key_path", None)
-    if path is None:
-        return ""
+    key_path = settings.persist_dir / "api_key"
     try:
-        return path.read_text().strip()
+        return key_path.read_text().strip()
     except (FileNotFoundError, OSError):
         return ""
 
@@ -491,7 +490,7 @@ class CMSClient:
             if not api_key:
                 raise TransportError(
                     "AGORA_CMS_TRANSPORT=wps requires AGORA_DEVICE_API_KEY "
-                    "or a provisioned cms_device_api_key file"
+                    "or a populated <persist_dir>/api_key file"
                 )
 
         transport = await open_transport(
