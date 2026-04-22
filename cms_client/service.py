@@ -27,7 +27,25 @@ from shared.state import atomic_write, read_state, write_state
 
 logger = logging.getLogger("agora.cms_client")
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+
+# Stage 3c (#345 in agora-cms): chunked LOGS_RESPONSE over the
+# existing WS channel.  WPS caps a single WebSocket frame at ~1 MiB;
+# we build a gzipped tarball of journal output and, if it's too large
+# to fit in one JSON message, split it into LGCK-tagged binary frames
+# that the CMS assembler concatenates into a blob.
+LOGS_CHUNK_MAGIC = b"LGCK"
+LOGS_CHUNK_HEADER_VERSION = 1
+LOGS_CHUNK_FLAG_FINAL = 0x01
+# ~900 KiB JSON fits safely under the 1 MiB WPS ceiling after the
+# WS/WPS framing overhead.  Anything larger goes down the chunk path.
+LOGS_JSON_MAX_BYTES = 900_000
+# Payload bytes per chunk.  30 × 0.75 MiB = 22.5 MiB total possible
+# frames, but the assembler enforces a 21 MiB assembled cap — the
+# chunk-count cap (30) is the practical limit for Pi-generated logs.
+LOGS_CHUNK_PAYLOAD_BYTES = 768 * 1024
+LOGS_CHUNK_MAX_COUNT = 30
+LOGS_CHUNK_ASSEMBLED_CAP = 22_020_096  # 21 MiB — matches CMS side
 
 # Reconnect backoff: 2s, 4s, 8s, ... capped at 60s
 RECONNECT_BASE = 2
@@ -46,6 +64,69 @@ AUTH_REJECTED_RETRY = 10    # seconds to wait before retrying after auth rejecti
 
 class AuthRejectedError(Exception):
     """Raised when the CMS rejects this device's credentials."""
+
+
+def _build_logs_tar_gz(logs: dict[str, str]) -> bytes:
+    """Pack per-service log text into a gzipped tar archive.
+
+    Mirrors the layout the CMS-side shim produces for the legacy
+    ``LOGS_RESPONSE`` JSON path — one ``<service>.log`` entry per
+    service, UTF-8 encoded.  The CMS assembler writes the result to
+    blob storage untouched; consumers (the dashboard download link)
+    pull it straight through.
+    """
+    import io
+    import tarfile
+    import time
+
+    buf = io.BytesIO()
+    mtime = int(time.time())
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for service_name, log_text in logs.items():
+            safe_name = service_name.replace("/", "_").replace("\\", "_")
+            data = (log_text or "").encode("utf-8")
+            info = tarfile.TarInfo(name=f"{safe_name}.log")
+            info.size = len(data)
+            info.mtime = mtime
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _encode_logs_chunk_frame(
+    *,
+    request_id: str,
+    seq: int,
+    total: int,
+    payload: bytes,
+    is_final: bool,
+) -> bytes:
+    """Encode a single LGCK chunk frame.
+
+    Wire format (little-endian, matches the CMS assembler):
+
+    ``"LGCK" | u8 ver | u16 rid_len | utf8 request_id | u16 seq |
+    u16 total | u8 flags | payload``
+
+    ``flags`` bit 0 is the ``is_final`` marker.
+    """
+    import struct
+
+    if total <= 0:
+        raise ValueError("total must be > 0")
+    if not 0 <= seq < total:
+        raise ValueError(f"seq {seq} out of range for total {total}")
+    rid_bytes = request_id.encode("utf-8")
+    if len(rid_bytes) > 0xFFFF:
+        raise ValueError("request_id too long")
+    flags = LOGS_CHUNK_FLAG_FINAL if is_final else 0
+    header = (
+        LOGS_CHUNK_MAGIC
+        + struct.pack("<B", LOGS_CHUNK_HEADER_VERSION)
+        + struct.pack("<H", len(rid_bytes))
+        + rid_bytes
+        + struct.pack("<HHB", seq, total, flags)
+    )
+    return header + payload
 
 
 def _get_device_id() -> str:
@@ -412,6 +493,9 @@ class CMSClient:
                 "ip_address": _get_local_ip(),
                 "storage_capacity_mb": cap_mb,
                 "storage_used_mb": used_mb,
+                # Stage 3c: advertises that this device can split large
+                # LOGS_RESPONSE payloads into LGCK binary frames.
+                "capabilities": ["logs_chunk_v1"],
             }
             await ws.send(json.dumps(register_msg))
             logger.info("Sent register message (device_id=%s)", self.device_id)
@@ -1422,7 +1506,16 @@ class CMSClient:
             pass
 
     async def _handle_request_logs(self, msg: dict, ws) -> None:
-        """Collect journalctl logs for requested services and send back."""
+        """Collect journalctl logs for requested services and send back.
+
+        Stage 3c (#345 in agora-cms): the current single-message
+        ``logs_response`` JSON path works fine for most devices but
+        silently truncates / errors when the journal output exceeds
+        the WPS ~1 MiB per-message cap.  When that happens we build a
+        gzipped tarball of the per-service output and stream it back
+        as a sequence of LGCK-tagged binary WebSocket frames that the
+        CMS assembler reconstructs on the other side.
+        """
         request_id = msg.get("request_id", "")
         services = msg.get("services") or [
             "agora-player", "agora-api", "agora-cms-client", "agora-provision",
@@ -1451,17 +1544,105 @@ class CMSClient:
             except Exception as e:
                 logs[service] = f"[error: {e}]"
 
+        # journalctl-failure case always uses the small path — there's
+        # no payload worth chunking.
+        if error:
+            try:
+                await ws.send(json.dumps({
+                    "type": "logs_response",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "device_id": self.device_id,
+                    "logs": logs,
+                    "error": error,
+                }))
+            except Exception:
+                logger.exception("Failed to send logs response")
+            return
+
+        # Decide: JSON path (legacy, small) vs chunked binary path.
+        response = {
+            "type": "logs_response",
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "device_id": self.device_id,
+            "logs": logs,
+            "error": None,
+        }
+        json_payload = json.dumps(response)
+
+        if len(json_payload.encode("utf-8")) <= LOGS_JSON_MAX_BYTES:
+            try:
+                await ws.send(json_payload)
+            except Exception:
+                logger.exception("Failed to send logs response")
+            return
+
+        # Large payload: gzipped tarball → binary LGCK chunks.
+        try:
+            tar_gz = _build_logs_tar_gz(logs)
+        except Exception as e:
+            logger.exception("Failed to build logs tarball for request %s", request_id)
+            await self._send_logs_error(ws, request_id, f"log_pack_failed: {e}")
+            return
+
+        if len(tar_gz) > LOGS_CHUNK_ASSEMBLED_CAP:
+            logger.warning(
+                "Log request %s payload %d bytes exceeds %d-byte cap; dropping",
+                request_id, len(tar_gz), LOGS_CHUNK_ASSEMBLED_CAP,
+            )
+            await self._send_logs_error(
+                ws, request_id,
+                f"logs_too_large: {len(tar_gz)} bytes > {LOGS_CHUNK_ASSEMBLED_CAP}",
+            )
+            return
+
+        total_chunks = (len(tar_gz) + LOGS_CHUNK_PAYLOAD_BYTES - 1) // LOGS_CHUNK_PAYLOAD_BYTES
+        if total_chunks > LOGS_CHUNK_MAX_COUNT:
+            logger.warning(
+                "Log request %s would need %d chunks (max %d); dropping",
+                request_id, total_chunks, LOGS_CHUNK_MAX_COUNT,
+            )
+            await self._send_logs_error(
+                ws, request_id,
+                f"logs_too_large: {total_chunks} chunks > {LOGS_CHUNK_MAX_COUNT}",
+            )
+            return
+
+        logger.info(
+            "Log request %s: sending %d bytes in %d chunks",
+            request_id, len(tar_gz), total_chunks,
+        )
+        try:
+            for seq in range(total_chunks):
+                start = seq * LOGS_CHUNK_PAYLOAD_BYTES
+                end = start + LOGS_CHUNK_PAYLOAD_BYTES
+                is_final = seq == total_chunks - 1
+                frame = _encode_logs_chunk_frame(
+                    request_id=request_id,
+                    seq=seq,
+                    total=total_chunks,
+                    payload=tar_gz[start:end],
+                    is_final=is_final,
+                )
+                await ws.send(frame)
+        except Exception:
+            logger.exception(
+                "Failed to send chunked logs for request %s", request_id,
+            )
+
+    async def _send_logs_error(self, ws, request_id: str, error: str) -> None:
         try:
             await ws.send(json.dumps({
                 "type": "logs_response",
                 "protocol_version": PROTOCOL_VERSION,
                 "request_id": request_id,
                 "device_id": self.device_id,
-                "logs": logs,
+                "logs": {},
                 "error": error,
             }))
         except Exception:
-            logger.exception("Failed to send logs response")
+            logger.exception("Failed to send logs error response")
 
     async def _handle_upgrade(self, ws) -> None:
         logger.info("Upgrade requested by CMS")
