@@ -145,10 +145,14 @@ def _resolve_device_api_key(settings: Settings) -> str:
     ``AGORA_DEVICE_API_KEY``); falls back to the contents of
     ``<persist_dir>/cms_device_api_key``.
     """
-    if settings.device_api_key:
-        return settings.device_api_key.strip()
+    key = getattr(settings, "device_api_key", "") or ""
+    if key:
+        return key.strip()
+    path = getattr(settings, "device_api_key_path", None)
+    if path is None:
+        return ""
     try:
-        return settings.device_api_key_path.read_text().strip()
+        return path.read_text().strip()
     except (FileNotFoundError, OSError):
         return ""
 
@@ -395,7 +399,7 @@ class CMSClient:
         """Single connection lifecycle: connect → register → message loop."""
         cms_url = self._get_cms_url()
         self._active_cms_url = cms_url
-        transport_mode = (self.settings.cms_transport or "direct").lower()
+        transport_mode = (getattr(self.settings, "cms_transport", "") or "direct").lower()
         logger.info(
             "Connecting to CMS at %s (transport=%s)", cms_url, transport_mode,
         )
@@ -414,7 +418,7 @@ class CMSClient:
             cms_url=cms_url,
             device_id=self.device_id,
             api_key=api_key,
-            api_base=self.settings.cms_api_url or None,
+            api_base=getattr(self.settings, "cms_api_url", "") or None,
         )
 
         async with transport as ws:
