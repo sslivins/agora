@@ -18,10 +18,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import websockets
+import aiohttp
 
 from api.config import Settings
 from cms_client.asset_manager import AssetManager
-from cms_client.transport import TransportError, open_transport
+from cms_client.transport import TransportError, _derive_api_base, open_transport
 from shared.board import get_cpu_temp, supported_codecs
 from shared.models import CurrentState, DesiredState, PlaybackMode
 from shared.state import atomic_write, read_state, write_state
@@ -30,23 +31,23 @@ logger = logging.getLogger("agora.cms_client")
 
 PROTOCOL_VERSION = 2
 
-# Stage 3c (#345 in agora-cms): chunked LOGS_RESPONSE over the
-# existing WS channel.  WPS caps a single WebSocket frame at ~1 MiB;
-# we build a gzipped tarball of journal output and, if it's too large
-# to fit in one JSON message, split it into LGCK-tagged binary frames
-# that the CMS assembler concatenates into a blob.
-LOGS_CHUNK_MAGIC = b"LGCK"
-LOGS_CHUNK_HEADER_VERSION = 1
-LOGS_CHUNK_FLAG_FINAL = 0x01
+# Log request transport:
+# - Small payloads (<= LOGS_JSON_MAX_BYTES) ride the WS as a single
+#   ``logs_response`` JSON message (legacy path, unchanged).
+# - Large payloads are gzipped to a tarball and HTTP-POSTed straight
+#   to the CMS at ``/api/devices/{device_id}/logs/{request_id}/upload``.
+#   This path was introduced to replace the Stage-3c chunked binary
+#   (LGCK) frames, which WPS transport rejects — ``ws.send(bytes)``
+#   is not supported under Web PubSub.
 # ~900 KiB JSON fits safely under the 1 MiB WPS ceiling after the
-# WS/WPS framing overhead.  Anything larger goes down the chunk path.
+# WS/WPS framing overhead.  Anything larger takes the HTTP upload path.
 LOGS_JSON_MAX_BYTES = 900_000
-# Payload bytes per chunk.  30 × 0.75 MiB = 22.5 MiB total possible
-# frames, but the assembler enforces a 21 MiB assembled cap — the
-# chunk-count cap (30) is the practical limit for Pi-generated logs.
-LOGS_CHUNK_PAYLOAD_BYTES = 768 * 1024
-LOGS_CHUNK_MAX_COUNT = 30
-LOGS_CHUNK_ASSEMBLED_CAP = 22_020_096  # 21 MiB — matches CMS side
+# Maximum compressed upload size the CMS accepts (matches the CMS
+# ``MAX_UPLOAD_BYTES`` constant in ``cms/routers/log_requests.py``).
+LOGS_UPLOAD_MAX_BYTES = 22_020_096  # 21 MiB
+# HTTP timeout for the log-upload POST.  Pi-side journal tarballs are
+# tens of MB at most over a local network.
+LOGS_UPLOAD_TIMEOUT = 60.0
 
 # Reconnect backoff: 2s, 4s, 8s, ... capped at 60s
 RECONNECT_BASE = 2
@@ -91,43 +92,6 @@ def _build_logs_tar_gz(logs: dict[str, str]) -> bytes:
             info.mtime = mtime
             tf.addfile(info, io.BytesIO(data))
     return buf.getvalue()
-
-
-def _encode_logs_chunk_frame(
-    *,
-    request_id: str,
-    seq: int,
-    total: int,
-    payload: bytes,
-    is_final: bool,
-) -> bytes:
-    """Encode a single LGCK chunk frame.
-
-    Wire format (little-endian, matches the CMS assembler):
-
-    ``"LGCK" | u8 ver | u16 rid_len | utf8 request_id | u16 seq |
-    u16 total | u8 flags | payload``
-
-    ``flags`` bit 0 is the ``is_final`` marker.
-    """
-    import struct
-
-    if total <= 0:
-        raise ValueError("total must be > 0")
-    if not 0 <= seq < total:
-        raise ValueError(f"seq {seq} out of range for total {total}")
-    rid_bytes = request_id.encode("utf-8")
-    if len(rid_bytes) > 0xFFFF:
-        raise ValueError("request_id too long")
-    flags = LOGS_CHUNK_FLAG_FINAL if is_final else 0
-    header = (
-        LOGS_CHUNK_MAGIC
-        + struct.pack("<B", LOGS_CHUNK_HEADER_VERSION)
-        + struct.pack("<H", len(rid_bytes))
-        + rid_bytes
-        + struct.pack("<HHB", seq, total, flags)
-    )
-    return header + payload
 
 
 def _get_device_id() -> str:
@@ -528,9 +492,6 @@ class CMSClient:
                 "ip_address": _get_local_ip(),
                 "storage_capacity_mb": cap_mb,
                 "storage_used_mb": used_mb,
-                # Stage 3c: advertises that this device can split large
-                # LOGS_RESPONSE payloads into LGCK binary frames.
-                "capabilities": ["logs_chunk_v1"],
             }
             await ws.send(json.dumps(register_msg))
             logger.info("Sent register message (device_id=%s)", self.device_id)
@@ -1543,13 +1504,12 @@ class CMSClient:
     async def _handle_request_logs(self, msg: dict, ws) -> None:
         """Collect journalctl logs for requested services and send back.
 
-        Stage 3c (#345 in agora-cms): the current single-message
-        ``logs_response`` JSON path works fine for most devices but
-        silently truncates / errors when the journal output exceeds
-        the WPS ~1 MiB per-message cap.  When that happens we build a
-        gzipped tarball of the per-service output and stream it back
-        as a sequence of LGCK-tagged binary WebSocket frames that the
-        CMS assembler reconstructs on the other side.
+        Small payloads ride the WS back as a single ``logs_response``
+        JSON message (legacy path).  When the journal output exceeds
+        the ~1 MiB WPS frame ceiling we build a gzipped tarball and
+        HTTP-POST it to the CMS log-upload endpoint; this replaces the
+        earlier chunked-binary (LGCK) scheme, which WPS transport
+        cannot carry because ``ws.send(bytes)`` is unsupported.
         """
         request_id = msg.get("request_id", "")
         services = msg.get("services") or [
@@ -1613,7 +1573,11 @@ class CMSClient:
                 logger.exception("Failed to send logs response")
             return
 
-        # Large payload: gzipped tarball → binary LGCK chunks.
+        # Large payload: gzipped tarball → HTTP POST to the CMS log
+        # upload endpoint.  We used to split this into LGCK-tagged
+        # binary WS frames, but the WPS transport rejects bytes sends;
+        # an HTTP upload is mixed-fleet safe and bypasses both the
+        # per-frame size cap and the transport's JSON-only constraint.
         try:
             tar_gz = _build_logs_tar_gz(logs)
         except Exception as e:
@@ -1621,50 +1585,96 @@ class CMSClient:
             await self._send_logs_error(ws, request_id, f"log_pack_failed: {e}")
             return
 
-        if len(tar_gz) > LOGS_CHUNK_ASSEMBLED_CAP:
+        if len(tar_gz) > LOGS_UPLOAD_MAX_BYTES:
             logger.warning(
                 "Log request %s payload %d bytes exceeds %d-byte cap; dropping",
-                request_id, len(tar_gz), LOGS_CHUNK_ASSEMBLED_CAP,
+                request_id, len(tar_gz), LOGS_UPLOAD_MAX_BYTES,
             )
             await self._send_logs_error(
                 ws, request_id,
-                f"logs_too_large: {len(tar_gz)} bytes > {LOGS_CHUNK_ASSEMBLED_CAP}",
-            )
-            return
-
-        total_chunks = (len(tar_gz) + LOGS_CHUNK_PAYLOAD_BYTES - 1) // LOGS_CHUNK_PAYLOAD_BYTES
-        if total_chunks > LOGS_CHUNK_MAX_COUNT:
-            logger.warning(
-                "Log request %s would need %d chunks (max %d); dropping",
-                request_id, total_chunks, LOGS_CHUNK_MAX_COUNT,
-            )
-            await self._send_logs_error(
-                ws, request_id,
-                f"logs_too_large: {total_chunks} chunks > {LOGS_CHUNK_MAX_COUNT}",
+                f"logs_too_large: {len(tar_gz)} bytes > {LOGS_UPLOAD_MAX_BYTES}",
             )
             return
 
         logger.info(
-            "Log request %s: sending %d bytes in %d chunks",
-            request_id, len(tar_gz), total_chunks,
+            "Log request %s: uploading %d bytes via HTTP",
+            request_id, len(tar_gz),
         )
         try:
-            for seq in range(total_chunks):
-                start = seq * LOGS_CHUNK_PAYLOAD_BYTES
-                end = start + LOGS_CHUNK_PAYLOAD_BYTES
-                is_final = seq == total_chunks - 1
-                frame = _encode_logs_chunk_frame(
-                    request_id=request_id,
-                    seq=seq,
-                    total=total_chunks,
-                    payload=tar_gz[start:end],
-                    is_final=is_final,
-                )
-                await ws.send(frame)
-        except Exception:
+            await self._upload_logs_bundle(request_id, tar_gz)
+        except Exception as e:
             logger.exception(
-                "Failed to send chunked logs for request %s", request_id,
+                "Failed to upload logs for request %s", request_id,
             )
+            await self._send_logs_error(ws, request_id, f"upload_failed: {e}")
+
+    async def _upload_logs_bundle(self, request_id: str, tar_gz: bytes) -> None:
+        """POST a gzipped log tarball to the CMS upload endpoint.
+
+        A ``409`` response whose body carries ``status: "ready"`` means
+        the request is already terminal on the CMS (e.g. an earlier
+        retry succeeded); we treat that as success and do not raise.
+        All other non-2xx responses raise ``RuntimeError``.
+        """
+        api_base = self._logs_api_base()
+        if not api_base:
+            raise RuntimeError("no CMS api_base configured for log upload")
+        api_key = self._read_api_key()
+        if not api_key:
+            raise RuntimeError("no device api_key available for log upload")
+
+        url = (
+            f"{api_base.rstrip('/')}/api/devices/{self.device_id}"
+            f"/logs/{request_id}/upload"
+        )
+        headers = {
+            "X-Device-API-Key": api_key,
+            "Content-Type": "application/gzip",
+        }
+        timeout = aiohttp.ClientTimeout(total=LOGS_UPLOAD_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, data=tar_gz) as resp:
+                if resp.status == 409:
+                    # Idempotent-retry case: CMS already considers the
+                    # request terminal.  Accept as success so we stop
+                    # bothering the user with a spurious error.
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = None
+                    if isinstance(body, dict) and body.get("status") == "ready":
+                        logger.info(
+                            "Log request %s: CMS reports already-ready; treating as success",
+                            request_id,
+                        )
+                        return
+                    text = (
+                        json.dumps(body)
+                        if isinstance(body, dict)
+                        else await resp.text()
+                    )
+                    raise RuntimeError(f"HTTP 409: {text[:200]}")
+                if resp.status >= 400:
+                    body = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
+                logger.info(
+                    "Log request %s uploaded successfully (HTTP %d)",
+                    request_id, resp.status,
+                )
+
+    def _logs_api_base(self) -> str:
+        """Resolve the CMS HTTP base URL for log uploads.
+
+        Prefers ``settings.cms_api_url`` when explicitly configured,
+        otherwise derives ``http(s)://`` from the active ws URL.
+        """
+        configured = (getattr(self.settings, "cms_api_url", "") or "").strip()
+        if configured:
+            return configured
+        ws_url = self._active_cms_url or self._get_cms_url()
+        if not ws_url:
+            return ""
+        return _derive_api_base(ws_url)
 
     async def _send_logs_error(self, ws, request_id: str, error: str) -> None:
         try:
