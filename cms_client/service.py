@@ -18,7 +18,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import websockets
-import aiohttp
+
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover - aiohttp is optional at import time
+    aiohttp = None  # type: ignore[assignment]
 
 from api.config import Settings
 from cms_client.asset_manager import AssetManager
