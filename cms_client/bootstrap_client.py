@@ -325,8 +325,10 @@ async def fetch_connect_token(
     UTF-8 bytes, matching
     :func:`shared.bootstrap_identity.connect_token_canonical_bytes`.
 
-    :param device_id: CMS-assigned device UUID (as returned in the
-        decrypted bootstrap payload).
+    :param device_id: the device_id the CMS has recorded for this pubkey
+        (for agora, the Raspberry Pi CPU serial the device used at
+        ``/register``).  Must match ``Device.id`` on the CMS side, which
+        is pinned at adoption time.
     :param seed: raw 32-byte ed25519 seed.  Sensitive — never logged.
     :param timestamp: unix seconds.  Defaults to ``int(time.time())``.
     :param nonce: 32+ hex chars.  Defaults to ``secrets.token_hex(16)``.

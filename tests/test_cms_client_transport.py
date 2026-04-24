@@ -286,3 +286,57 @@ class TestOpenTransport:
                 device_id="pi-01",
             )
         assert isinstance(t, DirectTransport)
+
+    @pytest.mark.asyncio
+    async def test_wps_pre_minted_skips_connect_token(self):
+        """Bootstrap v2: when pre_minted_url+token are supplied, the
+        legacy /connect-token mint is NOT called and the URL is used
+        verbatim (with access_token appended if missing)."""
+        fake_ws = _FakeWS()
+        captured = {}
+
+        async def fake_connect(url, **kwargs):
+            captured["url"] = url
+            captured["subprotocols"] = kwargs.get("subprotocols")
+            return fake_ws
+
+        async def fake_request_token(*args, **kwargs):
+            captured["legacy_mint_called"] = True
+            return ("should-not-be-used", "should-not-be-used")
+
+        with patch.object(transport_mod.websockets, "connect", side_effect=fake_connect), \
+             patch.object(transport_mod, "_request_connect_token", side_effect=fake_request_token):
+            t = await open_transport(
+                mode="wps",
+                cms_url="wss://cms.example.com/ws/device",
+                device_id="pi-01",
+                api_key="",  # deliberately empty — pre-minted path supplies auth
+                pre_minted_url="wss://wps.example.com/client/hubs/devices",
+                pre_minted_token="jwt_v2_token",
+            )
+        assert isinstance(t, WPSTransport)
+        assert "legacy_mint_called" not in captured
+        assert captured["url"] == "wss://wps.example.com/client/hubs/devices?access_token=jwt_v2_token"
+        assert captured["subprotocols"] == ["json.webpubsub.azure.v1"]
+
+    @pytest.mark.asyncio
+    async def test_wps_pre_minted_preserves_existing_token_in_url(self):
+        """If pre_minted_url already has access_token=, don't append again."""
+        fake_ws = _FakeWS()
+        captured = {}
+
+        async def fake_connect(url, **kwargs):
+            captured["url"] = url
+            return fake_ws
+
+        with patch.object(transport_mod.websockets, "connect", side_effect=fake_connect):
+            await open_transport(
+                mode="wps",
+                cms_url="wss://cms.example.com/ws/device",
+                device_id="pi-01",
+                pre_minted_url="wss://wps.example.com/client/hubs/devices?access_token=embedded",
+                pre_minted_token="jwt_v2_token",
+            )
+        # Token already in URL → not re-appended.
+        assert captured["url"].count("access_token=") == 1
+        assert "access_token=embedded" in captured["url"]

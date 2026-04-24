@@ -202,21 +202,37 @@ async def open_wps(
     *,
     cms_url: str,
     device_id: str,
-    api_key: str,
+    api_key: str = "",
     api_base: Optional[str] = None,
+    pre_minted_url: str = "",
+    pre_minted_token: str = "",
 ) -> WPSTransport:
     """Bootstrap a WPS transport.
 
-    Steps:
-      1. Derive HTTP(S) API base from ``cms_url`` (or use override).
-      2. POST /api/devices/{device_id}/connect-token with X-Device-API-Key.
-      3. Open a websocket to the returned URL using the WPS subprotocol.
-      4. Return a WPSTransport wrapping the socket.
+    Two modes:
+
+    * Legacy (``api_key`` path): derives the API base from ``cms_url``,
+      POSTs to ``/api/devices/{id}/connect-token`` with
+      ``X-Device-API-Key``, joins the returned ``access_token`` into the
+      URL, opens the websocket.
+    * Bootstrap v2 (``pre_minted_url`` + ``pre_minted_token``): skips the
+      api-key-based mint step; caller has already obtained the WPS URL
+      and JWT (via the new ``/api/devices/connect-token`` signed flow).
+      The ``access_token`` query param is joined in the same way.
+
+    At least one of ``api_key`` or (``pre_minted_url`` + ``pre_minted_token``)
+    must be provided.
     """
-    if not api_key:
-        raise TransportError("WPS transport requires a device_api_key")
-    base = api_base or _derive_api_base(cms_url)
-    wss_url, access_token = await _request_connect_token(base, device_id, api_key)
+    if pre_minted_url and pre_minted_token:
+        wss_url, access_token = pre_minted_url, pre_minted_token
+    else:
+        if not api_key:
+            raise TransportError(
+                "WPS transport requires a device_api_key or a pre-minted "
+                "(wps_url, wps_jwt) pair"
+            )
+        base = api_base or _derive_api_base(cms_url)
+        wss_url, access_token = await _request_connect_token(base, device_id, api_key)
     if access_token and "access_token=" not in wss_url:
         joiner = "&" if "?" in wss_url else "?"
         wss_url = f"{wss_url}{joiner}access_token={access_token}"
@@ -237,6 +253,8 @@ async def open_transport(
     device_id: str,
     api_key: str = "",
     api_base: Optional[str] = None,
+    pre_minted_url: str = "",
+    pre_minted_token: str = "",
 ) -> _Transport:
     """Factory: open the transport matching ``mode`` ("direct" or "wps")."""
     m = (mode or "direct").lower().strip()
@@ -248,5 +266,7 @@ async def open_transport(
             device_id=device_id,
             api_key=api_key,
             api_base=api_base,
+            pre_minted_url=pre_minted_url,
+            pre_minted_token=pre_minted_token,
         )
     raise TransportError(f"Unknown transport mode {mode!r} (expected 'direct' or 'wps')")
