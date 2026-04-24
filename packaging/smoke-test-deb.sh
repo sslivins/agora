@@ -42,6 +42,8 @@ REQUIRED_FILES=(
     "$STAGE/etc/systemd/system/agora-api.service"
     "$STAGE/etc/systemd/system/agora-cms-client.service"
     "$STAGE/etc/systemd/system/agora-provision.service"
+    "$STAGE/etc/systemd/system/agora-fleet-provision.service"
+    "$SRC/scripts/agora-fleet-provision.sh"
     "$STAGE/DEBIAN/control"
     "$STAGE/DEBIAN/postinst"
 )

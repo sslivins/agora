@@ -13,8 +13,15 @@ fi
 usermod -aG netdev "${AGORA_USER}" 2>/dev/null || true
 
 # ── Create persist directory (flash-backed, survives reboots) ──
+# Bootstrap v2 requires the persist dir to be owned by the uid that
+# runs agora-cms-client (root — no User= directive). Other services
+# (agora-api, agora-player) run as user 'agora' and read files inside
+# persist (e.g. api_key, mode 0644) through the 0755 dir mode.
+# Files written by bootstrap v2 (device_key, pairing_secret,
+# bootstrap_state.json) are mode 0600 root:root and remain private.
 mkdir -p "${AGORA_BASE}/persist"
-chown "${AGORA_USER}:${AGORA_USER}" "${AGORA_BASE}/persist"
+chown -R root:root "${AGORA_BASE}/persist"
+chmod 0755 "${AGORA_BASE}/persist"
 
 # ── Migrate persistent files from old state dir if needed ──
 for file in cms_auth_token cms_config.json splash api_key; do
@@ -219,9 +226,15 @@ systemctl restart NetworkManager 2>/dev/null || true
 chmod +x "${AGORA_BASE}/src/scripts/configure-ntp.sh"
 bash "${AGORA_BASE}/src/scripts/configure-ntp.sh" || true
 
+# ── Install fleet-provision helper script ──
+FLEET_SCRIPT="${AGORA_BASE}/src/scripts/agora-fleet-provision.sh"
+if [ -f "${FLEET_SCRIPT}" ]; then
+    chmod 0755 "${FLEET_SCRIPT}"
+fi
+
 # ── Enable and restart services ──
 systemctl daemon-reload
-systemctl enable agora-player agora-api agora-cms-client agora-provision
+systemctl enable agora-player agora-api agora-cms-client agora-provision agora-fleet-provision
 
 # ── Ensure dnsmasq does not start by default (managed by provision service) ──
 systemctl disable dnsmasq 2>/dev/null || true

@@ -1,0 +1,18 @@
+[Unit]
+Description=Agora Fleet Provisioning (first-boot env installer)
+DefaultDependencies=no
+After=local-fs.target
+Before=agora-cms-client.service agora-api.service agora-player.service
+# This unit must not block the cms-client even on unusual hosts;
+# the script itself creates /etc/agora if missing, so we deliberately
+# do not gate on ConditionPathIsDirectory.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/agora/src/scripts/agora-fleet-provision.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -977,7 +977,7 @@ class CMSClient:
         schedules = sync_data.get("schedules", [])
         default_asset = sync_data.get("default_asset")
         tz_name = sync_data.get("timezone", "UTC")
-        logger.info("EVAL: default_asset=%s, schedules=%d, last_state=%s",
+        logger.debug("EVAL: default_asset=%s, schedules=%d, last_state=%s",
                      default_asset, len(schedules), self._last_eval_state)
 
         # Check if the player is in an error state — if so, clear the cache

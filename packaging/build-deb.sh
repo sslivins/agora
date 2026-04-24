@@ -75,6 +75,7 @@ cp "${REPO_ROOT}/systemd/agora-api.service" "${BUILD_DIR}/etc/systemd/system/"
 cp "${REPO_ROOT}/systemd/agora-player.service" "${BUILD_DIR}/etc/systemd/system/"
 cp "${REPO_ROOT}/systemd/agora-cms-client.service" "${BUILD_DIR}/etc/systemd/system/"
 cp "${REPO_ROOT}/systemd/agora-provision.service" "${BUILD_DIR}/etc/systemd/system/"
+cp "${REPO_ROOT}/systemd/agora-fleet-provision.service" "${BUILD_DIR}/etc/systemd/system/"
 
 # ── Plymouth theme ──
 if [[ -f "${REPO_ROOT}/config/boot-splash.png" ]]; then
