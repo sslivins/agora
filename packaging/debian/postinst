@@ -70,12 +70,20 @@ EOF
 fi
 
 # ── Install Python packages ──
-pip3 install --break-system-packages -q \
-    -r "${AGORA_BASE}/src/requirements-api.txt" \
-    -r "${AGORA_BASE}/src/requirements-player.txt" \
-    -r "${AGORA_BASE}/src/requirements-cms-client.txt" \
-    qrcode 2>/dev/null \
-|| pip3 install -q \
+# On bookworm, pip3 refuses system-wide installs by default (PEP 668).
+# PIP_BREAK_SYSTEM_PACKAGES=1 opts in; older pip that predates the env var
+# ignores it harmlessly.
+export PIP_BREAK_SYSTEM_PACKAGES=1
+
+# The debian-packaged python3-cryptography lacks a pip RECORD file, so
+# a plain `pip3 install cryptography>=44` fails with "uninstall-no-record-file"
+# whenever pip needs to replace it. --ignore-installed makes pip install to
+# /usr/local alongside the apt copy (pip's path takes precedence on import).
+# We pin from requirements-cms-client.txt so both stay in sync.
+CRYPTO_REQ=$(grep -E '^cryptography' "${AGORA_BASE}/src/requirements-cms-client.txt" || echo "cryptography")
+pip3 install -q --ignore-installed --no-deps "${CRYPTO_REQ}"
+
+pip3 install -q \
     -r "${AGORA_BASE}/src/requirements-api.txt" \
     -r "${AGORA_BASE}/src/requirements-player.txt" \
     -r "${AGORA_BASE}/src/requirements-cms-client.txt" \
