@@ -289,6 +289,12 @@ class CMSClient:
         self._current_asset: str | None = None
         self._eval_wake = asyncio.Event()      # triggers immediate schedule re-eval
         self._last_player_mode: str | None = None
+        # In-flight asset fetch tasks, keyed by asset_name. Fetch handlers run
+        # as background tasks so the WS read loop isn't blocked by multi-minute
+        # downloads (tracked in agora#136). Downloads are serialized by
+        # ``_fetch_lock`` so AssetManager eviction math stays correct.
+        self._fetch_tasks: dict[str, asyncio.Task] = {}
+        self._fetch_lock = asyncio.Lock()
         # Bootstrap v2 state (only populated when settings.bootstrap_v2 is true)
         self._bootstrap_identity = None  # shared.bootstrap_identity.DeviceIdentity
         self._bootstrap_pairing_secret: str | None = None
@@ -659,8 +665,9 @@ class CMSClient:
                     elif msg_type == "stop":
                         await self._handle_stop()
                     elif msg_type == "fetch_asset":
-                        await self._handle_fetch_asset(msg, ws)
+                        self._spawn_fetch_asset(msg, ws)
                     elif msg_type == "delete_asset":
+                        await self._cancel_fetch(msg.get("asset_name", ""))
                         await self._handle_delete_asset(msg, ws)
                     elif msg_type == "config":
                         await self._handle_config(msg)
@@ -671,6 +678,7 @@ class CMSClient:
                     elif msg_type == "factory_reset":
                         await self._handle_factory_reset(ws)
                     elif msg_type == "wipe_assets":
+                        await self._cancel_all_fetches()
                         await self._handle_wipe_assets(msg, ws)
                     elif msg_type == "request_logs":
                         await self._handle_request_logs(msg, ws)
@@ -707,6 +715,7 @@ class CMSClient:
                     else:
                         logger.warning("Unknown CMS message type: %s", msg_type)
             finally:
+                await self._cancel_all_fetches()
                 status_task.cancel()
                 try:
                     await status_task
@@ -1433,6 +1442,61 @@ class CMSClient:
             return key_path.read_text().strip()
         except FileNotFoundError:
             return ""
+
+    def _spawn_fetch_asset(self, msg: dict, ws) -> None:
+        """Dispatch ``fetch_asset`` as a background task.
+
+        The WS read loop must stay responsive while large assets download
+        (agora#136). Duplicate fetches for the same asset supersede the prior
+        one. Actual download work is serialized by ``self._fetch_lock`` so
+        AssetManager eviction accounting remains correct.
+        """
+        asset_name = msg.get("asset_name", "")
+        if not asset_name:
+            logger.warning("Invalid fetch_asset message: missing asset_name")
+            return
+        prior = self._fetch_tasks.get(asset_name)
+        if prior is not None and not prior.done():
+            prior.cancel()
+        task = asyncio.create_task(self._fetch_asset_locked(msg, ws))
+        self._fetch_tasks[asset_name] = task
+
+        def _cleanup(t: asyncio.Task, name: str = asset_name) -> None:
+            if self._fetch_tasks.get(name) is t:
+                self._fetch_tasks.pop(name, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def _fetch_asset_locked(self, msg: dict, ws) -> None:
+        try:
+            async with self._fetch_lock:
+                await self._handle_fetch_asset(msg, ws)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Background fetch_asset task failed")
+
+    async def _cancel_fetch(self, asset_name: str) -> None:
+        if not asset_name:
+            return
+        task = self._fetch_tasks.get(asset_name)
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _cancel_all_fetches(self) -> None:
+        tasks = [t for t in self._fetch_tasks.values() if not t.done()]
+        if not tasks:
+            self._fetch_tasks.clear()
+            return
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._fetch_tasks.clear()
 
     async def _handle_fetch_asset(self, msg: dict, ws) -> None:
         """CMS tells us to download an asset — with budget-aware eviction."""
