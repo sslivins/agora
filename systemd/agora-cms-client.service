@@ -1,7 +1,8 @@
 [Unit]
 Description=Agora CMS Client
-After=network-online.target agora-api.service
+After=network-online.target agora-api.service agora-fleet-provision.service
 Wants=network-online.target
+Requires=agora-fleet-provision.service
 
 [Service]
 Type=simple
@@ -9,6 +10,11 @@ ExecStart=/usr/bin/python3 -m cms_client.main
 WorkingDirectory=/opt/agora/src
 Environment=PYTHONPATH=/opt/agora/src
 Environment=AGORA_BASE=/opt/agora
+# Fleet provisioning env (AGORA_BOOTSTRAP_V2, AGORA_FLEET_ID,
+# AGORA_FLEET_SECRET_HEX). Installed by agora-fleet-provision.service.
+# The '-' prefix means the file is optional so the unit still starts
+# on a fresh install that hasn't been provisioned yet.
+EnvironmentFile=-/etc/agora/environment
 Restart=always
 RestartSec=10
 

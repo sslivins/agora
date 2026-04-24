@@ -43,6 +43,33 @@ On first boot:
 - **WiFi boards (Zero 2 W, Pi 4):** Start a Wi-Fi access point (**Agora-XXXX**) with a captive-portal web UI for configuring Wi-Fi, device name, and CMS connection.
 - **Ethernet boards (Pi 4, Pi 5/CM5):** If connected via Ethernet, skip the WiFi setup and go straight online. The IP address and mDNS hostname are shown on the HDMI display.
 
+### Fleet provisioning (bootstrap v2)
+
+Devices that talk to a hosted CMS identify themselves via a fleet-scoped
+HMAC on the first `/register` call. The fleet secret is **not** baked into
+the image. To provision a new device for a fleet:
+
+1. Flash the stock image with Raspberry Pi Imager (no customisation
+   beyond Wi-Fi / hostname / SSH needed).
+2. Before ejecting the SD card, open the **bootfs** partition (visible as
+   a FAT volume on Windows / macOS / Linux) and create
+   `agora-fleet.env` with two lines:
+
+   ```
+   AGORA_FLEET_ID=<your-fleet-id>
+   AGORA_FLEET_SECRET_HEX=<64-hex-char fleet secret>
+   ```
+
+3. Eject the card and boot the Pi. On first boot a oneshot service
+   (`agora-fleet-provision.service`) installs the values into
+   `/etc/agora/environment` (root, 0600) and **shreds** the copy on the
+   boot partition so a lost SD card cannot leak the secret.
+
+Operators who forget to drop the file can SSH in and run
+`sudo /opt/agora/src/scripts/agora-fleet-provision.sh` after creating
+the file manually (or just edit `/etc/agora/environment` directly and
+restart `agora-cms-client`). The helper is idempotent.
+
 ### Option 2: Install on Existing Raspberry Pi OS
 
 Start with **Raspberry Pi OS 64-bit Lite**. In Imager settings, enable SSH and configure Wi-Fi, then:
