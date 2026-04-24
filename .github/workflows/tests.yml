@@ -21,6 +21,7 @@ jobs:
           pip install -r requirements-api.txt
           pip install pytest pytest-asyncio httpx
           pip install pytest-playwright
+          pip install "cryptography>=44,<46"
           playwright install --with-deps chromium
 
       - name: Run tests
