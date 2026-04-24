@@ -35,6 +35,17 @@ logger = logging.getLogger("agora.cms_client")
 
 PROTOCOL_VERSION = 2
 
+# Bootstrap v2 renewal policy (issue #420 stage B.3).
+# Minimum delay between JWT refreshes on the renewal task, so a clock
+# skew or an early-expired JWT doesn't spin at full speed.
+JWT_REFRESH_MIN_INTERVAL = 30  # seconds
+# 401s from /connect-token can mean many things (bad sig, stale nonce,
+# clock skew, revoked pubkey).  Don't treat the first 401 as terminal.
+# Only clear adopted state after this many consecutive 401s.
+JWT_REFRESH_401_MAX = 3
+# Backoff after a non-success renewal attempt before retrying.
+JWT_REFRESH_RETRY_SEC = 60
+
 # Log request transport:
 # - Small payloads (<= LOGS_JSON_MAX_BYTES) ride the WS as a single
 #   ``logs_response`` JSON message (legacy path, unchanged).
@@ -278,6 +289,13 @@ class CMSClient:
         self._current_asset: str | None = None
         self._eval_wake = asyncio.Event()      # triggers immediate schedule re-eval
         self._last_player_mode: str | None = None
+        # Bootstrap v2 state (only populated when settings.bootstrap_v2 is true)
+        self._bootstrap_identity = None  # shared.bootstrap_identity.DeviceIdentity
+        self._bootstrap_pairing_secret: str | None = None
+        self._jwt_refresh_401_count: int = 0
+        # Per-connect cancel signal for first-boot polling; set by
+        # _config_watch_loop when cms_url changes or by stop().
+        self._bootstrap_poll_cancel: asyncio.Event | None = None
         self.asset_manager = AssetManager(
             manifest_path=settings.manifest_path,
             assets_dir=settings.assets_dir,
@@ -415,6 +433,10 @@ class CMSClient:
 
     async def stop(self) -> None:
         self._running = False
+        # Abort any in-flight bootstrap v2 first-boot poll.
+        cancel_ev = getattr(self, "_bootstrap_poll_cancel", None)
+        if cancel_ev is not None:
+            cancel_ev.set()
         if self._ws:
             await self._ws.close()
 
@@ -432,16 +454,97 @@ class CMSClient:
                     self._active_cms_url = new_url
                     # Clear auth token — the new CMS won't recognise it
                     _save_auth_token(self.settings.auth_token_path, "")
+                    # Bootstrap v2 cached WPS JWT was minted by the old
+                    # CMS (different signer/base); it's useless now.
+                    # Identity keypair stays — the pubkey is still ours.
+                    if self._bootstrap_v2_enabled():
+                        try:
+                            from cms_client import bootstrap_boot
+                            bootstrap_boot.clear_state(
+                                self.settings.bootstrap_state_path,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to clear bootstrap_state on CMS URL change",
+                                exc_info=True,
+                            )
                     self._write_cms_status(
                         "connecting",
                         message="CMS URL changed. Reconnecting\u2026",
                     )
+                    # Signal any in-flight bootstrap v2 first-boot poll to
+                    # abort — otherwise it keeps polling the old CMS for
+                    # minutes despite our URL change.
+                    cancel_ev = getattr(self, "_bootstrap_poll_cancel", None)
+                    if cancel_ev is not None:
+                        cancel_ev.set()
                     if self._ws:
                         await self._ws.close()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.debug("Config watch error", exc_info=True)
+
+    def _bootstrap_v2_enabled(self) -> bool:
+        return bool(getattr(self.settings, "bootstrap_v2", False))
+
+    async def _mint_wps_credentials_v2(self, cms_url: str):
+        """Bootstrap v2: obtain (pre_minted_url, pre_minted_token) via HTTPS.
+
+        Returns the :class:`BootstrapCredentials` and the
+        ``aiohttp.ClientSession`` used to obtain them (the session is
+        kept open for later renewal calls; caller is responsible for
+        closing it).
+        """
+        import aiohttp
+        from cms_client import bootstrap_boot
+
+        # Lazy-load identity so this runs only when the flag is on.
+        if self._bootstrap_identity is None or self._bootstrap_pairing_secret is None:
+            identity, secret = bootstrap_boot.ensure_identity(
+                device_key_path=self.settings.device_key_path,
+                pairing_secret_path=self.settings.pairing_secret_path,
+            )
+            self._bootstrap_identity = identity
+            self._bootstrap_pairing_secret = secret
+
+        api_base = (
+            getattr(self.settings, "cms_api_url", "") or _derive_api_base(cms_url)
+        )
+
+        fleet_secret_hex = getattr(self.settings, "fleet_secret_hex", "") or ""
+        try:
+            fleet_secret = bytes.fromhex(fleet_secret_hex) if fleet_secret_hex else b""
+        except ValueError as e:
+            raise TransportError(
+                f"AGORA_FLEET_SECRET_HEX is not valid hex: {e}"
+            ) from e
+        fleet_id = getattr(self.settings, "fleet_id", "") or ""
+
+        metadata = {
+            "firmware_version": self._get_version(),
+            "device_type": _get_device_type(),
+            "device_name": self.settings.device_name,
+        }
+
+        session = aiohttp.ClientSession()
+        try:
+            creds = await bootstrap_boot.ensure_wps_credentials(
+                session,
+                cms_api_base=api_base,
+                device_id=self.device_id,
+                identity=self._bootstrap_identity,
+                pairing_secret=self._bootstrap_pairing_secret,
+                state_path=self.settings.bootstrap_state_path,
+                fleet_id=fleet_id,
+                fleet_secret=fleet_secret,
+                metadata=metadata,
+                poll_cancel_event=self._bootstrap_poll_cancel,
+            )
+        except Exception:
+            await session.close()
+            raise
+        return creds, session, api_base
 
     async def _connect_and_run(self) -> None:
         """Single connection lifecycle: connect → register → message loop."""
@@ -453,7 +556,32 @@ class CMSClient:
         )
 
         api_key = ""
-        if transport_mode == "wps":
+        pre_minted_url = ""
+        pre_minted_token = ""
+        pre_minted_expires_at = ""
+        http_session = None
+        bootstrap_api_base = ""
+
+        bootstrap_v2 = self._bootstrap_v2_enabled() and transport_mode == "wps"
+
+        if bootstrap_v2:
+            logger.info("Bootstrap v2 enabled — obtaining WPS JWT via HTTPS")
+            # Fresh cancel event per connect attempt — allows
+            # _config_watch_loop and stop() to interrupt slow first-boot
+            # polling when cms_url changes or shutdown is requested.
+            self._bootstrap_poll_cancel = asyncio.Event()
+            try:
+                creds, http_session, bootstrap_api_base = (
+                    await self._mint_wps_credentials_v2(cms_url)
+                )
+            except Exception as e:
+                # Map orchestration errors into TransportError so the outer
+                # reconnect loop backs off uniformly.
+                raise TransportError(f"bootstrap v2 failed: {e!r}") from e
+            pre_minted_url = creds.wps_url
+            pre_minted_token = creds.wps_jwt
+            pre_minted_expires_at = creds.expires_at
+        elif transport_mode == "wps":
             api_key = _resolve_device_api_key(self.settings)
             if not api_key:
                 raise TransportError(
@@ -461,13 +589,20 @@ class CMSClient:
                     "or a populated <persist_dir>/api_key file"
                 )
 
-        transport = await open_transport(
-            mode=transport_mode,
-            cms_url=cms_url,
-            device_id=self.device_id,
-            api_key=api_key,
-            api_base=getattr(self.settings, "cms_api_url", "") or None,
-        )
+        try:
+            transport = await open_transport(
+                mode=transport_mode,
+                cms_url=cms_url,
+                device_id=self.device_id,
+                api_key=api_key,
+                api_base=getattr(self.settings, "cms_api_url", "") or None,
+                pre_minted_url=pre_minted_url,
+                pre_minted_token=pre_minted_token,
+            )
+        except Exception:
+            if http_session is not None:
+                await http_session.close()
+            raise
 
         async with transport as ws:
             self._ws = ws
@@ -501,6 +636,14 @@ class CMSClient:
             logger.info("Sent register message (device_id=%s)", self.device_id)
 
             status_task = asyncio.create_task(self._status_loop(ws))
+            renewal_task: asyncio.Task | None = None
+            if bootstrap_v2:
+                renewal_task = asyncio.create_task(
+                    self._jwt_renewal_loop(
+                        ws, http_session, bootstrap_api_base,
+                        pre_minted_expires_at,
+                    )
+                )
 
             try:
                 async for raw in ws:
@@ -569,6 +712,125 @@ class CMSClient:
                     await status_task
                 except asyncio.CancelledError:
                     pass
+                if renewal_task is not None:
+                    renewal_task.cancel()
+                    try:
+                        await renewal_task
+                    except asyncio.CancelledError:
+                        pass
+                if http_session is not None:
+                    await http_session.close()
+
+    async def _jwt_renewal_loop(
+        self, ws, session, api_base: str, expires_at: str,
+    ) -> None:
+        """Background: refresh the WPS JWT before it expires, then reconnect.
+
+        Policy:
+
+        * Sleep until ``expires_at - jwt_refresh_lead_seconds``.
+        * On success: persist new state, close ``ws`` to force a
+          reconnect in the outer loop (which will read the new state).
+        * On :class:`ConnectTokenRejectedError` (401): do NOT clear
+          adopted state on the first hit — this often means clock skew,
+          replayed nonce, or a transient CMS glitch.  Only clear after
+          :data:`JWT_REFRESH_401_MAX` consecutive 401s.
+        * On 429 / transport error: back off and retry.
+        """
+        from cms_client import bootstrap_boot
+
+        try:
+            from datetime import timedelta
+            lead = int(getattr(self.settings, "jwt_refresh_lead_seconds", 600) or 600)
+            current_expires_at = expires_at
+            while self._running:
+                expires_dt = bootstrap_boot._parse_expires_at(current_expires_at)
+                if expires_dt is None:
+                    logger.warning(
+                        "JWT expires_at unparseable (%r) — skipping renewal",
+                        current_expires_at,
+                    )
+                    return
+                now_dt = datetime.now(timezone.utc)
+                sleep_seconds = (
+                    expires_dt - now_dt - timedelta(seconds=lead)
+                ).total_seconds()
+                if sleep_seconds < JWT_REFRESH_MIN_INTERVAL:
+                    sleep_seconds = JWT_REFRESH_MIN_INTERVAL
+                logger.debug("JWT renewal sleeping %.0fs", sleep_seconds)
+                await asyncio.sleep(sleep_seconds)
+
+                try:
+                    new_creds = await bootstrap_boot.refresh_wps_jwt(
+                        session,
+                        cms_api_base=api_base,
+                        identity=self._bootstrap_identity,
+                        state_path=self.settings.bootstrap_state_path,
+                    )
+                except bootstrap_boot.ConnectTokenRejectedError:
+                    self._jwt_refresh_401_count += 1
+                    logger.warning(
+                        "WPS JWT refresh rejected (401) — consecutive=%d",
+                        self._jwt_refresh_401_count,
+                    )
+                    if self._jwt_refresh_401_count >= JWT_REFRESH_401_MAX:
+                        logger.error(
+                            "Giving up on current adopted state after %d "
+                            "consecutive 401s — rotating identity to force "
+                            "true first-boot re-registration",
+                            self._jwt_refresh_401_count,
+                        )
+                        # Rotate everything: JWT state, identity keypair,
+                        # pairing secret, and auth token. Keeping the old
+                        # pubkey would leave us re-registering with a key
+                        # the CMS may have already revoked.
+                        bootstrap_boot.clear_state(
+                            self.settings.bootstrap_state_path,
+                        )
+                        for p in (
+                            self.settings.device_key_path,
+                            self.settings.pairing_secret_path,
+                            self.settings.auth_token_path,
+                        ):
+                            try:
+                                p.unlink()
+                            except FileNotFoundError:
+                                pass
+                            except Exception:
+                                logger.debug(
+                                    "Failed to unlink %s on terminal 401", p,
+                                    exc_info=True,
+                                )
+                        self._bootstrap_identity = None
+                        self._bootstrap_pairing_secret = None
+                        await ws.close()
+                        return
+                    await asyncio.sleep(JWT_REFRESH_RETRY_SEC)
+                    continue
+                except bootstrap_boot.RateLimitedError:
+                    logger.info("WPS JWT refresh rate-limited — backing off")
+                    await asyncio.sleep(JWT_REFRESH_RETRY_SEC)
+                    continue
+                except bootstrap_boot.BootstrapTransportError as e:
+                    logger.warning("WPS JWT refresh transport error: %r", e)
+                    await asyncio.sleep(JWT_REFRESH_RETRY_SEC)
+                    continue
+                except Exception:
+                    logger.exception("Unexpected error refreshing WPS JWT")
+                    await asyncio.sleep(JWT_REFRESH_RETRY_SEC)
+                    continue
+
+                self._jwt_refresh_401_count = 0
+                logger.info(
+                    "WPS JWT refreshed — forcing reconnect to pick up new token"
+                )
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                return
+        except asyncio.CancelledError:
+            raise
 
     async def _send_status(self) -> None:
         """Build and send a single status heartbeat."""
@@ -1420,6 +1682,12 @@ class CMSClient:
         _safe_unlink(persist_dir / "device_name")
         _safe_unlink(persist_dir / "api_key")
         _safe_unlink(persist_dir / "local_api_enabled")
+
+        # Bootstrap v2 identity + cached credentials.  These are safe to
+        # always remove — on non-v2 builds the paths just don't exist.
+        _safe_unlink(persist_dir / "device_key")
+        _safe_unlink(persist_dir / "pairing_secret")
+        _safe_unlink(persist_dir / "bootstrap_state.json")
 
         # Remove state files
         _safe_unlink(state_dir / "cms_status.json")

@@ -42,6 +42,22 @@ class Settings(BaseSettings):
     # the value stored in <persist_dir>/api_key.
     device_api_key: str = ""
 
+    # Bootstrap v2 (issue #420): when true, the device uses the new HTTPS
+    # bootstrap flow (POST /register → poll /bootstrap-status → decrypt →
+    # open WPS with the pre-minted JWT; POST /connect-token for renewal).
+    # When false (default), the legacy api_key path is used.
+    bootstrap_v2: bool = False
+    # Fleet identity for the fleet-HMAC gate on /register.  Baked into
+    # firmware builds; both must be set when bootstrap_v2=true and the
+    # device has no cached bootstrap state (first boot).  fleet_secret_hex
+    # is the raw HMAC key, hex-encoded.  When the device is already
+    # adopted, neither is used — only the signed /connect-token path.
+    fleet_id: str = ""
+    fleet_secret_hex: str = ""
+    # Seconds before JWT expiry to refresh.  The renewal task sleeps until
+    # (expires_at - jwt_refresh_lead_seconds) and then calls /connect-token.
+    jwt_refresh_lead_seconds: int = 600  # 10 min
+
     # Asset budget (0 = 80% of partition)
     asset_budget_mb: int = 0
 
@@ -88,6 +104,21 @@ class Settings(BaseSettings):
     @property
     def auth_token_path(self) -> Path:
         return self.persist_dir / "cms_auth_token"
+
+    @property
+    def device_key_path(self) -> Path:
+        """Bootstrap v2: ed25519 seed file (mode 0400)."""
+        return self.persist_dir / "device_key"
+
+    @property
+    def pairing_secret_path(self) -> Path:
+        """Bootstrap v2: pairing-secret file (mode 0400)."""
+        return self.persist_dir / "pairing_secret"
+
+    @property
+    def bootstrap_state_path(self) -> Path:
+        """Bootstrap v2: JSON state (adopted marker + cached WPS JWT, mode 0600)."""
+        return self.persist_dir / "bootstrap_state.json"
 
     @property
     def cms_config_path(self) -> Path:
