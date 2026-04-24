@@ -35,6 +35,7 @@ from shared.bootstrap_identity import (
     BootstrapSecretFileError,
     DeviceIdentity,
     PAIRING_SECRET_TEXT_LEN,
+    _create_new_secret_file,
     compute_fleet_hmac_hex,
     connect_token_canonical_bytes,
     decrypt_adopt_payload,
@@ -57,17 +58,59 @@ posix_only = pytest.mark.skipif(
 
 
 def _ed25519_pub_to_x25519(pub_bytes: bytes) -> X25519PublicKey:
-    """Mirror of CMS ``_ed25519_pub_to_x25519`` — derive X25519 pub from Ed25519 pub.
-
-    Uses the standard Montgomery-from-Edwards u = (1+y)/(1-y) mapping.  We
-    only need this for the self-contained ECIES fixture below; the library
-    under test does *not* exercise this branch.
+    """Deprecated helper kept for backwards reference; see module-level
+    ``_ed25519_pub_to_x25519_bytes`` for the real implementation used by
+    ``test_decrypt_adopt_payload_roundtrip_from_pubkey``.
     """
-    # We can avoid re-implementing y→u by doing the encrypt against a
-    # recipient whose identity we already own: derive X25519 priv from
-    # the seed and use its public key as the recipient.  That's what
-    # ``_encrypt_for_device_seed`` does instead.
     raise NotImplementedError  # pragma: no cover
+
+
+def _ed25519_pub_to_x25519_bytes(pub_bytes: bytes) -> bytes:
+    """Mirror of CMS ``_ed25519_pub_to_x25519``.
+
+    Returns the raw 32-byte X25519 public key.  Kept inline (rather than
+    importing from the CMS repo) so the device-side test suite can pin
+    the conversion math independently.
+    """
+    assert len(pub_bytes) == 32
+    y = int.from_bytes(pub_bytes, "little") & ((1 << 255) - 1)
+    p = (1 << 255) - 19
+    assert y < p, "non-canonical y"
+    denom = (1 - y) % p
+    assert denom != 0, "point at infinity"
+    inv = pow(denom, p - 2, p)
+    u = ((1 + y) * inv) % p
+    assert u not in (0, 1), "low-order point"
+    return u.to_bytes(32, "little")
+
+
+def _encrypt_for_device_pubkey(pubkey_b64: str, plaintext: bytes) -> str:
+    """CMS-side ``encrypt_for_device`` replicated exactly: starts from the
+    Ed25519 *public key* (b64) and applies the y→u Montgomery conversion.
+
+    This is the real wire path CMS uses; it exercises ``decrypt_adopt_payload``
+    against a ciphertext produced via the pub-key conversion branch, which
+    ``_encrypt_for_device_seed`` deliberately bypasses.
+    """
+    recip_ed = base64.b64decode(pubkey_b64, validate=True)
+    recip_x_bytes = _ed25519_pub_to_x25519_bytes(recip_ed)
+    recip_x = X25519PublicKey.from_public_bytes(recip_x_bytes)
+
+    eph_priv = X25519PrivateKey.generate()
+    eph_pub_bytes = eph_priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    shared = eph_priv.exchange(recip_x)
+    key_material = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32 + 12,
+        salt=None,
+        info=b"agora-bootstrap-ecies-v1",
+    ).derive(shared)
+    key, nonce = key_material[:32], key_material[32:]
+    ct = AESGCM(key).encrypt(nonce, plaintext, associated_data=None)
+    return base64.b64encode(eph_pub_bytes + nonce + ct).decode("ascii")
 
 
 def _x25519_priv_from_ed25519_seed(seed: bytes) -> X25519PrivateKey:
@@ -304,6 +347,23 @@ def test_decrypt_adopt_payload_roundtrip() -> None:
     assert decrypt_adopt_payload(seed, ct_b64) == plaintext
 
 
+def test_decrypt_adopt_payload_roundtrip_from_pubkey() -> None:
+    # Closes the interop gap: ciphertext is produced using the real CMS
+    # path (Ed25519 pubkey → Montgomery y→u conversion), not the
+    # seed-shortcut used elsewhere in these tests.
+    seed = os.urandom(32)
+    priv = Ed25519PrivateKey.from_private_bytes(seed)
+    pub_b64 = base64.b64encode(
+        priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
+    plaintext = b"ecies from pubkey"
+    ct_b64 = _encrypt_for_device_pubkey(pub_b64, plaintext)
+    assert decrypt_adopt_payload(seed, ct_b64) == plaintext
+
+
 def test_decrypt_adopt_payload_tamper_triggers_auth_failure() -> None:
     seed = os.urandom(32)
     ct_b64 = _encrypt_for_device_seed(seed, b"hello world")
@@ -371,3 +431,113 @@ def test_compute_fleet_hmac_hex_matches_stdlib() -> None:
         hashlib.sha256,
     ).hexdigest()
     assert got == expected
+
+
+# ---------------------------------------------------------------------
+# Encoding contract
+# ---------------------------------------------------------------------
+
+
+def test_pubkey_b64_is_standard_base64_with_padding() -> None:
+    """Ed25519 raw pub (32 bytes) → std-base64 is 44 chars ending in '='."""
+    seed = os.urandom(32)
+    priv = Ed25519PrivateKey.from_private_bytes(seed)
+    pub_bytes = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    b64 = base64.b64encode(pub_bytes).decode("ascii")
+    assert len(b64) == 44
+    assert b64.endswith("=")
+    # Standard alphabet (no urlsafe / stripped padding).
+    assert "-" not in b64 and "_" not in b64
+    # And it must round-trip through strict base64 validation.
+    assert base64.b64decode(b64, validate=True) == pub_bytes
+
+
+def test_connect_token_signature_is_standard_base64() -> None:
+    seed = os.urandom(32)
+    sig_b64 = sign_connect_token_request(seed, "d", 1700000000, "n")
+    # Ed25519 signature is always 64 bytes → 88 chars standard base64, no padding.
+    assert len(sig_b64) == 88
+    assert "-" not in sig_b64 and "_" not in sig_b64
+    assert len(base64.b64decode(sig_b64, validate=True)) == 64
+
+
+# ---------------------------------------------------------------------
+# Create-once semantics (regression guard for the duck's finding #1)
+# ---------------------------------------------------------------------
+
+
+@posix_only
+def test_concurrent_create_does_not_overwrite(tmp_path: Path) -> None:
+    """Two racing callers: second must see the first's data, not clobber it."""
+    os.chmod(tmp_path, 0o700)
+    key_path = tmp_path / "device_key"
+
+    # Simulate a losing-racer: pre-create the file with a fixed seed.
+    fixed_seed = b"\xab" * 32
+    assert _create_new_secret_file(key_path, fixed_seed, BootstrapKeyFileError)
+
+    # Now call the top-level function — it must NOT overwrite the
+    # already-present file, and must return the on-disk identity.
+    ident = load_or_create_device_identity(key_path)
+    assert ident.seed == fixed_seed
+    assert key_path.read_bytes() == fixed_seed
+
+
+@posix_only
+def test_pairing_secret_concurrent_create_does_not_overwrite(
+    tmp_path: Path,
+) -> None:
+    os.chmod(tmp_path, 0o700)
+    secret_path = tmp_path / "pairing_secret"
+    pre_existing = "AAAAAAAAAAAAAAAAAAAAAAAAAA"  # 26-char valid base32
+    assert _create_new_secret_file(
+        secret_path, pre_existing.encode("ascii"), BootstrapSecretFileError,
+    )
+    assert load_or_create_pairing_secret(secret_path) == pre_existing
+    assert secret_path.read_text() == pre_existing
+
+
+@posix_only
+def test_create_side_oserror_is_wrapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raw OSError on the create path (e.g. read-only FS) must surface as
+    the module's domain exception so B.3 / support tooling can catch it
+    uniformly."""
+    os.chmod(tmp_path, 0o700)
+    key_path = tmp_path / "device_key"
+
+    import shared.bootstrap_identity as bi
+
+    real_open = os.open
+
+    def fake_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(key_path) and (flags & os.O_CREAT):
+            raise OSError(30, "Read-only file system")  # EROFS
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(bi.os, "open", fake_open)
+    with pytest.raises(BootstrapKeyFileError, match="read-only filesystem"):
+        load_or_create_device_identity(key_path)
+
+
+@posix_only
+def test_mkdir_failure_is_wrapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parent-dir ``mkdir`` failures (permission denied, disk full, …)
+    must also surface as the module's domain exception."""
+    os.chmod(tmp_path, 0o700)
+    key_path = tmp_path / "missing_parent" / "device_key"
+
+    import shared.bootstrap_identity as bi
+
+    def fake_mkdir(self, mode=0o777, parents=False, exist_ok=False):  # type: ignore[no-untyped-def]
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(bi.Path, "mkdir", fake_mkdir)
+    with pytest.raises(BootstrapKeyFileError, match="mkdir"):
+        load_or_create_device_identity(key_path)

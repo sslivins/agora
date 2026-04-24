@@ -48,7 +48,6 @@ import binascii
 import hashlib
 import hmac
 import os
-import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,17 +117,27 @@ class DeviceIdentity:
 
 
 def _check_parent_dir(path: Path, exc_cls: type[Exception]) -> None:
-    """Validate and, where safe, repair the parent directory of ``path``.
+    """Validate and, where safe, repair the *immediate* parent of ``path``.
 
-    Rules:
+    Rules enforced on the immediate parent only:
     - must exist and be a directory
     - must be owned by the current uid
     - must not be group- or world-writable
     - same-owner over-permissive mode is repaired to ``0o700``
+
+    Note: if the parent is missing, we create it with ``mkdir(parents=True,
+    mode=0o700)``; intermediate ancestors inherit that mode on creation
+    but pre-existing ancestors are **not** audited.  Callers that care
+    about the full chain should place the secret under a stable
+    application directory (e.g. ``/opt/agora/persist``) that is itself
+    managed by packaging.
     """
     parent = path.parent
     if not parent.exists():
-        parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        try:
+            parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        except OSError as e:
+            raise exc_cls(f"mkdir({parent}) failed: {e}") from e
         return
     st = os.stat(parent, follow_symlinks=False)
     if not stat.S_ISDIR(st.st_mode):
@@ -146,6 +155,20 @@ def _check_parent_dir(path: Path, exc_cls: type[Exception]) -> None:
             raise exc_cls(
                 f"{parent} is group/world-writable and chmod failed: {e}"
             ) from e
+
+
+def _fsync_dir(parent: Path) -> None:
+    """Best-effort fsync of ``parent``.  Silently ignored if unsupported."""
+    try:
+        dir_fd = os.open(parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def _open_existing_regular_file(path: Path, exc_cls: type[Exception]) -> int:
@@ -189,48 +212,58 @@ def _open_existing_regular_file(path: Path, exc_cls: type[Exception]) -> int:
     return fd
 
 
-def _atomic_write_secret(path: Path, data: bytes, exc_cls: type[Exception]) -> None:
-    """Write ``data`` to ``path`` atomically with mode ``0o400``.
+def _create_new_secret_file(
+    path: Path, data: bytes, exc_cls: type[Exception],
+) -> bool:
+    """Atomically create ``path`` with ``data`` and mode ``0o400``.
 
-    Power-loss-safe: tmp file is fsynced, renamed into place, and the parent
-    directory is fsynced before we return.  Uses ``O_EXCL | O_NOFOLLOW`` on
-    the tmp file to make sure we don't race with an attacker planting a
-    symlink under a predictable name.
+    Uses ``O_CREAT | O_EXCL | O_NOFOLLOW`` on the *final* path so the
+    operation is create-once: concurrent callers cannot overwrite each
+    other.  Returns ``True`` on success, ``False`` if the file already
+    exists (``EEXIST``) — caller should fall through to the existing-file
+    validation path.  Any other failure (``ENOSPC``, ``EROFS``, ``EPERM``,
+    ...) is wrapped in ``exc_cls``.
+
+    On success, ``fsync``s the file fd and the parent directory so the
+    newly-created file is durable across power-loss.
     """
     parent = path.parent
-    # secrets.token_hex picks a random tmp suffix so parallel boots or a
-    # previous crash don't cause O_EXCL to bail.
-    tmp = parent / f".{path.name}.tmp.{secrets.token_hex(4)}"
-    fd = os.open(
-        tmp,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        _FILE_MODE,
-    )
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    try:
-        os.replace(tmp, path)
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            _FILE_MODE,
+        )
+    except FileExistsError:
+        return False
     except OSError as e:
-        # Best-effort cleanup of the tmp file.
+        errno_val = getattr(e, "errno", None)
+        hint = ""
+        if errno_val == 30:  # EROFS
+            hint = " (read-only filesystem?)"
+        elif errno_val == 28:  # ENOSPC
+            hint = " (no space left on device)"
+        elif errno_val == 13:  # EACCES
+            hint = " (permission denied; check parent ownership/mode)"
+        raise exc_cls(f"create({path}) failed{hint}: {e}") from e
+    try:
         try:
-            tmp.unlink()
+            os.write(fd, data)
+            os.fsync(fd)
+        except OSError as e:
+            raise exc_cls(f"write({path}) failed: {e}") from e
+    except Exception:
+        # Don't leave a partial file behind; O_EXCL on the next attempt
+        # would otherwise mis-diagnose an already-created file.
+        try:
+            os.unlink(path)
         except OSError:
             pass
-        raise exc_cls(f"rename into {path} failed: {e}") from e
-    # Fsync the parent directory so the rename itself is durable.
-    try:
-        dir_fd = os.open(parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
+        raise
     finally:
-        os.close(dir_fd)
+        os.close(fd)
+    _fsync_dir(parent)
+    return True
 
 
 # ---------------------------------------------------------------------
@@ -254,26 +287,31 @@ def _derive_pubkey_b64(seed: bytes) -> str:
 def load_or_create_device_identity(key_path: Path) -> DeviceIdentity:
     """Load the device's Ed25519 seed from ``key_path`` or create it.
 
+    Create-once semantics: two concurrent callers observing an absent
+    file will not both generate and overwrite — the loser's ``O_EXCL``
+    create fails with ``EEXIST`` and that caller reads the winner's
+    contents instead.
+
     Never regenerates a malformed existing file — raises instead so an
     already-adopted device isn't silently re-issued a new identity.
     """
     _check_parent_dir(key_path, BootstrapKeyFileError)
-    if key_path.exists() or key_path.is_symlink():
-        fd = _open_existing_regular_file(key_path, BootstrapKeyFileError)
-        try:
-            blob = os.read(fd, _SEED_LEN + 1)
-        finally:
-            os.close(fd)
-        if len(blob) != _SEED_LEN:
-            raise BootstrapKeyFileError(
-                f"{key_path} is {len(blob)} bytes; expected {_SEED_LEN}. "
-                f"Refusing to silently regenerate (would strand the adopted "
-                f"device); delete the file manually to factory-reset identity."
-            )
-        return DeviceIdentity(seed=blob, pubkey_b64=_derive_pubkey_b64(blob))
     seed = os.urandom(_SEED_LEN)
-    _atomic_write_secret(key_path, seed, BootstrapKeyFileError)
-    return DeviceIdentity(seed=seed, pubkey_b64=_derive_pubkey_b64(seed))
+    if _create_new_secret_file(key_path, seed, BootstrapKeyFileError):
+        return DeviceIdentity(seed=seed, pubkey_b64=_derive_pubkey_b64(seed))
+    # File already existed (or was concurrently created): validate + load.
+    fd = _open_existing_regular_file(key_path, BootstrapKeyFileError)
+    try:
+        blob = os.read(fd, _SEED_LEN + 1)
+    finally:
+        os.close(fd)
+    if len(blob) != _SEED_LEN:
+        raise BootstrapKeyFileError(
+            f"{key_path} is {len(blob)} bytes; expected {_SEED_LEN}. "
+            f"Refusing to silently regenerate (would strand the adopted "
+            f"device); delete the file manually to factory-reset identity."
+        )
+    return DeviceIdentity(seed=blob, pubkey_b64=_derive_pubkey_b64(blob))
 
 
 # ---------------------------------------------------------------------
@@ -294,27 +332,29 @@ def _generate_pairing_secret() -> str:
 def load_or_create_pairing_secret(secret_path: Path) -> str:
     """Load the pairing secret from ``secret_path`` or create it.
 
-    Shares the same file-system contract as
+    Shares the same file-system contract and create-once semantics as
     :func:`load_or_create_device_identity`.  Returns the 26-char base32
-    text form the admin will type into the CMS adopt modal.
+    text form.
     """
     _check_parent_dir(secret_path, BootstrapSecretFileError)
-    if secret_path.exists() or secret_path.is_symlink():
-        fd = _open_existing_regular_file(secret_path, BootstrapSecretFileError)
-        try:
-            blob = os.read(fd, PAIRING_SECRET_TEXT_LEN + 2)
-        finally:
-            os.close(fd)
-        text = blob.decode("ascii", errors="replace").strip()
-        if len(text) != PAIRING_SECRET_TEXT_LEN or not set(text).issubset(_B32_ALPHA):
-            raise BootstrapSecretFileError(
-                f"{secret_path} contents are not a {PAIRING_SECRET_TEXT_LEN}-char "
-                f"RFC-4648 base32 string; refusing to silently regenerate. "
-                f"Delete the file manually to generate a fresh secret."
-            )
-        return text
-    text = _generate_pairing_secret()
-    _atomic_write_secret(secret_path, text.encode("ascii"), BootstrapSecretFileError)
+    new_text = _generate_pairing_secret()
+    if _create_new_secret_file(
+        secret_path, new_text.encode("ascii"), BootstrapSecretFileError,
+    ):
+        return new_text
+    # File already existed (or was concurrently created): validate + load.
+    fd = _open_existing_regular_file(secret_path, BootstrapSecretFileError)
+    try:
+        blob = os.read(fd, PAIRING_SECRET_TEXT_LEN + 2)
+    finally:
+        os.close(fd)
+    text = blob.decode("ascii", errors="replace").strip()
+    if len(text) != PAIRING_SECRET_TEXT_LEN or not set(text).issubset(_B32_ALPHA):
+        raise BootstrapSecretFileError(
+            f"{secret_path} contents are not a {PAIRING_SECRET_TEXT_LEN}-char "
+            f"RFC-4648 base32 string; refusing to silently regenerate. "
+            f"Delete the file manually to generate a fresh secret."
+        )
     return text
 
 
