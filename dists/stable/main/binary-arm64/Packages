@@ -1,5 +1,5 @@
 Package: agora
-Version: 1.11.15
+Version: 1.11.16
 Architecture: arm64
 Maintainer: sslivins
 Depends: python3 (>= 3.11),
@@ -26,11 +26,11 @@ Depends: python3 (>= 3.11),
  cage,
  chromium
 Recommends: gstreamer1.0-v4l2
-Filename: pool/agora_1.11.15_arm64.deb
-Size: 1941566
-MD5sum: 75376feaa04c9af6db2ac81d247ea75f
-SHA1: 8dd033aa5dab0f9811387642faf82dd336f1c144
-SHA256: 37577d8f788b8e2cc0f8dc99ad9bc9f6c38267e3ef90565585c35f94692903fb
+Filename: pool/agora_1.11.16_arm64.deb
+Size: 1941538
+MD5sum: 3c1bc42721a68cd276e00f386a11a96e
+SHA1: 59d54887ab95fcdc433a710eabf83ab22f57c9e2
+SHA256: 0c9aeea7c4f6c71878889ab041778eaee0cf85fd4a7c4dad5e175af71c27ccc9
 Section: multimedia
 Priority: optional
 Description: Agora media playback system for Raspberry Pi
