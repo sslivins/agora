@@ -19,6 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements-api.txt
+          pip install -r requirements-cms-client.txt
           pip install pytest pytest-asyncio httpx
           pip install pytest-playwright
           pip install "cryptography>=44,<46"
