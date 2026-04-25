@@ -531,6 +531,7 @@ class CMSClient:
             "firmware_version": self._get_version(),
             "device_type": _get_device_type(),
             "device_name": self.settings.device_name,
+            "local_ip": _get_local_ip(),
         }
 
         session = aiohttp.ClientSession()
