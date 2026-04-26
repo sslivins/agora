@@ -35,6 +35,16 @@ logger = logging.getLogger("agora.cms_client")
 
 PROTOCOL_VERSION = 2
 
+# Firmware-advertised capability flags consumed by the CMS to gate
+# features that require specific firmware behaviour. The CMS persists
+# these on the device row and rejects schedule create/updates that
+# would push assets the device can't render.
+#
+# - "slideshow_v1": this firmware understands ``asset_type=slideshow``
+#   on FETCH_ASSET messages, fetches the manifest+slides, and stores
+#   them under ``assets/slideshows/<name>/``.
+DEVICE_CAPABILITIES = ["slideshow_v1"]
+
 # Bootstrap v2 renewal policy (issue #420 stage B.3).
 # Minimum delay between JWT refreshes on the renewal task, so a clock
 # skew or an early-expired JWT doesn't spin at full speed.
@@ -657,6 +667,7 @@ class CMSClient:
                 "device_name_custom": name_is_custom,
                 "device_type": _get_device_type(),
                 "supported_codecs": supported_codecs(),
+                "capabilities": list(DEVICE_CAPABILITIES),
                 "ip_address": _get_local_ip(),
                 "storage_capacity_mb": cap_mb,
                 "storage_used_mb": used_mb,
@@ -1045,6 +1056,7 @@ class CMSClient:
             asset = winner.get("asset", "")
             checksum = winner.get("asset_checksum")
             loop_count = winner.get("loop_count")
+            asset_type = winner.get("asset_type")
             new_schedule_id = winner.get("id")
             new_schedule_name = winner.get("name", "")
 
@@ -1202,14 +1214,21 @@ class CMSClient:
                     self._last_eval_state = ("waiting", asset, checksum)
                 return
 
-            state_key = ("play", asset, checksum, loop_count)
+            state_key = ("play", asset, checksum, loop_count, asset_type)
             if self._last_eval_state == state_key:
                 return
 
             # Schedule changed — send ENDED for previous, STARTED for new
             self._end_current_playback()
 
-            desired = DesiredState(mode=PlaybackMode.PLAY, asset=asset, loop=True, loop_count=loop_count, expected_checksum=checksum)
+            desired = DesiredState(
+                mode=PlaybackMode.PLAY,
+                asset=asset,
+                asset_type=asset_type,
+                loop=True,
+                loop_count=loop_count,
+                expected_checksum=checksum,
+            )
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(asset)
             self._last_eval_state = state_key
