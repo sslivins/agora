@@ -72,6 +72,7 @@ PERSIST_DIR = Path("/opt/agora/persist")
 STATE_DIR = Path("/opt/agora/state")
 PROVISION_FLAG = PERSIST_DIR / "provisioned"
 WIFI_DISABLED_FLAG = PERSIST_DIR / "wifi_disabled"
+PAIRING_SECRET_PATH = PERSIST_DIR / "pairing_secret"
 CMS_STATUS_PATH = STATE_DIR / "cms_status.json"
 
 WIFI_CONNECT_TIMEOUT = 60   # seconds to wait for Wi-Fi on boot
@@ -88,6 +89,8 @@ CMS_MDNS_HOST = "agora-cms.local"
 CMS_MDNS_PORT = 8080
 
 OOBE_DISPLAY_HOLD = 1       # seconds to hold static screens before advancing
+
+from provision.pairing import read_pairing_secret as _read_pairing_secret  # noqa: E402,F401
 
 
 def is_provisioned() -> bool:
@@ -360,6 +363,9 @@ async def _try_wifi_connect(
 async def _wait_for_cms_adoption(
     display: ProvisionDisplay | None,
     shutdown_event: asyncio.Event,
+    *,
+    ip: str = "",
+    hostname: str = "",
 ) -> str:
     """Monitor CMS status after provisioning.
 
@@ -376,7 +382,12 @@ async def _wait_for_cms_adoption(
         return "no_cms"
 
     shown_connecting = False
-    shown_pending = False
+    # ``pending_mode`` tracks which "waiting for adoption" screen is on
+    # the framebuffer so we don't redraw every poll.  Transitions:
+    #   None -> "fallback" (secret not yet present)
+    #   None -> "qr"       (secret present at first pending poll)
+    #   "fallback" -> "qr" (secret appeared after cms-client started)
+    pending_mode: str | None = None
     spinner_stop = threading.Event()
     spinner_thread = None
     consecutive_errors = 0
@@ -396,10 +407,29 @@ async def _wait_for_cms_adoption(
             if state == "connected" and registration == "pending":
                 _stop_spinner(spinner_stop, spinner_thread)
                 consecutive_errors = 0
-                if not shown_pending and display and display.available:
-                    display.show_cms_connected_pending(cms_host)
-                    shown_pending = True
-                    logger.info("CMS connected — waiting for adoption")
+                if pending_mode != "qr" and display and display.available:
+                    # Try to upgrade to the QR screen as soon as the
+                    # pairing secret is on disk (cms-client may have
+                    # started after us, especially on the ethernet path).
+                    secret = _read_pairing_secret()
+                    if secret:
+                        display.show_pairing_qr(
+                            secret=secret,
+                            cms_host=cms_host,
+                            ip=ip or get_device_ip() or "",
+                            hostname=hostname,
+                        )
+                        pending_mode = "qr"
+                        logger.info(
+                            "CMS connected — showing pairing QR for adoption",
+                        )
+                    elif pending_mode is None:
+                        display.show_cms_connected_pending(cms_host)
+                        pending_mode = "fallback"
+                        logger.info(
+                            "CMS connected — waiting for adoption "
+                            "(pairing secret not yet available)",
+                        )
 
             elif state == "error" or (state == "disconnected" and status.get("error")):
                 _stop_spinner(spinner_stop, spinner_thread)
@@ -591,7 +621,9 @@ async def run_service(force_oobe: bool = False) -> None:
         # Wait for CMS adoption (same as Phase 2 of WiFi OOBE)
         adoption_success = False
         while not shutdown_event.is_set():
-            result = await _wait_for_cms_adoption(display, shutdown_event)
+            result = await _wait_for_cms_adoption(
+                display, shutdown_event, ip=device_ip or "", hostname=hostname,
+            )
             logger.info("CMS adoption result: %s", result)
 
             if result == "adopted":
@@ -805,9 +837,14 @@ async def run_service(force_oobe: bool = False) -> None:
 
         # ── Phase 2: CMS adoption (loops with reconfigure) ──────────
         logger.info("Entering CMS adoption phase")
+        wifi_suffix = get_device_serial_suffix()
+        wifi_hostname = f"agora-{wifi_suffix}.local" if wifi_suffix else ""
         adoption_success = False
         while not shutdown_event.is_set():
-            result = await _wait_for_cms_adoption(display, shutdown_event)
+            result = await _wait_for_cms_adoption(
+                display, shutdown_event,
+                ip=get_device_ip() or "", hostname=wifi_hostname,
+            )
             logger.info("CMS adoption result: %s", result)
 
             if result == "adopted":
