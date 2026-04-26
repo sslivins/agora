@@ -4,9 +4,11 @@ import itertools
 import json
 import logging
 import os
+import queue
 import signal
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,6 +166,12 @@ class AgoraPlayer:
 
     DEFAULT_SPLASH_CONFIG = "splash/default.png"
 
+    # Class-level default so bypass-init test fixtures see a sane value
+    # before _start_mpv increments it. Real instances overwrite via
+    # __init__ for clarity, but the int is immutable so the class default
+    # poses no shared-state hazard.
+    _mpv_generation: int = 0
+
     def __init__(self, base_path: str = "/opt/agora"):
         self.base = Path(base_path)
         self.state_dir = self.base / "state"
@@ -199,6 +207,26 @@ class AgoraPlayer:
         # Slideshow sequencer state. None when not playing a slideshow.
         # Populated by _start_slideshow; cleared by _clear_slideshow.
         self._slideshow: Optional[dict] = None
+
+        # ── mpv IPC event listener (Phase 1) ──
+        #
+        # A persistent background thread connects to ``MPV_IPC_SOCKET`` and
+        # reads events broadcast by mpv (start-file, end-file, etc.) onto
+        # ``_mpv_event_queue``. Events are drained on the GLib main loop
+        # via ``GLib.idle_add(self._drain_mpv_events)`` so all dispatch
+        # happens single-threaded.
+        #
+        # ``_mpv_generation`` is bumped every time a fresh mpv subprocess is
+        # spawned. Each event is stamped with the generation that was
+        # current when the listener was connected, so consumers (slideshow,
+        # loop_count) can ignore stale events from a previous mpv instance.
+        self._mpv_event_thread: Optional[threading.Thread] = None
+        self._mpv_event_stop = threading.Event()
+        self._mpv_event_queue: "queue.Queue[dict]" = queue.Queue()
+        self._mpv_event_connected = threading.Event()
+        self._mpv_generation: int = 0
+        self._mpv_drain_lock = threading.Lock()
+        self._mpv_drain_pending: bool = False
 
         Gst.init(None)
 
@@ -423,6 +451,7 @@ class AgoraPlayer:
             return True
 
     def _teardown(self) -> None:
+        self._stop_mpv_event_listener()
         self._stop_mpv()
         self._stop_cage()
         if self.pipeline:
@@ -752,6 +781,207 @@ class AgoraPlayer:
                 except OSError:
                     pass
 
+    # ── mpv IPC event listener (Phase 1) ──
+    #
+    # Long-lived thread that subscribes to mpv's IPC event stream so the
+    # main loop can react to ``end-file`` / ``start-file`` / etc. without
+    # having to poll ``_mpv_process.poll()`` or run a watchdog timer per
+    # asset. This is the foundation for identity-based slideshow EOF
+    # tracking (Phase 2) and mpv-native finite-loop accounting (Phase 3).
+
+    # Reconnect cadence when the IPC socket is unavailable (e.g. mpv not
+    # yet up, or restarting between schedules). Kept short so a freshly
+    # spawned mpv is picked up promptly.
+    _MPV_EVENT_RECONNECT_DELAY_S = 0.3
+
+    # Read timeout so the listener checks ``_mpv_event_stop`` regularly
+    # and exits promptly during shutdown without abandoning a recv() call.
+    _MPV_EVENT_READ_TIMEOUT_S = 0.5
+
+    def _start_mpv_event_listener(self) -> None:
+        """Start the persistent mpv IPC event listener thread. Idempotent.
+
+        The thread reconnects to ``MPV_IPC_SOCKET`` whenever it becomes
+        available, so it is safe to call before mpv has been spawned.
+        """
+        # Lazy-init threading primitives so bypass-init test fixtures
+        # that go through run() don't have to set them up by hand.
+        if getattr(self, "_mpv_event_stop", None) is None:
+            self._mpv_event_stop = threading.Event()
+        if getattr(self, "_mpv_event_connected", None) is None:
+            self._mpv_event_connected = threading.Event()
+        if getattr(self, "_mpv_event_queue", None) is None:
+            self._mpv_event_queue = queue.Queue()
+        if getattr(self, "_mpv_drain_lock", None) is None:
+            self._mpv_drain_lock = threading.Lock()
+        if not hasattr(self, "_mpv_drain_pending"):
+            self._mpv_drain_pending = False
+        existing = getattr(self, "_mpv_event_thread", None)
+        if existing is not None and existing.is_alive():
+            return
+        self._mpv_event_stop.clear()
+        self._mpv_event_thread = threading.Thread(
+            target=self._mpv_event_loop,
+            name="mpv-event-listener",
+            daemon=True,
+        )
+        self._mpv_event_thread.start()
+        logger.info("mpv event listener thread started")
+
+    def _stop_mpv_event_listener(self) -> None:
+        """Signal the listener to stop and wait briefly for it to exit."""
+        # Defensive: this is called from _teardown, which can run in test
+        # contexts where the listener fields were never initialised
+        # (bypass-init fixtures). Treat missing fields as "no listener".
+        stop_evt = getattr(self, "_mpv_event_stop", None)
+        if stop_evt is None:
+            return
+        stop_evt.set()
+        connected_evt = getattr(self, "_mpv_event_connected", None)
+        if connected_evt is not None:
+            connected_evt.clear()
+        t = getattr(self, "_mpv_event_thread", None)
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
+            if t.is_alive():
+                logger.warning("mpv event listener did not exit within 2s")
+        self._mpv_event_thread = None
+
+    def is_mpv_event_listener_ready(self) -> bool:
+        """Return True if the listener is currently connected to a running mpv.
+
+        Consumers (slideshow ``play_to_end``, loop_count) check this before
+        relying on event-driven transitions; if False, they fall back to
+        the legacy duration/respawn paths so we never get stuck.
+        """
+        return self._mpv_event_connected.is_set()
+
+    def _mpv_event_loop(self) -> None:
+        """Background thread body: connect, read events, dispatch via GLib.
+
+        Runs until ``self._mpv_event_stop`` is set. Auto-reconnects on
+        ENOENT (mpv not up) and on connection close (mpv respawned).
+        Each event dict is stamped with ``_generation`` matching the mpv
+        instance that emitted it.
+        """
+        while not self._mpv_event_stop.is_set():
+            sock = self._mpv_event_connect()
+            if sock is None:
+                # No mpv yet — wait briefly, then retry. wait() returns
+                # True if stop was set during the sleep so we exit cleanly.
+                if self._mpv_event_stop.wait(self._MPV_EVENT_RECONNECT_DELAY_S):
+                    return
+                continue
+
+            gen = self._mpv_generation
+            self._mpv_event_connected.set()
+            logger.debug("mpv event listener connected (gen %d)", gen)
+            try:
+                self._mpv_event_read_loop(sock, gen)
+            finally:
+                self._mpv_event_connected.clear()
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                logger.debug("mpv event listener disconnected; will retry")
+
+    def _mpv_event_connect(self) -> Optional[socket.socket]:
+        """Open a non-blocking-ish AF_UNIX connection to MPV_IPC_SOCKET.
+
+        Returns the connected socket on success, or None if mpv isn't up.
+        """
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(self._MPV_EVENT_READ_TIMEOUT_S)
+            sock.connect(MPV_IPC_SOCKET)
+            return sock
+        except OSError:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            return None
+
+    def _mpv_event_read_loop(self, sock: socket.socket, generation: int) -> None:
+        """Inner loop: read newline-delimited JSON events until disconnect."""
+        recv_buf = b""
+        while not self._mpv_event_stop.is_set():
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                # Expected — gives us a chance to check the stop flag.
+                continue
+            except OSError:
+                return
+            if not chunk:
+                # mpv closed its end of the socket
+                return
+            recv_buf += chunk
+            while b"\n" in recv_buf:
+                line, recv_buf = recv_buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode())
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if "event" not in msg:
+                    # Command responses go to the requesting client only
+                    # in practice, but be defensive in case mpv changes.
+                    continue
+                msg["_generation"] = generation
+                self._mpv_event_queue.put(msg)
+                self._schedule_drain()
+
+    def _schedule_drain(self) -> None:
+        """Schedule a single GLib.idle_add of the drain callback.
+
+        If a drain is already pending, do nothing — the existing callback
+        will dequeue everything currently buffered when it runs. This
+        prevents flooding the main loop with idle callbacks on bursty
+        event streams.
+        """
+        with self._mpv_drain_lock:
+            if self._mpv_drain_pending:
+                return
+            self._mpv_drain_pending = True
+        GLib.idle_add(self._drain_mpv_events)
+
+    def _drain_mpv_events(self) -> bool:
+        """GLib idle callback: drain the queue and dispatch each event.
+
+        Always runs on the main loop thread, so consumers don't need
+        their own locks. Returns False (one-shot).
+        """
+        with self._mpv_drain_lock:
+            self._mpv_drain_pending = False
+        while True:
+            try:
+                event = self._mpv_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._on_mpv_event(event)
+            except Exception:  # pragma: no cover — defensive
+                logger.exception("Error handling mpv event")
+        return False
+
+    def _on_mpv_event(self, event: dict) -> None:
+        """Dispatch a single mpv IPC event on the main loop thread.
+
+        Phase 1 leaves this as a no-op pass-through (the listener still
+        runs and is observable for tests / readiness gating). Phase 2
+        wires slideshow ``play_to_end`` advancement here, and Phase 3
+        wires ``loop_count`` accounting.
+        """
+        # Phase 2/3 will populate this. Keep the no-op explicit so unit
+        # tests can patch / observe dispatches without subclassing.
+        return None
+
     def _start_mpv(self, path: Path, *, loop: bool = False) -> None:
         """Launch mpv subprocess for media playback via DRM output.
 
@@ -779,6 +1009,7 @@ class AgoraPlayer:
         cmd = _build_mpv_command(path, muted=False, loop=loop)
         logger.info("Starting mpv: %s", " ".join(cmd))
         try:
+            self._mpv_generation += 1
             self._mpv_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -818,6 +1049,7 @@ class AgoraPlayer:
         cmd = _build_stream_command(url)
         logger.info("Starting stream: %s", " ".join(cmd))
         try:
+            self._mpv_generation += 1
             self._mpv_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -1124,6 +1356,7 @@ class AgoraPlayer:
                     cmd = _build_mpv_command(splash, muted=True, loop=True)
                     logger.info("Showing splash via mpv: %s", splash.name)
                     try:
+                        self._mpv_generation += 1
                         self._mpv_process = subprocess.Popen(
                             cmd,
                             stdout=subprocess.DEVNULL,
@@ -1615,6 +1848,10 @@ class AgoraPlayer:
 
         # Suppress VT console text (preserves Plymouth retained splash on framebuffer)
         self._suppress_console()
+
+        # Start the persistent mpv IPC event listener early. It auto-
+        # reconnects, so it's safe to run before the first mpv is spawned.
+        self._start_mpv_event_listener()
 
         # Apply initial state (may show splash, which can take seconds)
         self.apply_desired()

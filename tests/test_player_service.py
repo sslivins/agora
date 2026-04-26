@@ -2264,6 +2264,237 @@ class TestLoadfileMpvIpcHardening:
             assert b'"request_id"' in s, f"missing request_id in {s!r}"
 
 
+# ── mpv IPC event listener (Phase 1) ──
+
+
+class TestMpvEventListener:
+    """Tests for the persistent mpv IPC event listener thread."""
+
+    @staticmethod
+    def _prep(mpv_player):
+        """Initialise listener-related attributes on a bypass-init fixture."""
+        import queue as _queue
+        import threading as _threading
+
+        mpv_player._mpv_event_thread = None
+        mpv_player._mpv_event_stop = _threading.Event()
+        mpv_player._mpv_event_queue = _queue.Queue()
+        mpv_player._mpv_event_connected = _threading.Event()
+        mpv_player._mpv_generation = 0
+        mpv_player._mpv_drain_lock = _threading.Lock()
+        mpv_player._mpv_drain_pending = False
+
+    def test_schedule_drain_is_idempotent_while_pending(self, mpv_player):
+        """_schedule_drain should call GLib.idle_add at most once until the
+        drain callback runs."""
+        self._prep(mpv_player)
+        with patch("player.service.GLib") as glib:
+            mpv_player._schedule_drain()
+            mpv_player._schedule_drain()
+            mpv_player._schedule_drain()
+        assert glib.idle_add.call_count == 1
+        assert mpv_player._mpv_drain_pending is True
+
+    def test_drain_dispatches_all_queued_events_in_order(self, mpv_player):
+        """_drain_mpv_events should pop every queued event and call
+        _on_mpv_event in FIFO order, then return False (one-shot)."""
+        self._prep(mpv_player)
+        seen = []
+        mpv_player._on_mpv_event = lambda evt: seen.append(evt["event"])
+        mpv_player._mpv_drain_pending = True
+        for name in ("start-file", "playback-restart", "end-file"):
+            mpv_player._mpv_event_queue.put({"event": name})
+        result = mpv_player._drain_mpv_events()
+        assert result is False
+        assert seen == ["start-file", "playback-restart", "end-file"]
+        assert mpv_player._mpv_drain_pending is False
+
+    def test_drain_re_enables_scheduling_after_running(self, mpv_player):
+        """After drain runs, the next _schedule_drain should call idle_add
+        again."""
+        self._prep(mpv_player)
+        mpv_player._mpv_drain_pending = True
+        mpv_player._drain_mpv_events()
+        with patch("player.service.GLib") as glib:
+            mpv_player._schedule_drain()
+        assert glib.idle_add.call_count == 1
+
+    def test_drain_swallows_handler_exceptions(self, mpv_player):
+        """A buggy handler must not break the drain loop or leave
+        _mpv_drain_pending stuck."""
+        self._prep(mpv_player)
+        calls = []
+
+        def boom(evt):
+            calls.append(evt["event"])
+            if evt["event"] == "start-file":
+                raise RuntimeError("boom")
+
+        mpv_player._on_mpv_event = boom
+        mpv_player._mpv_drain_pending = True
+        mpv_player._mpv_event_queue.put({"event": "start-file"})
+        mpv_player._mpv_event_queue.put({"event": "end-file"})
+        mpv_player._drain_mpv_events()
+        assert calls == ["start-file", "end-file"]
+        assert mpv_player._mpv_drain_pending is False
+
+    def test_start_listener_is_idempotent(self, mpv_player):
+        """Calling _start_mpv_event_listener twice creates only one thread."""
+        self._prep(mpv_player)
+        with patch("player.service.threading.Thread") as ThreadCls:
+            ThreadCls.return_value.is_alive.return_value = True
+            mpv_player._start_mpv_event_listener()
+            mpv_player._start_mpv_event_listener()
+        assert ThreadCls.call_count == 1
+
+    def test_stop_listener_sets_stop_and_joins(self, mpv_player):
+        """_stop_mpv_event_listener must set stop, clear connected, and
+        join the thread."""
+        self._prep(mpv_player)
+        fake_thread = MagicMock()
+        fake_thread.is_alive.return_value = True
+        mpv_player._mpv_event_thread = fake_thread
+        mpv_player._mpv_event_connected.set()
+        mpv_player._stop_mpv_event_listener()
+        assert mpv_player._mpv_event_stop.is_set()
+        assert not mpv_player._mpv_event_connected.is_set()
+        fake_thread.join.assert_called_once_with(timeout=2.0)
+        assert mpv_player._mpv_event_thread is None
+
+    def test_stop_listener_no_thread_is_safe(self, mpv_player):
+        """Stopping with no thread set is a no-op."""
+        self._prep(mpv_player)
+        mpv_player._stop_mpv_event_listener()
+        assert mpv_player._mpv_event_stop.is_set()
+
+    def test_is_listener_ready_reflects_connected_flag(self, mpv_player):
+        self._prep(mpv_player)
+        assert mpv_player.is_mpv_event_listener_ready() is False
+        mpv_player._mpv_event_connected.set()
+        assert mpv_player.is_mpv_event_listener_ready() is True
+
+    @patch("player.service.GLib")
+    def test_read_loop_parses_lines_and_stamps_generation(self, _glib, mpv_player):
+        """The reader should split incoming bytes on newline, JSON-decode,
+        push events (and only events) onto the queue, and stamp each with
+        the generation it was given."""
+        self._prep(mpv_player)
+        events = [
+            b'{"event":"start-file","playlist_entry_id":7}\n',
+            b'{"event":"end-file","reason":"eof","playlist_entry_id":7}\n',
+            b'{"request_id":1,"error":"success"}\n',  # response — must be skipped
+            b'{"event":"shutdown"}\n',
+            b'',  # connection close
+        ]
+        sock = MagicMock()
+        sock.recv.side_effect = events
+        mpv_player._mpv_event_read_loop(sock, generation=42)
+        drained = []
+        while True:
+            try:
+                drained.append(mpv_player._mpv_event_queue.get_nowait())
+            except Exception:
+                break
+        assert [e["event"] for e in drained] == ["start-file", "end-file", "shutdown"]
+        assert all(e["_generation"] == 42 for e in drained)
+        assert all("request_id" not in e for e in drained)
+
+    @patch("player.service.GLib")
+    def test_read_loop_handles_split_lines(self, _glib, mpv_player):
+        """A JSON object split across two recv() calls should still parse."""
+        self._prep(mpv_player)
+        sock = MagicMock()
+        sock.recv.side_effect = [
+            b'{"event":"start-',
+            b'file","playlist_entry_id":3}\n',
+            b'',
+        ]
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        evt = mpv_player._mpv_event_queue.get_nowait()
+        assert evt["event"] == "start-file"
+        assert evt["playlist_entry_id"] == 3
+
+    @patch("player.service.GLib")
+    def test_read_loop_skips_garbage_lines(self, _glib, mpv_player):
+        """Lines that aren't valid JSON must not crash the loop."""
+        self._prep(mpv_player)
+        sock = MagicMock()
+        sock.recv.side_effect = [
+            b'not json\n',
+            b'{"event":"end-file","reason":"eof"}\n',
+            b'',
+        ]
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        evt = mpv_player._mpv_event_queue.get_nowait()
+        assert evt["event"] == "end-file"
+
+    @patch("player.service.GLib")
+    def test_read_loop_continues_after_socket_timeout(self, _glib, mpv_player):
+        """A socket.timeout (used to keep checking the stop flag) must not
+        terminate the reader."""
+        self._prep(mpv_player)
+        import socket as _socket
+        sock = MagicMock()
+        sock.recv.side_effect = [
+            _socket.timeout("read timeout"),
+            b'{"event":"end-file","reason":"eof"}\n',
+            b'',
+        ]
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        evt = mpv_player._mpv_event_queue.get_nowait()
+        assert evt["event"] == "end-file"
+
+    @patch("player.service.GLib")
+    def test_read_loop_exits_when_stop_set(self, _glib, mpv_player):
+        """Setting _mpv_event_stop should make the reader return on the
+        next timeout."""
+        self._prep(mpv_player)
+        import socket as _socket
+        mpv_player._mpv_event_stop.set()
+        sock = MagicMock()
+        # First call would time out, but stop is already set so the loop
+        # should exit before recv is called.
+        sock.recv.side_effect = _socket.timeout("read timeout")
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        # Either zero recvs (loop saw stop first) or one followed by exit.
+        assert mpv_player._mpv_event_queue.empty()
+
+    def test_event_loop_retries_when_socket_unavailable(self, mpv_player):
+        """If MPV_IPC_SOCKET doesn't exist yet, the listener should sleep
+        and retry rather than spin or crash."""
+        self._prep(mpv_player)
+        attempts = {"n": 0}
+
+        def fake_connect():
+            attempts["n"] += 1
+            if attempts["n"] >= 3:
+                # Trip the stop event so the loop exits cleanly
+                mpv_player._mpv_event_stop.set()
+            return None  # simulate "not available yet"
+
+        with patch.object(mpv_player, "_mpv_event_connect", side_effect=fake_connect):
+            mpv_player._mpv_event_loop()
+        assert attempts["n"] >= 2
+
+    def test_event_loop_sets_connected_flag_then_clears_on_disconnect(self, mpv_player):
+        """While a connection is live, _mpv_event_connected should be set;
+        after the read loop returns, it should be cleared."""
+        self._prep(mpv_player)
+        states = []
+
+        def fake_read(sock, generation):
+            states.append(("during", mpv_player._mpv_event_connected.is_set()))
+            mpv_player._mpv_event_stop.set()
+
+        fake_sock = MagicMock()
+        with patch.object(mpv_player, "_mpv_event_connect", return_value=fake_sock), \
+             patch.object(mpv_player, "_mpv_event_read_loop", side_effect=fake_read):
+            mpv_player._mpv_event_loop()
+        states.append(("after", mpv_player._mpv_event_connected.is_set()))
+        assert states == [("during", True), ("after", False)]
+        fake_sock.close.assert_called()
+
+
 # ── mpv IPC start_mpv integration ──
 
 
