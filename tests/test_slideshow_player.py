@@ -224,3 +224,195 @@ class TestApplyDesiredRoutes:
             player.apply_desired()
         glib.source_remove.assert_called_once_with(99)
         assert player._slideshow is None
+
+
+class TestPlayToEndIpcDriven:
+    """Phase 2: play_to_end advances via mpv IPC event listener.
+
+    When the listener is ready and IPC loadfile reports a
+    ``playlist_entry_id``, the slideshow should arm a
+    ``pending_play_to_end`` record and rely on ``_on_mpv_event`` to
+    advance — not respawn mpv.
+    """
+
+    def _arm(self, mpv_player):
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 30000, "play_to_end": True},
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 5000, "play_to_end": False},
+        ])
+        # Pretend the IPC event listener is ready and the loadfile
+        # captured an entry_id.
+        import threading
+        player._mpv_event_connected = threading.Event()
+        player._mpv_event_connected.set()
+        player._mpv_generation = 7
+
+        def fake_loadfile(path, **kw):
+            player._mpv_active_entry_id = 42
+            return True
+        player._loadfile_mpv = MagicMock(side_effect=fake_loadfile)
+        return player, svc
+
+    def test_play_to_end_arms_pending_via_ipc(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1234
+            player._start_slideshow("Show", None)
+        # IPC path used, not respawn.
+        player._loadfile_mpv.assert_called_once()
+        kwargs = player._loadfile_mpv.call_args.kwargs
+        assert kwargs.get("loop") is False
+        assert kwargs.get("keep_open") is True
+        player._start_mpv.assert_not_called()
+        # pending_play_to_end armed with the captured entry_id and current gen.
+        pending = player._slideshow["pending_play_to_end"]
+        assert pending["entry_id"] == 42
+        assert pending["generation"] == 7
+        assert pending["watchdog_id"] == 1234
+
+    def test_on_mpv_event_advances_on_matching_eof(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1234
+            player._start_slideshow("Show", None)
+            # Reset the loadfile mock for the second slide call.
+            player._loadfile_mpv.reset_mock()
+            player._on_mpv_event({
+                "event": "end-file", "reason": "eof",
+                "playlist_entry_id": 42, "_generation": 7,
+            })
+            # Watchdog cancelled, pending cleared, advanced to slide 2.
+            glib.source_remove.assert_any_call(1234)
+        assert player._slideshow["pending_play_to_end"] is None
+        assert player._slideshow["index"] == 2
+
+    def test_on_mpv_event_ignores_mismatched_entry_id(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        before_idx = player._slideshow["index"]
+        player._on_mpv_event({
+            "event": "end-file", "reason": "eof",
+            "playlist_entry_id": 99, "_generation": 7,
+        })
+        assert player._slideshow["pending_play_to_end"] is not None
+        assert player._slideshow["index"] == before_idx
+
+    def test_on_mpv_event_ignores_stale_generation(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        before_idx = player._slideshow["index"]
+        player._on_mpv_event({
+            "event": "end-file", "reason": "eof",
+            "playlist_entry_id": 42, "_generation": 6,
+        })
+        assert player._slideshow["pending_play_to_end"] is not None
+        assert player._slideshow["index"] == before_idx
+
+    def test_on_mpv_event_ignores_stop_reason(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        before_idx = player._slideshow["index"]
+        player._on_mpv_event({
+            "event": "end-file", "reason": "stop",
+            "playlist_entry_id": 42, "_generation": 7,
+        })
+        assert player._slideshow["pending_play_to_end"] is not None
+        assert player._slideshow["index"] == before_idx
+
+    def test_on_mpv_event_advances_on_error_reason(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        player._on_mpv_event({
+            "event": "end-file", "reason": "error",
+            "playlist_entry_id": 42, "_generation": 7,
+        })
+        assert player._slideshow["pending_play_to_end"] is None
+        assert player._slideshow["index"] == 2
+
+    def test_listener_not_ready_falls_back_to_respawn(self, mpv_player):
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 30000, "play_to_end": True},
+        ])
+        # No _mpv_event_connected attribute → listener not ready.
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        # Legacy path: _start_mpv called, no pending_play_to_end armed.
+        player._start_mpv.assert_called_once()
+        assert player._slideshow["pending_play_to_end"] is None
+
+    def test_loadfile_failure_falls_back_to_respawn(self, mpv_player):
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 30000, "play_to_end": True},
+        ])
+        import threading
+        player._mpv_event_connected = threading.Event()
+        player._mpv_event_connected.set()
+        player._loadfile_mpv = MagicMock(return_value=False)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        player._start_mpv.assert_called_once()
+        assert player._slideshow["pending_play_to_end"] is None
+
+    def test_loadfile_no_entry_id_falls_back_to_respawn(self, mpv_player):
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 30000, "play_to_end": True},
+        ])
+        import threading
+        player._mpv_event_connected = threading.Event()
+        player._mpv_event_connected.set()
+        # loadfile reports success but never sets entry_id.
+        player._mpv_active_entry_id = None
+        player._loadfile_mpv = MagicMock(return_value=True)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        player._start_mpv.assert_called_once()
+        assert player._slideshow["pending_play_to_end"] is None
+
+    def test_clear_slideshow_cancels_watchdog(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1234
+            player._start_slideshow("Show", None)
+        with patch.object(svc, "GLib") as glib:
+            player._clear_slideshow()
+            # Watchdog id 1234 cancelled (timeout_id is None so only one call).
+            glib.source_remove.assert_called_once_with(1234)
+        assert player._slideshow is None
+
+    def test_watchdog_advances_when_event_never_arrives(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1234
+            player._start_slideshow("Show", None)
+        epoch = player._slideshow["epoch"]
+        player._on_play_to_end_watchdog(epoch)
+        assert player._slideshow["pending_play_to_end"] is None
+        assert player._slideshow["index"] == 2
+
+    def test_watchdog_drops_for_stale_epoch(self, mpv_player):
+        player, svc = self._arm(mpv_player)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        before_idx = player._slideshow["index"]
+        # Fire watchdog from a previous slideshow epoch — should be a no-op.
+        player._on_play_to_end_watchdog(player._slideshow["epoch"] - 1)
+        assert player._slideshow["pending_play_to_end"] is not None
+        assert player._slideshow["index"] == before_idx
+

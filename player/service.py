@@ -171,6 +171,8 @@ class AgoraPlayer:
     # __init__ for clarity, but the int is immutable so the class default
     # poses no shared-state hazard.
     _mpv_generation: int = 0
+    _mpv_active_entry_id: Optional[int] = None
+    _mpv_keep_open_active: bool = False
 
     def __init__(self, base_path: str = "/opt/agora"):
         self.base = Path(base_path)
@@ -225,6 +227,8 @@ class AgoraPlayer:
         self._mpv_event_queue: "queue.Queue[dict]" = queue.Queue()
         self._mpv_event_connected = threading.Event()
         self._mpv_generation: int = 0
+        self._mpv_active_entry_id: Optional[int] = None
+        self._mpv_keep_open_active: bool = False
         self._mpv_drain_lock = threading.Lock()
         self._mpv_drain_pending: bool = False
 
@@ -272,6 +276,7 @@ class AgoraPlayer:
     def _clear_slideshow(self) -> None:
         """Tear down slideshow state (cancel timeout, drop manifest)."""
         self._cancel_slide_timeout()
+        self._cancel_play_to_end_watchdog()
         self._slideshow = None
 
     def _start_slideshow(self, name: str, loop_count: Optional[int]) -> None:
@@ -284,6 +289,10 @@ class AgoraPlayer:
             return
         self._cancel_slide_timeout()
         slides = manifest["slides"]
+        # ``epoch`` is bumped each time a slideshow starts so a stale
+        # play_to_end watchdog or late mpv event from a prior slideshow
+        # cannot drive the new one.
+        prev_epoch = (self._slideshow or {}).get("epoch", 0)
         self._slideshow = {
             "name": name,
             "slides": slides,
@@ -291,11 +300,13 @@ class AgoraPlayer:
             "loops_completed": 0,
             "loop_count": loop_count,
             "timeout_id": None,
+            "epoch": prev_epoch + 1,
+            "pending_play_to_end": None,
         }
         self._loops_completed = 0
         logger.info(
-            "Slideshow start: name=%s slides=%d loop_count=%s",
-            name, len(slides), loop_count,
+            "Slideshow start: name=%s slides=%d loop_count=%s epoch=%d",
+            name, len(slides), loop_count, self._slideshow["epoch"],
         )
         self._play_next_slide()
 
@@ -346,11 +357,7 @@ class AgoraPlayer:
         )
 
         if play_to_end:
-            # Video, run to end. We need a fresh mpv subprocess (not IPC
-            # loadfile) so the process actually exits on EOF and
-            # _monitor_mpv detects it to advance to the next slide.
-            self._stop_mpv()
-            self._start_mpv(path, loop=False)
+            self._play_slide_to_end(slide, slide_name, path, ss)
         else:
             # Image, or video with fixed duration: load via IPC if possible
             # then schedule a timed advance.  Loop the source so static
@@ -369,6 +376,86 @@ class AgoraPlayer:
                 started_at=datetime.now(timezone.utc),
             )
         return False
+
+    # Hard cap (ms) on how long we'll wait for an mpv ``end-file`` event
+    # for a play_to_end slide before giving up and advancing. Keeps a
+    # broken video from stalling the slideshow forever.
+    _PLAY_TO_END_WATCHDOG_HARD_CAP_MS = 10 * 60 * 1000
+
+    def _play_slide_to_end(self, slide: dict, slide_name: str,
+                           path: Path, ss: dict) -> None:
+        """Play a slide that runs to its natural end.
+
+        Preferred path: if the mpv IPC event listener is ready, IPC-load
+        the file with ``keep_open=True`` so mpv stays alive past EOF and
+        emits an ``end-file`` event. We arm a ``pending_play_to_end``
+        record on the slideshow so ``_on_mpv_event`` advances when the
+        matching event arrives, plus a watchdog timer in case mpv
+        silently misbehaves.
+
+        Fallback: if the listener isn't ready or the IPC load fails or
+        no entry_id was returned, respawn mpv (legacy path) so EOF causes
+        the process to exit and ``_monitor_mpv`` advances on retcode==0.
+        """
+        if self.is_mpv_event_listener_ready():
+            if self._loadfile_mpv(path, loop=False, muted=False, keep_open=True):
+                entry_id = self._mpv_active_entry_id
+                if entry_id is not None:
+                    duration_ms = int(slide.get("duration_ms") or 0)
+                    # Watchdog: 2× hinted duration with 60s floor, capped
+                    # at the hard cap so a misreported duration can't
+                    # stall the show indefinitely.
+                    if duration_ms > 0:
+                        watchdog_ms = max(duration_ms * 2, 60_000)
+                    else:
+                        watchdog_ms = self._PLAY_TO_END_WATCHDOG_HARD_CAP_MS
+                    watchdog_ms = min(watchdog_ms, self._PLAY_TO_END_WATCHDOG_HARD_CAP_MS)
+                    epoch = ss["epoch"]
+                    watchdog_id = GLib.timeout_add(
+                        watchdog_ms, self._on_play_to_end_watchdog, epoch,
+                    )
+                    ss["pending_play_to_end"] = {
+                        "slide_index": ss["index"] - 1,
+                        "slide_name": slide_name,
+                        "entry_id": entry_id,
+                        "generation": self._mpv_generation,
+                        "armed_at": datetime.now(timezone.utc),
+                        "watchdog_id": watchdog_id,
+                    }
+                    self._update_current(
+                        mode=PlaybackMode.PLAY,
+                        asset=ss["name"],
+                        started_at=datetime.now(timezone.utc),
+                    )
+                    logger.info(
+                        "Slideshow %s: armed play_to_end via IPC "
+                        "(slide=%s entry_id=%s gen=%d watchdog=%dms)",
+                        ss["name"], slide_name, entry_id,
+                        self._mpv_generation, watchdog_ms,
+                    )
+                    return
+                logger.warning(
+                    "Slideshow %s: IPC loadfile succeeded but no "
+                    "playlist_entry_id — falling back to respawn",
+                    ss["name"],
+                )
+            else:
+                logger.info(
+                    "Slideshow %s: IPC loadfile failed for play_to_end "
+                    "slide — falling back to respawn",
+                    ss["name"],
+                )
+        else:
+            logger.info(
+                "Slideshow %s: event listener not ready — using respawn "
+                "path for play_to_end slide",
+                ss["name"],
+            )
+        # Legacy fallback: fresh mpv subprocess so EOF causes the
+        # process to exit; _monitor_mpv detects retcode==0 and calls
+        # _play_next_slide.
+        self._stop_mpv()
+        self._start_mpv(path, loop=False)
 
     def _on_slide_timeout(self) -> bool:
         """GLib timeout callback for image slide expiry."""
@@ -692,7 +779,8 @@ class AgoraPlayer:
                 return False, None, recv_buf
             recv_buf += chunk
 
-    def _loadfile_mpv(self, path: Path, *, loop: bool = False, muted: bool = True) -> bool:
+    def _loadfile_mpv(self, path: Path, *, loop: bool = False,
+                      muted: bool = True, keep_open: bool = False) -> bool:
         """Switch content in a running mpv via IPC socket. Returns True on success.
 
         ``muted`` controls the runtime ``mute`` property after the file is
@@ -701,9 +789,23 @@ class AgoraPlayer:
         with ``--ao=alsa --audio-device=…`` bound (see ``_build_mpv_command``),
         toggling mute via IPC is sufficient — no respawn needed.
 
+        ``keep_open`` controls mpv's ``keep-open`` property. When True, mpv
+        stays loaded after EOF (paused on last frame) and emits an
+        ``end-file`` event that consumers can watch for via the IPC event
+        listener. The slideshow ``play_to_end`` path sets this so it can
+        advance to the next slide via the event listener instead of having
+        to respawn mpv. Always set explicitly (yes/no) so consecutive
+        loadfile calls don't inherit the previous setting.
+
         Each command is correlated by ``request_id`` so events that interleave
         on the same socket (mpv broadcasts events to every connected client)
         cannot be mistaken for the response.
+
+        On success, ``self._mpv_active_entry_id`` is updated with the
+        ``playlist_entry_id`` returned by mpv's loadfile response (None if
+        mpv didn't include one — older mpv versions). Slideshow consumers
+        use this for identity matching against subsequent ``end-file``
+        events.
         """
         if self._mpv_process is None or self._mpv_process.poll() is not None:
             return False
@@ -726,6 +828,21 @@ class AgoraPlayer:
                 logger.warning("mpv IPC: set loop-file failed")
                 return False
 
+            # Set keep-open lazily: only when transitioning. Default is
+            # "no" (mpv's own default), so we only send a command when
+            # arming play_to_end (keep_open=True) or when un-arming after
+            # a previous keep_open=True load. This keeps the IPC chatter
+            # — and the test surface — unchanged for the common case.
+            prev_keep_open = getattr(self, "_mpv_keep_open_active", False)
+            if keep_open or prev_keep_open:
+                keep_open_val = "yes" if keep_open else "no"
+                ok, _, recv_buf = self._ipc_call(sock, recv_buf,
+                    ["set_property", "keep-open", keep_open_val])
+                if not ok:
+                    logger.warning("mpv IPC: set keep-open failed")
+                    return False
+                self._mpv_keep_open_active = bool(keep_open)
+
             ok, _, recv_buf = self._ipc_call(sock, recv_buf, ["set_property", "mute", bool(muted)])
             if not ok:
                 logger.warning("mpv IPC: set mute (pre-load) failed")
@@ -746,11 +863,20 @@ class AgoraPlayer:
                 logger.warning("mpv IPC: set hwdec failed")
                 return False
 
-            ok, _, recv_buf = self._ipc_call(sock, recv_buf,
+            ok, data, recv_buf = self._ipc_call(sock, recv_buf,
                 ["loadfile", str(path), "replace"])
             if not ok:
                 logger.warning("mpv IPC: loadfile failed for %s", path.name)
                 return False
+
+            # Capture the playlist entry id from the loadfile response.
+            # mpv 0.36+ returns ``{"playlist_entry_id": N}`` in data; older
+            # versions may not, in which case we leave it None and consumers
+            # fall back to a non-identity-based path.
+            entry_id = None
+            if isinstance(data, dict):
+                entry_id = data.get("playlist_entry_id")
+            self._mpv_active_entry_id = entry_id
 
             # Re-assert mute after loadfile — mpv can reset per-file audio
             ok, _, recv_buf = self._ipc_call(sock, recv_buf,
@@ -768,7 +894,8 @@ class AgoraPlayer:
                         ["set_property", "fullscreen", True])
 
             logger.info(
-                "mpv IPC loadfile succeeded for %s (mute=%s)", path.name, muted,
+                "mpv IPC loadfile succeeded for %s (mute=%s keep_open=%s entry_id=%s)",
+                path.name, muted, keep_open, entry_id,
             )
             return True
         except (OSError, json.JSONDecodeError, IndexError, KeyError) as e:
@@ -854,7 +981,8 @@ class AgoraPlayer:
         relying on event-driven transitions; if False, they fall back to
         the legacy duration/respawn paths so we never get stuck.
         """
-        return self._mpv_event_connected.is_set()
+        evt = getattr(self, "_mpv_event_connected", None)
+        return evt is not None and evt.is_set()
 
     def _mpv_event_loop(self) -> None:
         """Background thread body: connect, read events, dispatch via GLib.
@@ -973,14 +1101,100 @@ class AgoraPlayer:
     def _on_mpv_event(self, event: dict) -> None:
         """Dispatch a single mpv IPC event on the main loop thread.
 
-        Phase 1 leaves this as a no-op pass-through (the listener still
-        runs and is observable for tests / readiness gating). Phase 2
-        wires slideshow ``play_to_end`` advancement here, and Phase 3
-        wires ``loop_count`` accounting.
+        Phase 2 wires slideshow ``play_to_end`` advancement here. We watch
+        for ``end-file`` events whose ``playlist_entry_id`` matches the
+        slide we armed via ``_loadfile_mpv(keep_open=True)`` and whose
+        ``_generation`` matches the mpv instance that was active at arm
+        time. Stale events from a previous mpv (post-respawn) or for a
+        different entry (e.g. user clicking through assets fast) are
+        ignored.
+
+        Reasons handled:
+          * ``eof``    – natural end of the video → advance.
+          * ``error``  – mpv hit a decode error mid-playback → advance
+                         (logs at warning so we don't get stuck on a
+                         broken slide).
+          * ``stop``/``quit``/``redirect`` – ignored. These come from
+            explicit caller action (loadfile of next slide, _stop_mpv,
+            mpv playlist redirects) and must not double-advance.
         """
-        # Phase 2/3 will populate this. Keep the no-op explicit so unit
-        # tests can patch / observe dispatches without subclassing.
-        return None
+        evt_name = event.get("event")
+        if evt_name != "end-file":
+            return
+        ss = self._slideshow
+        if not ss:
+            return
+        pending = ss.get("pending_play_to_end")
+        if not pending:
+            return
+        if event.get("_generation") != pending["generation"]:
+            logger.debug(
+                "mpv end-file ignored: generation mismatch (event=%s armed=%s)",
+                event.get("_generation"), pending["generation"],
+            )
+            return
+        if event.get("playlist_entry_id") != pending["entry_id"]:
+            logger.debug(
+                "mpv end-file ignored: entry_id mismatch (event=%s armed=%s)",
+                event.get("playlist_entry_id"), pending["entry_id"],
+            )
+            return
+        reason = event.get("reason")
+        if reason in ("stop", "quit", "redirect"):
+            logger.debug("mpv end-file reason=%s — ignoring (caller-initiated)", reason)
+            return
+        if reason == "error":
+            logger.warning(
+                "mpv end-file reason=error for slide %d (%s) — advancing anyway",
+                pending["slide_index"], pending["slide_name"],
+            )
+        else:
+            logger.info(
+                "mpv end-file reason=%s for slide %d (%s) — advancing",
+                reason, pending["slide_index"], pending["slide_name"],
+            )
+        # Cancel watchdog and clear pending before advancing so a re-entrant
+        # _play_next_slide can install a fresh pending dict.
+        self._cancel_play_to_end_watchdog()
+        ss["pending_play_to_end"] = None
+        self._play_next_slide()
+
+    def _cancel_play_to_end_watchdog(self) -> None:
+        """Cancel any pending play_to_end watchdog timeout."""
+        ss = self._slideshow
+        if not ss:
+            return
+        pending = ss.get("pending_play_to_end")
+        if not pending:
+            return
+        wid = pending.get("watchdog_id")
+        if wid:
+            try:
+                GLib.source_remove(wid)
+            except Exception:
+                pass
+            pending["watchdog_id"] = None
+
+    def _on_play_to_end_watchdog(self, slideshow_epoch: int) -> bool:
+        """GLib timeout fired when an armed play_to_end slide hasn't ended
+        within its watchdog window. Advances anyway so we never get stuck.
+
+        Returns False (one-shot).
+        """
+        ss = self._slideshow
+        if not ss or ss.get("epoch") != slideshow_epoch:
+            return False
+        pending = ss.get("pending_play_to_end")
+        if not pending:
+            return False
+        logger.warning(
+            "play_to_end watchdog fired for slide %d (%s) — advancing",
+            pending["slide_index"], pending["slide_name"],
+        )
+        pending["watchdog_id"] = None
+        ss["pending_play_to_end"] = None
+        self._play_next_slide()
+        return False
 
     def _start_mpv(self, path: Path, *, loop: bool = False) -> None:
         """Launch mpv subprocess for media playback via DRM output.
@@ -1010,6 +1224,8 @@ class AgoraPlayer:
         logger.info("Starting mpv: %s", " ".join(cmd))
         try:
             self._mpv_generation += 1
+            self._mpv_keep_open_active = False
+            self._mpv_active_entry_id = None
             self._mpv_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -1050,6 +1266,8 @@ class AgoraPlayer:
         logger.info("Starting stream: %s", " ".join(cmd))
         try:
             self._mpv_generation += 1
+            self._mpv_keep_open_active = False
+            self._mpv_active_entry_id = None
             self._mpv_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -1357,6 +1575,8 @@ class AgoraPlayer:
                     logger.info("Showing splash via mpv: %s", splash.name)
                     try:
                         self._mpv_generation += 1
+                        self._mpv_keep_open_active = False
+                        self._mpv_active_entry_id = None
                         self._mpv_process = subprocess.Popen(
                             cmd,
                             stdout=subprocess.DEVNULL,
