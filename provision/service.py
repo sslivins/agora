@@ -34,6 +34,7 @@ import socket
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -84,6 +85,16 @@ WIFI_RETRY_DELAY = 5        # seconds between Wi-Fi retries
 
 CMS_ADOPT_TIMEOUT = 300     # 5 minutes waiting for CMS adoption
 CMS_ERROR_THRESHOLD = 5     # consecutive CMS errors → trigger reconfigure
+# Maximum age (seconds) before a NEGATIVE cms_status.json entry
+# (state=error or state=disconnected+error) is treated as stale and
+# ignored.  Bootstrap-v2 polling can block for many minutes between
+# status writes, and a leftover negative entry from a previous run
+# would otherwise make _wait_for_cms_adoption hit CMS_ERROR_THRESHOLD
+# in ~10s and bounce into reconfigure.  Positive states
+# (connected/pending or connected/registered) are NEVER stale-filtered
+# — fresh adoption signals must always be honored, even if their
+# timestamp predates the start of this wait by a few ms.
+CMS_STATUS_STALE_NEG_SEC = 30.0
 
 CMS_MDNS_HOST = "agora-cms.local"
 CMS_MDNS_PORT = 8080
@@ -261,6 +272,42 @@ def _read_cms_status() -> dict:
         return {}
 
 
+def _is_status_negative_stale(status: dict, now: float | None = None) -> bool:
+    """Return True if a NEGATIVE cms_status entry should be ignored as stale.
+
+    A status is "negative" when ``state`` is ``error`` OR
+    ``state == "disconnected"`` AND a non-empty ``error`` is set.
+    Anything else (connected/pending, connected/registered,
+    connecting, plain disconnected with no error) is never considered
+    stale by this function — those are either positive or explicitly
+    transient and must always be honored.
+
+    A negative status is considered stale when its ``timestamp`` is
+    older than :data:`CMS_STATUS_STALE_NEG_SEC` seconds — or, if the
+    timestamp is missing/unparseable during OOBE, conservatively
+    treated as stale so the device doesn't latch onto a corrupt
+    leftover entry from a previous run.
+    """
+    state = status.get("state", "")
+    error = status.get("error", "")
+    is_negative = state == "error" or (state == "disconnected" and bool(error))
+    if not is_negative:
+        return False
+    ts_str = status.get("timestamp", "")
+    if not ts_str:
+        # Missing timestamp on a negative entry — treat as stale.
+        return True
+    try:
+        # Python <3.11 doesn't accept "Z"; normalize.
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc).timestamp() - ts.timestamp()
+    return age > CMS_STATUS_STALE_NEG_SEC
+
+
 def _get_cms_host() -> str:
     """Read CMS host from the persisted config."""
     try:
@@ -418,6 +465,20 @@ async def _wait_for_cms_adoption(
         deadline = time.monotonic() + CMS_ADOPT_TIMEOUT
         while not shutdown_event.is_set() and time.monotonic() < deadline:
             status = _read_cms_status()
+            # Filter out leftover negative entries from a previous run.
+            # cms-client doesn't write status during the (potentially
+            # multi-minute) bootstrap-v2 polling window, so without
+            # this guard a stale "error"/"disconnected+error" entry
+            # would dominate the loop and bounce us into reconfigure
+            # before the QR screen ever shows.
+            if _is_status_negative_stale(status):
+                status = {
+                    "state": "connecting",
+                    "error": "",
+                    "message": "",
+                    "registration": "",
+                    "timestamp": status.get("timestamp", ""),
+                }
             state = status.get("state", "")
             registration = status.get("registration", "")
 

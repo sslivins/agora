@@ -470,6 +470,227 @@ class TestEnsureWpsCredentialsFirstBoot:
                 poll_cancel_event=cancel,
             )
 
+    @pytest.mark.asyncio
+    async def test_on_pending_registered_fires_after_register(
+        self, tmp_path, identity, pairing_secret, monkeypatch,
+    ):
+        """First-boot path: callback fires once after register_once()."""
+        monkeypatch.setattr(
+            bootstrap_boot, "decrypt_adopt_payload",
+            lambda seed, payload_b64: b'{"device_id": "pi-1"}',
+        )
+
+        register_done = asyncio.Event()
+        async def fake_register(session, base, **kw):
+            register_done.set()
+        monkeypatch.setattr(bootstrap_boot, "register_once", fake_register)
+
+        callback_log: list[bool] = []
+        def on_pending():
+            # Capture whether register has completed by the time the
+            # callback fires — must be True (post-register, pre-poll).
+            callback_log.append(register_done.is_set())
+
+        async def fake_status(session, base, *, pubkey_b64):
+            return BootstrapStatus(status="adopted", payload_b64="x")
+        monkeypatch.setattr(
+            bootstrap_boot, "get_bootstrap_status_once", fake_status,
+        )
+        async def fake_fetch(session, base, *, device_id, seed):
+            return _fresh_token(60)
+        monkeypatch.setattr(bootstrap_boot, "fetch_connect_token", fake_fetch)
+        async def no_sleep(*a, **kw):
+            return None
+        monkeypatch.setattr(bootstrap_boot.asyncio, "sleep", no_sleep)
+
+        await bootstrap_boot.ensure_wps_credentials(
+            session=object(),
+            cms_api_base="https://cms.example.com",
+            device_id="pi-abc",
+            identity=identity,
+            pairing_secret=pairing_secret,
+            state_path=tmp_path / "s.json",
+            fleet_id="fleet-A",
+            fleet_secret=b"\x00" * 32,
+            on_pending_registered=on_pending,
+        )
+        assert callback_log == [True]
+
+    @pytest.mark.asyncio
+    async def test_on_pending_registered_fires_again_on_reregister(
+        self, tmp_path, identity, pairing_secret, monkeypatch,
+    ):
+        """Pending row reaped → re-register → callback fires again."""
+        monkeypatch.setattr(
+            bootstrap_boot, "decrypt_adopt_payload",
+            lambda seed, payload_b64: b'{"device_id": "pi-z"}',
+        )
+        async def fake_register(session, base, **kw):
+            return None
+        monkeypatch.setattr(bootstrap_boot, "register_once", fake_register)
+
+        seq = {"n": 0}
+        async def fake_status(session, base, *, pubkey_b64):
+            seq["n"] += 1
+            if seq["n"] == 1:
+                raise PendingNotFoundError(404, "reaped")
+            return BootstrapStatus(status="adopted", payload_b64="x")
+        monkeypatch.setattr(
+            bootstrap_boot, "get_bootstrap_status_once", fake_status,
+        )
+        async def fake_fetch(session, base, *, device_id, seed):
+            return _fresh_token(60)
+        monkeypatch.setattr(bootstrap_boot, "fetch_connect_token", fake_fetch)
+        async def no_sleep(*a, **kw):
+            return None
+        monkeypatch.setattr(bootstrap_boot.asyncio, "sleep", no_sleep)
+
+        calls = {"n": 0}
+        def on_pending():
+            calls["n"] += 1
+
+        await bootstrap_boot.ensure_wps_credentials(
+            session=object(),
+            cms_api_base="https://cms.example.com",
+            device_id="pi-abc",
+            identity=identity,
+            pairing_secret=pairing_secret,
+            state_path=tmp_path / "s.json",
+            fleet_id="fleet-A",
+            fleet_secret=b"\x00" * 32,
+            on_pending_registered=on_pending,
+        )
+        # Once for the initial register, once after the 404 re-register.
+        assert calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_on_pending_registered_swallows_exceptions(
+        self, tmp_path, identity, pairing_secret, monkeypatch,
+    ):
+        """A buggy callback must not break the bootstrap flow."""
+        monkeypatch.setattr(
+            bootstrap_boot, "decrypt_adopt_payload",
+            lambda seed, payload_b64: b'{"device_id": "pi-q"}',
+        )
+        async def fake_register(session, base, **kw):
+            return None
+        monkeypatch.setattr(bootstrap_boot, "register_once", fake_register)
+        async def fake_status(session, base, *, pubkey_b64):
+            return BootstrapStatus(status="adopted", payload_b64="x")
+        monkeypatch.setattr(
+            bootstrap_boot, "get_bootstrap_status_once", fake_status,
+        )
+        async def fake_fetch(session, base, *, device_id, seed):
+            return _fresh_token(60)
+        monkeypatch.setattr(bootstrap_boot, "fetch_connect_token", fake_fetch)
+        async def no_sleep(*a, **kw):
+            return None
+        monkeypatch.setattr(bootstrap_boot.asyncio, "sleep", no_sleep)
+
+        def boom():
+            raise RuntimeError("status writer broken")
+
+        # Must complete normally despite the callback raising.
+        creds = await bootstrap_boot.ensure_wps_credentials(
+            session=object(),
+            cms_api_base="https://cms.example.com",
+            device_id="pi-abc",
+            identity=identity,
+            pairing_secret=pairing_secret,
+            state_path=tmp_path / "s.json",
+            fleet_id="fleet-A",
+            fleet_secret=b"\x00" * 32,
+            on_pending_registered=boom,
+        )
+        assert creds is not None
+
+
+class TestOnPendingRegisteredCachedPath:
+    """Cached-fresh and signed-refresh paths must NOT fire the callback."""
+
+    pytestmark = posix_only
+
+    @pytest.mark.asyncio
+    async def test_cached_path_does_not_fire(
+        self, tmp_path, identity, pairing_secret, monkeypatch,
+    ):
+        state_path = tmp_path / "bootstrap_state.json"
+        exp = _rfc3339(datetime.now(timezone.utc) + timedelta(hours=2))
+        bootstrap_boot.save_state(state_path, {
+            "schema_version": bootstrap_boot.STATE_SCHEMA_VERSION,
+            "cms_api_base": "https://cms.example.com",
+            "device_id": "pi-1234",
+            "wps_url": "wss://wps/x",
+            "wps_jwt": "cached-jwt",
+            "expires_at": exp,
+        })
+
+        async def boom(*a, **kw):
+            raise AssertionError("should not be called on cached path")
+        monkeypatch.setattr(bootstrap_boot, "register_once", boom)
+        monkeypatch.setattr(bootstrap_boot, "fetch_connect_token", boom)
+        monkeypatch.setattr(bootstrap_boot, "get_bootstrap_status_once", boom)
+
+        calls = {"n": 0}
+        def cb():
+            calls["n"] += 1
+
+        await bootstrap_boot.ensure_wps_credentials(
+            session=object(),
+            cms_api_base="https://cms.example.com",
+            device_id="pi-1234",
+            identity=identity,
+            pairing_secret=pairing_secret,
+            state_path=state_path,
+            fleet_id="",
+            fleet_secret=b"",
+            on_pending_registered=cb,
+        )
+        assert calls["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_signed_refresh_does_not_fire(
+        self, tmp_path, identity, pairing_secret, monkeypatch,
+    ):
+        state_path = tmp_path / "bootstrap_state.json"
+        exp = _rfc3339(datetime.now(timezone.utc) - timedelta(hours=1))
+        bootstrap_boot.save_state(state_path, {
+            "schema_version": bootstrap_boot.STATE_SCHEMA_VERSION,
+            "cms_api_base": "https://cms.example.com",
+            "device_id": "pi-1234",
+            "wps_url": "wss://wps/x",
+            "wps_jwt": "stale-jwt",
+            "expires_at": exp,
+        })
+
+        async def boom_register(*a, **kw):
+            raise AssertionError("register_once must not be called on refresh")
+        monkeypatch.setattr(bootstrap_boot, "register_once", boom_register)
+        async def boom_status(*a, **kw):
+            raise AssertionError("get_bootstrap_status_once must not be called on refresh")
+        monkeypatch.setattr(bootstrap_boot, "get_bootstrap_status_once", boom_status)
+        async def fake_fetch(session, base, *, device_id, seed):
+            return _fresh_token(120)
+        monkeypatch.setattr(bootstrap_boot, "fetch_connect_token", fake_fetch)
+
+        calls = {"n": 0}
+        def cb():
+            calls["n"] += 1
+
+        await bootstrap_boot.ensure_wps_credentials(
+            session=object(),
+            cms_api_base="https://cms.example.com",
+            device_id="pi-1234",
+            identity=identity,
+            pairing_secret=pairing_secret,
+            state_path=state_path,
+            fleet_id="fleet-A",
+            fleet_secret=b"\x00" * 32,
+            on_pending_registered=cb,
+        )
+        assert calls["n"] == 0
+
+
 
 # --------------------------------------------------------------------
 # refresh_wps_jwt
