@@ -1416,7 +1416,18 @@ class CMSClient:
 
         for asset_name, expected_checksum in needed:
             if self.asset_manager.has_asset(asset_name, expected_checksum):
-                continue
+                # Slideshows can be "registered" (parent JSON cached) yet have
+                # one or more slide source files evicted independently. Treat
+                # those as incomplete and force a refetch from CMS.
+                if self._is_slideshow_asset(asset_name) and not self._has_complete_slideshow(
+                    asset_name, expected_checksum,
+                ):
+                    logger.info(
+                        "Slideshow %s registered but incomplete on disk; requesting refetch",
+                        asset_name,
+                    )
+                else:
+                    continue
 
             if expected_checksum:
                 logger.info("Requesting asset: %s (checksum mismatch or missing)", asset_name)
@@ -1524,9 +1535,16 @@ class CMSClient:
     async def _handle_fetch_asset(self, msg: dict, ws) -> None:
         """CMS tells us to download an asset — with budget-aware eviction."""
         asset_name = msg.get("asset_name", "")
+        asset_type = msg.get("asset_type", "")
         download_url = msg.get("download_url", "")
         expected_checksum = msg.get("checksum", "")
         expected_size = msg.get("size_bytes", 0)
+
+        # Slideshow assets carry their payload in msg["slides"]; the outer
+        # download_url is empty.  Dispatch BEFORE the empty-URL guard.
+        if asset_type == "slideshow":
+            await self._handle_fetch_slideshow(msg, ws)
+            return
 
         if not asset_name or not download_url:
             logger.warning("Invalid fetch_asset message: missing fields")
@@ -1571,14 +1589,46 @@ class CMSClient:
                 await ws.send(json.dumps(fail))
                 return
 
-        logger.info("Fetching asset: %s from %s", asset_name, download_url)
+        actual_checksum = await self._download_one_asset(
+            asset_name, asset_type, download_url, expected_checksum,
+        )
+        if actual_checksum is None:
+            return  # already logged
 
+        # Re-trigger desired state if player is waiting for this asset
+        desired = read_state(self.settings.desired_state_path, DesiredState)
+        if desired.asset == asset_name:
+            logger.info("Re-applying desired state for just-downloaded asset: %s", asset_name)
+            desired.timestamp = datetime.now(timezone.utc)
+            write_state(self.settings.desired_state_path, desired)
+
+        ack = {
+            "type": "asset_ack",
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "asset_name": asset_name,
+            "checksum": actual_checksum,
+        }
+        await ws.send(json.dumps(ack))
+
+    async def _download_one_asset(
+        self,
+        asset_name: str,
+        asset_type: str,
+        download_url: str,
+        expected_checksum: str,
+    ) -> str | None:
+        """Download one asset to its target dir + register in the manifest.
+
+        Caller is responsible for eviction and ACK. Returns the actual
+        SHA-256 checksum on success or ``None`` on any failure (errors
+        are logged here).
+        """
         try:
             import aiohttp
 
             # Determine target directory using asset_type from CMS (issue #110),
             # falling back to extension-based detection for older CMS versions.
-            asset_type = msg.get("asset_type", "")
             if asset_type in ("video", "saved_stream"):
                 target_dir = self.settings.videos_dir
             elif asset_type == "image":
@@ -1594,7 +1644,10 @@ class CMSClient:
                     # Default to videos/ — player searches there (never root assets/)
                     target_dir = self.settings.videos_dir
 
+            target_dir.mkdir(parents=True, exist_ok=True)
             target_path = target_dir / asset_name
+
+            logger.info("Fetching asset: %s from %s", asset_name, download_url)
 
             async with aiohttp.ClientSession() as session:
                 headers = {}
@@ -1604,7 +1657,7 @@ class CMSClient:
                 async with session.get(download_url, headers=headers) as resp:
                     if resp.status != 200:
                         logger.error("Failed to download %s: HTTP %d", asset_name, resp.status)
-                        return
+                        return None
 
                     sha256 = hashlib.sha256()
                     tmp_path = target_path.with_suffix(".tmp")
@@ -1620,7 +1673,7 @@ class CMSClient:
                         logger.error("Checksum mismatch for %s: expected %s, got %s",
                                      asset_name, expected_checksum, actual_checksum)
                         tmp_path.unlink(missing_ok=True)
-                        return
+                        return None
 
                     os.replace(tmp_path, target_path)
                     file_size = target_path.stat().st_size
@@ -1629,25 +1682,239 @@ class CMSClient:
             # Register in manifest
             rel_path = str(target_path.relative_to(self.settings.assets_dir))
             self.asset_manager.register(asset_name, rel_path, file_size, actual_checksum)
+            return actual_checksum
 
-            # Re-trigger desired state if player is waiting for this asset
-            desired = read_state(self.settings.desired_state_path, DesiredState)
-            if desired.asset == asset_name:
-                logger.info("Re-applying desired state for just-downloaded asset: %s", asset_name)
-                desired.timestamp = datetime.now(timezone.utc)
-                write_state(self.settings.desired_state_path, desired)
+        except Exception:
+            logger.exception("Error fetching asset %s", asset_name)
+            return None
 
-            ack = {
+    # ── Slideshow fetch ──
+
+    async def _handle_fetch_slideshow(self, msg: dict, ws) -> None:
+        """Fetch a slideshow: download each slide, write a local manifest.
+
+        The slideshow's asset_manager entry is registered only after every
+        slide is on disk with a verified checksum. Partial downloads are
+        kept in cache (slides are independently useful) so a retry only
+        re-fetches the missing ones.
+        """
+        asset_name = msg.get("asset_name", "")
+        expected_checksum = msg.get("checksum", "")
+        slides = msg.get("slides") or []
+
+        if not asset_name:
+            logger.warning("Invalid slideshow fetch_asset: missing asset_name")
+            return
+        if not slides or not isinstance(slides, list):
+            logger.warning("Invalid slideshow fetch_asset for %s: empty or non-list slides", asset_name)
+            await ws.send(json.dumps({
+                "type": "fetch_failed",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "asset": asset_name,
+                "reason": "invalid_slideshow_payload",
+            }))
+            return
+
+        # Validate slide descriptors up front
+        for i, slide in enumerate(slides):
+            if not isinstance(slide, dict) or not slide.get("asset_name") or not slide.get("download_url"):
+                logger.warning(
+                    "Invalid slideshow fetch_asset for %s: slide %d malformed", asset_name, i,
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "invalid_slide_descriptor",
+                    "slide_position": i,
+                }))
+                return
+
+        # Fast path: slideshow + every slide already cached with matching checksums.
+        if self._has_complete_slideshow(asset_name, expected_checksum, slides):
+            logger.info("Slideshow already cached and complete: %s", asset_name)
+            await self._touch_slideshow_slides(asset_name, slides)
+            await ws.send(json.dumps({
                 "type": "asset_ack",
                 "protocol_version": PROTOCOL_VERSION,
                 "device_id": self.device_id,
                 "asset_name": asset_name,
-                "checksum": actual_checksum,
-            }
-            await ws.send(json.dumps(ack))
+                "checksum": expected_checksum,
+            }))
+            return
 
-        except Exception:
-            logger.exception("Error fetching asset %s", asset_name)
+        # Deduplicate slides by (asset_name, checksum) for budgeting and
+        # downloading. The playlist itself preserves duplicates and order.
+        unique_missing: dict[tuple[str, str], dict] = {}
+        for slide in slides:
+            key = (slide["asset_name"], slide.get("checksum", ""))
+            if key in unique_missing:
+                continue
+            if self.asset_manager.has_asset(slide["asset_name"], slide.get("checksum") or None):
+                continue
+            unique_missing[key] = slide
+
+        # Bulk eviction once for the sum of missing-slide bytes (the slideshow
+        # manifest itself is sub-1 KB JSON, ignored in budgeting).
+        if unique_missing:
+            total_bytes = sum(s.get("size_bytes", 0) for s in unique_missing.values())
+            scheduled_assets = self._get_scheduled_asset_names()
+            sync_data = self._read_schedule_cache()
+            default_asset = sync_data.get("default_asset") if sync_data else None
+            # Slides we are about to download must also be protected during eviction
+            # so the loop doesn't evict siblings out from under us.
+            protected = scheduled_assets | {key[0] for key in unique_missing.keys()}
+
+            ok = self.asset_manager.evict_for(total_bytes, protected, default_asset)
+            if not ok:
+                logger.error(
+                    "Cannot fit slideshow %s (%d bytes total): budget=%dMB",
+                    asset_name, total_bytes, self.asset_manager.budget_mb,
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "insufficient_storage",
+                    "budget_mb": self.asset_manager.budget_mb,
+                    "available_mb": self.asset_manager.available_bytes // (1024 * 1024),
+                    "required_mb": total_bytes // (1024 * 1024),
+                }))
+                return
+
+        # Download each unique missing slide.
+        for slide in unique_missing.values():
+            actual = await self._download_one_asset(
+                slide["asset_name"],
+                slide.get("asset_type", ""),
+                slide["download_url"],
+                slide.get("checksum", ""),
+            )
+            if actual is None:
+                logger.error(
+                    "Slideshow %s: slide %s download failed",
+                    asset_name, slide["asset_name"],
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "slide_download_failed",
+                    "slide_asset": slide["asset_name"],
+                }))
+                return
+
+        # All slides verified. Write the slideshow manifest with per-slide
+        # checksums so the completeness check has all the data it needs.
+        manifest_payload = {
+            "name": asset_name,
+            "checksum": expected_checksum,
+            "slides": [
+                {
+                    "name": s["asset_name"],
+                    "asset_type": s.get("asset_type", ""),
+                    "checksum": s.get("checksum", ""),
+                    "size_bytes": s.get("size_bytes", 0),
+                    "duration_ms": s.get("duration_ms", 0),
+                    "play_to_end": bool(s.get("play_to_end", False)),
+                }
+                for s in slides
+            ],
+        }
+        self.settings.slideshows_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = self.settings.slideshows_dir / f"{asset_name}.json"
+        atomic_write(manifest_path, json.dumps(manifest_payload, indent=2))
+        manifest_size = manifest_path.stat().st_size
+
+        rel_path = str(manifest_path.relative_to(self.settings.assets_dir))
+        self.asset_manager.register(asset_name, rel_path, manifest_size, expected_checksum)
+        await self._touch_slideshow_slides(asset_name, slides)
+
+        # Re-trigger desired state if player is waiting for this slideshow
+        desired = read_state(self.settings.desired_state_path, DesiredState)
+        if desired.asset == asset_name:
+            logger.info("Re-applying desired state for just-downloaded slideshow: %s", asset_name)
+            desired.timestamp = datetime.now(timezone.utc)
+            write_state(self.settings.desired_state_path, desired)
+
+        logger.info(
+            "Slideshow fetched: %s (%d slides, %d unique downloads)",
+            asset_name, len(slides), len(unique_missing),
+        )
+        await ws.send(json.dumps({
+            "type": "asset_ack",
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "asset_name": asset_name,
+            "checksum": expected_checksum,
+        }))
+
+    async def _touch_slideshow_slides(self, _asset_name: str, slides: list[dict]) -> None:
+        """Bump LRU timestamps for every slide source in a slideshow."""
+        seen: set[str] = set()
+        for slide in slides:
+            name = slide.get("asset_name") or slide.get("name")
+            if name and name not in seen:
+                self.asset_manager.touch(name)
+                seen.add(name)
+
+    def _is_slideshow_asset(self, asset_name: str) -> bool:
+        """True iff `asset_name` is registered as a slideshow on this device."""
+        entry = self.asset_manager.get(asset_name)
+        if not isinstance(entry, dict):
+            return False
+        path = entry.get("path", "")
+        return isinstance(path, str) and path.startswith("slideshows/")
+
+    def _read_slideshow_manifest(self, asset_name: str) -> dict | None:
+        """Read and parse a local slideshow manifest. Returns None if missing/corrupt."""
+        path = self.settings.slideshows_dir / f"{asset_name}.json"
+        try:
+            data = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if not isinstance(data.get("slides"), list):
+            return None
+        return data
+
+    def _has_complete_slideshow(
+        self,
+        asset_name: str,
+        expected_checksum: str,
+        slides: list[dict] | None = None,
+    ) -> bool:
+        """A slideshow is complete only when:
+
+        - the parent manifest entry is registered with a matching checksum,
+        - the local slideshow JSON parses and matches that checksum,
+        - every referenced slide is in the asset_manager with a matching checksum.
+
+        If `slides` is provided (e.g. fresh from a FETCH_ASSET message), it is
+        used as the authoritative slide list; otherwise the local manifest's
+        slide list is used.
+        """
+        if not self.asset_manager.has_asset(asset_name, expected_checksum):
+            return False
+        manifest = self._read_slideshow_manifest(asset_name)
+        if manifest is None:
+            return False
+        if expected_checksum and manifest.get("checksum") != expected_checksum:
+            return False
+        slide_list = slides if slides is not None else manifest.get("slides", [])
+        for slide in slide_list:
+            slide_name = slide.get("asset_name") or slide.get("name")
+            slide_checksum = slide.get("checksum") or None
+            if not slide_name:
+                return False
+            if not self.asset_manager.has_asset(slide_name, slide_checksum):
+                return False
+        return True
 
     async def _handle_delete_asset(self, msg: dict, ws) -> None:
         asset_name = msg.get("asset_name", "")
@@ -1657,11 +1924,17 @@ class CMSClient:
         self.asset_manager.remove(asset_name)
 
         # Also check disk directly in case it wasn't in manifest
-        for d in [self.settings.videos_dir, self.settings.images_dir, self.settings.splash_dir]:
+        for d in [self.settings.videos_dir, self.settings.images_dir, self.settings.splash_dir, self.settings.slideshows_dir]:
             target = d / asset_name
             if target.exists():
                 target.unlink()
                 break
+            # Slideshows live under <slideshows_dir>/<name>.json, not <name>.
+            if d == self.settings.slideshows_dir:
+                slideshow_target = d / f"{asset_name}.json"
+                if slideshow_target.exists():
+                    slideshow_target.unlink()
+                    break
 
         ack = {
             "type": "asset_deleted",
@@ -1783,7 +2056,7 @@ class CMSClient:
         _safe_unlink(state_dir / "assets.json")
 
         # Wipe assets on disk
-        for subdir in [self.settings.videos_dir, self.settings.images_dir]:
+        for subdir in [self.settings.videos_dir, self.settings.images_dir, self.settings.slideshows_dir]:
             if subdir.exists():
                 for f in subdir.iterdir():
                     if f.is_file():
@@ -1834,7 +2107,7 @@ class CMSClient:
         _safe_unlink(state_dir / "assets.json")
 
         # Wipe asset files on disk
-        for subdir in [self.settings.videos_dir, self.settings.images_dir]:
+        for subdir in [self.settings.videos_dir, self.settings.images_dir, self.settings.slideshows_dir]:
             if subdir.exists():
                 for f in subdir.iterdir():
                     if f.is_file():
@@ -2090,13 +2363,33 @@ class CMSClient:
             return None
 
     def _get_scheduled_asset_names(self) -> set[str]:
-        """Get all asset names from the cached schedule."""
+        """Get all asset names from the cached schedule, expanding any
+        slideshow whose local manifest is on disk to include its slide
+        sources so they are protected from LRU eviction while scheduled."""
         data = self._read_schedule_cache()
         if not data:
             return set()
-        names = set()
+        names: set[str] = set()
         for entry in data.get("schedules", []):
             asset = entry.get("asset")
             if asset:
                 names.add(asset)
+        default_asset = data.get("default_asset")
+        if default_asset:
+            names.add(default_asset)
+        # Expand slideshows → slide sources
+        for asset in list(names):
+            if not self._is_slideshow_asset(asset):
+                continue
+            manifest = self._read_slideshow_manifest(asset)
+            if manifest is None:
+                continue
+            for slide in manifest.get("slides", []):
+                slide_name = slide.get("name") or slide.get("asset_name")
+                if slide_name:
+                    names.add(slide_name)
+        if default_asset:
+            # Caller may use default_asset as a separate protection axis;
+            # leave it in `names` as well for safety but don't double-add.
+            pass
         return names

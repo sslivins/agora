@@ -73,6 +73,11 @@ class AssetManager:
             return False
         return True
 
+    def get(self, name: str) -> dict | None:
+        """Return a copy of the manifest entry for `name`, or None."""
+        entry = self._manifest.get(name)
+        return dict(entry) if entry else None
+
     def touch(self, name: str) -> None:
         """Update last_used timestamp for an asset."""
         if name in self._manifest:

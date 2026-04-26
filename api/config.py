@@ -78,6 +78,10 @@ class Settings(BaseSettings):
         return self.assets_dir / "splash"
 
     @property
+    def slideshows_dir(self) -> Path:
+        return self.assets_dir / "slideshows"
+
+    @property
     def state_dir(self) -> Path:
         return self.agora_base / "state"
 
@@ -141,6 +145,7 @@ class Settings(BaseSettings):
             self.videos_dir,
             self.images_dir,
             self.splash_dir,
+            self.slideshows_dir,
             self.state_dir,
             self.persist_dir,
             self.log_dir,
