@@ -43,7 +43,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from shared.bootstrap_identity import (
     DeviceIdentity,
@@ -254,6 +254,7 @@ async def ensure_wps_credentials(
     fleet_secret: bytes,
     metadata: Optional[dict] = None,
     poll_cancel_event: Optional[asyncio.Event] = None,
+    on_pending_registered: Optional[Callable[[], None]] = None,
     now_unix: Optional[float] = None,
 ) -> BootstrapCredentials:
     """Return a valid ``BootstrapCredentials`` for opening a WPS connection.
@@ -283,6 +284,13 @@ async def ensure_wps_credentials(
     :param poll_cancel_event: optional ``asyncio.Event`` — if set during
         first-boot polling, the loop stops promptly and raises
         :class:`BootstrapCancelledError`.
+    :param on_pending_registered: optional sync callback invoked once
+        ``/register`` has succeeded on the first-boot path (and again
+        if ``_poll_until_adopted`` re-registers after a pending-row
+        reap).  Lets the caller publish a "pending adoption" status
+        before we block in ``_poll_until_adopted``.  Not called on the
+        cached/refresh paths — those don't re-register.  Exceptions
+        from the callback are swallowed.
     :param now_unix: clock override for tests.
 
     :raises BootstrapConfigError: first-boot path entered with empty
@@ -341,6 +349,7 @@ async def ensure_wps_credentials(
         fleet_secret=fleet_secret,
         metadata=metadata,
     )
+    _safe_call(on_pending_registered)
     logger.info("Registered; polling /bootstrap-status until adopted")
 
     await _poll_until_adopted(
@@ -353,6 +362,7 @@ async def ensure_wps_credentials(
         device_id=device_id,
         metadata=metadata,
         poll_cancel_event=poll_cancel_event,
+        on_pending_registered=on_pending_registered,
     )
     # _poll_until_adopted returned without raising → device is adopted
     # and we know the decrypted device_id from the outbox.
@@ -388,6 +398,20 @@ async def ensure_wps_credentials(
     )
 
 
+def _safe_call(cb: Optional[Callable[[], None]]) -> None:
+    """Invoke a sync callback, swallowing/logging any exception.
+
+    Used for the ``on_pending_registered`` hook so a buggy callback
+    cannot break the bootstrap flow.
+    """
+    if cb is None:
+        return
+    try:
+        cb()
+    except Exception:
+        logger.debug("bootstrap callback raised", exc_info=True)
+
+
 async def _poll_until_adopted(
     session: Any,
     *,
@@ -399,6 +423,7 @@ async def _poll_until_adopted(
     device_id: str,
     metadata: Optional[dict],
     poll_cancel_event: Optional[asyncio.Event],
+    on_pending_registered: Optional[Callable[[], None]] = None,
 ) -> None:
     """Poll /bootstrap-status until the operator adopts.
 
@@ -429,6 +454,7 @@ async def _poll_until_adopted(
                     fleet_secret=fleet_secret,
                     metadata=metadata,
                 )
+                _safe_call(on_pending_registered)
             except PubkeyMismatchError:
                 # Extremely unlikely (row just got reaped).  Give up and
                 # let the caller handle it.

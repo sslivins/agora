@@ -60,10 +60,16 @@ class TestWaitForCmsAdoption:
     @pytest.mark.asyncio
     async def test_returns_failed_after_error_threshold(self):
         """Should return 'failed' after CMS_ERROR_THRESHOLD consecutive errors."""
+        from datetime import datetime, timezone
         shutdown = asyncio.Event()
 
         def mock_read_status():
-            return {"state": "error", "error": "Connection refused"}
+            # Fresh timestamp so the stale-negative guard doesn't filter it.
+            return {
+                "state": "error",
+                "error": "Connection refused",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         with patch("provision.service._get_cms_host", return_value="192.168.1.1"), \
              patch("provision.service._read_cms_status", side_effect=mock_read_status), \
@@ -75,10 +81,15 @@ class TestWaitForCmsAdoption:
     async def test_disconnected_with_error_counts_as_failure(self):
         """A 'disconnected' state with an error field should count toward
         the error threshold (e.g. connection timeout)."""
+        from datetime import datetime, timezone
         shutdown = asyncio.Event()
 
         def mock_read_status():
-            return {"state": "disconnected", "error": "timed out during handshake"}
+            return {
+                "state": "disconnected",
+                "error": "timed out during handshake",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         with patch("provision.service._get_cms_host", return_value="192.168.1.1"), \
              patch("provision.service._read_cms_status", side_effect=mock_read_status), \

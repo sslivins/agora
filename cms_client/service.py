@@ -322,6 +322,19 @@ class CMSClient:
             pass
         return self.settings.cms_url
 
+    def _on_bootstrap_pending_registered(self) -> None:
+        """Bootstrap-v2 callback: pending row registered, awaiting adoption.
+
+        Fired once after ``register_once`` succeeds in
+        ``bootstrap_boot.ensure_wps_credentials`` (and again on
+        re-registration after a pending-row reap).  Publishes
+        ``connected/pending`` so provision's ``_wait_for_cms_adoption``
+        can switch the device's display from the spinner to the
+        pairing-QR adoption screen — even though the WebSocket isn't
+        actually open yet.
+        """
+        self._write_cms_status("connected", registration="pending")
+
     def _write_cms_status(
         self,
         state: str,
@@ -547,6 +560,7 @@ class CMSClient:
                 fleet_secret=fleet_secret,
                 metadata=metadata,
                 poll_cancel_event=self._bootstrap_poll_cancel,
+                on_pending_registered=self._on_bootstrap_pending_registered,
             )
         except Exception:
             await session.close()
@@ -577,6 +591,14 @@ class CMSClient:
             # _config_watch_loop and stop() to interrupt slow first-boot
             # polling when cms_url changes or shutdown is requested.
             self._bootstrap_poll_cancel = asyncio.Event()
+            # Publish a fresh "connecting" status BEFORE the (potentially
+            # slow) bootstrap-v2 HTTPS handshake.  This overwrites any
+            # stale "disconnected/error" entry from a previous run so
+            # provision's _wait_for_cms_adoption doesn't latch onto it.
+            self._write_cms_status(
+                "connecting",
+                message="Registering with CMS\u2026",
+            )
             try:
                 creds, http_session, bootstrap_api_base = (
                     await self._mint_wps_credentials_v2(cms_url)
