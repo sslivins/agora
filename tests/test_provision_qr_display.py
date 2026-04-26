@@ -25,7 +25,7 @@ from provision import service as provision_service  # noqa: E402
 from provision import display as display_mod  # noqa: E402
 
 
-SAMPLE_SECRET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+SAMPLE_SECRET = "7K3Q4M2P"
 
 
 def _make_display():
@@ -122,7 +122,7 @@ def test_pending_with_secret_renders_qr_only_once():
 
 def test_show_pairing_qr_encodes_canonical_payload(monkeypatch):
     """The QR payload must match what the CMS scanner accepts:
-    ``{"v":1,"secret":<26-char base32>}`` with no whitespace.
+    ``{"v":1,"secret":<8-char Crockford base32>}`` with no whitespace.
     See ``cms/static/app.js:_parsePairingQr``.
     """
     captured = {}

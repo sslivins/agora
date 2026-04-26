@@ -18,17 +18,17 @@ logger = logging.getLogger("agora.provision")
 PERSIST_DIR = Path("/opt/agora/persist")
 PAIRING_SECRET_PATH = PERSIST_DIR / "pairing_secret"
 
-# RFC-4648 base32 alphabet (uppercase, no padding).  The pairing secret
-# must be exactly 26 chars from this alphabet.  See
+# Crockford base32 alphabet (uppercase, no I/L/O/U).  The pairing secret
+# must be exactly 8 chars from this alphabet.  See
 # ``shared/bootstrap_identity.py:PAIRING_SECRET_TEXT_LEN``.
-_PAIRING_SECRET_RE = re.compile(r"^[A-Z2-7]{26}$")
+_PAIRING_SECRET_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
 
 
 def read_pairing_secret(path: Path = PAIRING_SECRET_PATH) -> str | None:
     """Read the pairing secret from disk if present and valid.
 
     Returns ``None`` if the file is missing, unreadable, or does not
-    contain a 26-char RFC-4648 base32 string.  Never creates the file —
+    contain an 8-char Crockford-base32 string.  Never creates the file —
     creation is owned by ``cms_client.bootstrap_boot``.
 
     Logs a warning (without echoing the value) on malformed contents so

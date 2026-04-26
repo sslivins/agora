@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from provision.pairing import read_pairing_secret
 
-# 26-char RFC-4648 base32 — every char is in the alphabet ([A-Z2-7]).
-SAMPLE_SECRET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# 8-char Crockford base32 — every char is in the alphabet ([0-9A-HJKMNP-TV-Z]).
+SAMPLE_SECRET = "7K3Q4M2P"
 
 
 def test_missing_file_returns_none(tmp_path):
@@ -31,14 +31,14 @@ def test_strips_trailing_newline(tmp_path):
 
 def test_wrong_length_returns_none(tmp_path):
     p = tmp_path / "pairing_secret"
-    p.write_text("ABCDEFGHIJ")
+    p.write_text("ABCD")
     assert read_pairing_secret(p) is None
 
 
 def test_invalid_chars_returns_none(tmp_path):
     p = tmp_path / "pairing_secret"
-    # "1" and "8" are NOT in the RFC-4648 base32 alphabet (A-Z + 2-7).
-    p.write_text("1BCDEFGHIJKLMNOPQRSTUVWXY8")
+    # "I", "L", "O", "U" are NOT in Crockford base32.
+    p.write_text("ILOUABCD")
     assert read_pairing_secret(p) is None
 
 
@@ -50,7 +50,7 @@ def test_lowercase_rejected(tmp_path):
 
 def test_internal_whitespace_rejected(tmp_path):
     p = tmp_path / "pairing_secret"
-    p.write_text("ABCDEFGHIJKL MNOPQRSTUVWXY")  # space in middle
+    p.write_text("7K3Q 4M2P")  # space in middle, len 9
     assert read_pairing_secret(p) is None
 
 
