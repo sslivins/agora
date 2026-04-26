@@ -110,7 +110,9 @@ class TestSetupPageTlsToggle:
     def test_tls_checkbox_present_and_unchecked(self, page, provision_server):
         page.goto(provision_server)
         checkbox = page.locator("#cms-tls")
-        assert checkbox.is_visible()
+        # Native input is visually hidden by the slider CSS — assert the
+        # slider wrapper is visible instead.
+        assert page.locator(".toggle-switch").first.is_visible()
         assert not checkbox.is_checked()
 
     def test_enable_tls_switches_port_to_443(self, page, provision_server):
@@ -122,7 +124,7 @@ class TestSetupPageTlsToggle:
         port.fill("8080")
         assert port.input_value() == "8080"
 
-        tls.check()
+        tls.check(force=True)
         assert port.input_value() == "443"
 
     def test_disable_tls_clears_port(self, page, provision_server):
@@ -131,10 +133,10 @@ class TestSetupPageTlsToggle:
         port = page.locator("#cms-port")
         tls = page.locator("#cms-tls")
 
-        tls.check()
+        tls.check(force=True)
         assert port.input_value() == "443"
 
-        tls.uncheck()
+        tls.uncheck(force=True)
         assert port.input_value() == ""
         assert port.get_attribute("placeholder") == "8080"
 
@@ -145,7 +147,7 @@ class TestSetupPageTlsToggle:
         tls = page.locator("#cms-tls")
 
         port.fill("9443")
-        tls.check()
+        tls.check(force=True)
         assert port.input_value() == "9443"
 
     def test_empty_port_becomes_443_on_tls(self, page, provision_server):
@@ -155,7 +157,7 @@ class TestSetupPageTlsToggle:
         tls = page.locator("#cms-tls")
 
         port.fill("")
-        tls.check()
+        tls.check(force=True)
         assert port.input_value() == "443"
 
 
@@ -168,7 +170,7 @@ class TestReconfigurePageTlsToggle:
     def test_tls_checkbox_present_and_unchecked(self, page, provision_server):
         page.goto(f"{provision_server}/reconfigure")
         checkbox = page.locator("#cms-tls")
-        assert checkbox.is_visible()
+        assert page.locator(".toggle-switch").first.is_visible()
         assert not checkbox.is_checked()
 
     def test_enable_tls_switches_port(self, page, provision_server):
@@ -177,7 +179,7 @@ class TestReconfigurePageTlsToggle:
         tls = page.locator("#cms-tls")
 
         port.fill("8080")
-        tls.check()
+        tls.check(force=True)
         assert port.input_value() == "443"
 
     def test_disable_tls_clears_port(self, page, provision_server):
@@ -185,17 +187,17 @@ class TestReconfigurePageTlsToggle:
         port = page.locator("#cms-port")
         tls = page.locator("#cms-tls")
 
-        tls.check()
+        tls.check(force=True)
         assert port.input_value() == "443"
 
-        tls.uncheck()
+        tls.uncheck(force=True)
         assert port.input_value() == ""
 
     def test_form_submits_tls_flag(self, page, provision_server):
         """Submitting the reconfigure form should include cms_tls in the payload."""
         page.goto(f"{provision_server}/reconfigure")
         page.fill("#cms-host", "cms.example.com")
-        page.check("#cms-tls")
+        page.check("#cms-tls", force=True)
 
         with page.expect_request("**/api/reconfigure") as req_info:
             page.click("#submit-btn")
