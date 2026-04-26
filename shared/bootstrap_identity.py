@@ -21,9 +21,11 @@ Wire-format invariants that MUST stay in lockstep with CMS:
 - ECIES wire format is base64 of
   ``eph_x25519_pubkey(32) || aesgcm_nonce(12) || ciphertext || tag(16)``,
   HKDF-SHA256 with salt=None and info=``agora-bootstrap-ecies-v1``.
-- Pairing secret is 26 chars of RFC-4648 base32 (uppercase, no padding),
+- Pairing secret is 8 chars of Crockford base32 (uppercase, no I/L/O/U),
   hashed as ``sha256(secret.encode("utf-8")).hexdigest()`` — the admin in
-  CMS types/pastes that exact string into the adopt modal.
+  CMS types/pastes that exact string into the adopt modal (formatted
+  ``XXXX-XXXX`` on-screen for readability; the adopt UI normalizes
+  hyphens, whitespace, case, and the I/L→1, O→0 substitutions).
 
 File-system contract (both files):
 
@@ -69,16 +71,19 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 # Constants
 # ---------------------------------------------------------------------
 
-PAIRING_SECRET_LEN_BYTES = 16  # 128 bits of entropy
-PAIRING_SECRET_TEXT_LEN = 26  # base32(16 bytes) unpadded
+PAIRING_SECRET_LEN_BYTES = 5  # 40 bits of entropy → 8 chars Crockford
+PAIRING_SECRET_TEXT_LEN = 8  # 8 Crockford-base32 chars
 
 _SEED_LEN = 32
 _FILE_MODE = 0o400
 _DIR_MODE = 0o700
 _ECIES_HKDF_INFO = b"agora-bootstrap-ecies-v1"
 
-# Base32 alphabet we expect the secret to use (RFC-4648 uppercase, no "=").
-_B32_ALPHA = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+# Crockford base32 alphabet (no I, L, O, U).  Manually-typed pairing
+# codes are visually unambiguous; the CMS normalizer maps I/L→1 and
+# O→0 on input.  See cms/services/device_bootstrap.py:normalize_pairing_secret.
+_B32_ALPHA = set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+_CROCKFORD_ALPHA = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
 # ---------------------------------------------------------------------
@@ -321,10 +326,15 @@ def load_or_create_device_identity(key_path: Path) -> DeviceIdentity:
 
 def _generate_pairing_secret() -> str:
     raw = os.urandom(PAIRING_SECRET_LEN_BYTES)
-    # b32encode pads to multiple of 8; strip "=" so QR content stays minimal.
-    text = base64.b32encode(raw).decode("ascii").rstrip("=")
+    # Manual Crockford base32 (stdlib has none).  5 bytes = 40 bits = 8 chars.
+    n = int.from_bytes(raw, "big")
+    chars = []
+    for _ in range(PAIRING_SECRET_TEXT_LEN):
+        chars.append(_CROCKFORD_ALPHA[n & 0x1F])
+        n >>= 5
+    text = "".join(reversed(chars))
     assert len(text) == PAIRING_SECRET_TEXT_LEN, (
-        f"base32 length drift: got {len(text)}"
+        f"crockford length drift: got {len(text)}"
     )
     return text
 
@@ -333,8 +343,8 @@ def load_or_create_pairing_secret(secret_path: Path) -> str:
     """Load the pairing secret from ``secret_path`` or create it.
 
     Shares the same file-system contract and create-once semantics as
-    :func:`load_or_create_device_identity`.  Returns the 26-char base32
-    text form.
+    :func:`load_or_create_device_identity`.  Returns the 8-char
+    Crockford-base32 text form.
     """
     _check_parent_dir(secret_path, BootstrapSecretFileError)
     new_text = _generate_pairing_secret()
@@ -352,7 +362,7 @@ def load_or_create_pairing_secret(secret_path: Path) -> str:
     if len(text) != PAIRING_SECRET_TEXT_LEN or not set(text).issubset(_B32_ALPHA):
         raise BootstrapSecretFileError(
             f"{secret_path} contents are not a {PAIRING_SECRET_TEXT_LEN}-char "
-            f"RFC-4648 base32 string; refusing to silently regenerate. "
+            f"Crockford-base32 string; refusing to silently regenerate. "
             f"Delete the file manually to generate a fresh secret."
         )
     return text

@@ -277,8 +277,8 @@ def test_pairing_secret_roundtrip(tmp_path: Path) -> None:
     secret_path = tmp_path / "pairing_secret"
     text1 = load_or_create_pairing_secret(secret_path)
     assert len(text1) == PAIRING_SECRET_TEXT_LEN
-    assert text1 == text1.upper()  # uppercase base32
-    assert set(text1).issubset(set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"))
+    assert text1 == text1.upper()  # uppercase Crockford base32
+    assert set(text1).issubset(set("0123456789ABCDEFGHJKMNPQRSTVWXYZ"))
     assert stat.S_IMODE(os.stat(secret_path).st_mode) == 0o400
 
     text2 = load_or_create_pairing_secret(secret_path)
@@ -299,9 +299,9 @@ def test_pairing_secret_malformed_never_regenerates(tmp_path: Path) -> None:
 
 def test_pairing_secret_hash_hex_frozen() -> None:
     # Pin the hash contract with a frozen input → expected SHA-256 hex.
-    digest = pairing_secret_hash_hex("MFRGG2DFMZTWQ2LKNNWG23TV")
+    digest = pairing_secret_hash_hex("7K3Q4M2P")
     expected = hashlib.sha256(
-        "MFRGG2DFMZTWQ2LKNNWG23TV".encode("utf-8")
+        "7K3Q4M2P".encode("utf-8")
     ).hexdigest()
     assert digest == expected
 
@@ -492,7 +492,7 @@ def test_pairing_secret_concurrent_create_does_not_overwrite(
 ) -> None:
     os.chmod(tmp_path, 0o700)
     secret_path = tmp_path / "pairing_secret"
-    pre_existing = "AAAAAAAAAAAAAAAAAAAAAAAAAA"  # 26-char valid base32
+    pre_existing = "AAAAAAAA"  # 8-char valid Crockford base32
     assert _create_new_secret_file(
         secret_path, pre_existing.encode("ascii"), BootstrapSecretFileError,
     )

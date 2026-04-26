@@ -628,15 +628,21 @@ class ProvisionDisplay:
         else:
             y += 30
 
-        # Manual-entry fallback: print the raw secret in monospace.
+        # Manual-entry fallback: print the secret in monospace, formatted
+        # as XXXX-XXXX for readability.  CMS adopt UI normalizes hyphens,
+        # whitespace, case, and I/L→1, O→0 on input.
         _draw_text(
             ctx, cx, y,
             "Or enter this code manually:",
             "Sans 20", WHITE, alpha=0.5,
         )
         y += 30
+        manual_text = (
+            f"{secret[:4]}-{secret[4:]}"
+            if len(secret) == 8 else secret
+        )
         bw, bh = _draw_badge(
-            ctx, cx, y, secret, "Monospace Bold 26",
+            ctx, cx, y, manual_text, "Monospace Bold 26",
             bg_color=(0.3, 0.3, 0.4),
         )
         y += bh + 18
