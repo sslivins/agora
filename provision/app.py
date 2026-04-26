@@ -15,13 +15,14 @@ provision submitted, CMS reconfigured).
 import asyncio
 import json
 import logging
+import re
 import socket
 import time
 from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from provision.network import (
@@ -37,6 +38,82 @@ PERSIST_DIR = Path("/opt/agora/persist")
 STATE_DIR = Path("/opt/agora/state")
 CMS_MDNS_HOST = "agora-cms.local"
 CMS_DEFAULT_PORT = 8080
+
+# ── Hostname normalization ──────────────────────────────────────────────────
+#
+# Mobile keyboards routinely autocorrect ``'`` to a curly apostrophe (U+2019)
+# and ``"`` to curly quotes; if those make it into the CMS host field, Python
+# / aiohttp will silently IDN-encode the result (e.g. ``Kennan’s.com`` →
+# ``xn--kennans-d36c.com``) and DNS lookups will fail in confusing ways.
+# Strip them defensively and validate the result against RFC 1123.
+
+_SMART_QUOTE_TRANS = str.maketrans({
+    "\u2018": "",  # left single
+    "\u2019": "",  # right single (typical autocorrect target)
+    "\u201A": "",  # single low-9
+    "\u201B": "",  # high-reversed-9
+    "\u201C": "",  # left double
+    "\u201D": "",  # right double
+    "\u201E": "",  # double low-9
+    "\u2032": "",  # prime
+    "\u2033": "",  # double prime
+    "\u00B4": "",  # acute accent
+    "\u02BC": "",  # modifier letter apostrophe
+})
+
+_HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOSTNAME_RE = re.compile(rf"^{_HOSTNAME_LABEL}(?:\.{_HOSTNAME_LABEL})*$")
+
+
+def _normalize_cms_host(
+    raw: str, cms_tls: bool, cms_port: int,
+) -> tuple[str, int, bool, str | None]:
+    """Strip URL prefixes, smart quotes, and validate the CMS host.
+
+    Returns ``(host, port, tls, error)``. If ``error`` is non-None, the
+    host failed RFC 1123 validation and the caller should reject the
+    request. Empty input falls back to ``CMS_MDNS_HOST`` with no error.
+    """
+    host = (raw or "").strip().translate(_SMART_QUOTE_TRANS)
+    if not host:
+        return CMS_MDNS_HOST, cms_port, cms_tls, None
+
+    lower = host.lower()
+    for prefix in ("wss://", "https://", "ws://", "http://"):
+        if lower.startswith(prefix):
+            if prefix in ("wss://", "https://"):
+                cms_tls = True
+            host = host[len(prefix):]
+            break
+
+    for sep in ("/", "?", "#"):
+        host = host.split(sep, 1)[0]
+
+    if host.count(":") == 1:
+        h, _, p = host.rpartition(":")
+        try:
+            cms_port = int(p)
+            host = h
+        except ValueError:
+            pass
+
+    if not _HOSTNAME_RE.match(host):
+        return host, cms_port, cms_tls, (
+            f"Invalid CMS host '{host}'. Use letters, digits, dots, and "
+            "hyphens only (e.g. agora-cms.local)."
+        )
+
+    return host, cms_port, cms_tls, None
+
+
+def _build_cms_url(host: str, port: int, tls: bool) -> str:
+    """Build the wss/ws URL for the device websocket endpoint."""
+    scheme = "wss" if tls else "ws"
+    if tls and port == 443:
+        return f"{scheme}://{host}/ws/device"
+    if not tls and port == 80:
+        return f"{scheme}://{host}/ws/device"
+    return f"{scheme}://{host}:{port}/ws/device"
 
 # ── Event queues (consumed by provision/service.py) ──────────────────────────
 
@@ -169,7 +246,7 @@ async def provision(request: Request):
 
     wifi_ssid = body.get("wifi_ssid", "").strip()
     wifi_password = body.get("wifi_password", "")
-    cms_host = body.get("cms_host", "").strip() or CMS_MDNS_HOST
+    raw_cms_host = body.get("cms_host", "")
     cms_port = int(body.get("cms_port", CMS_DEFAULT_PORT))
     cms_tls = bool(body.get("cms_tls", False))
     device_name = body.get("device_name", "").strip()
@@ -177,44 +254,31 @@ async def provision(request: Request):
     if not wifi_ssid:
         return {"success": False, "error": "Wi-Fi network is required"}
 
-    # Save CMS config (defaults to mDNS host if not provided)
-    if cms_host:
-        # Strip protocol prefixes
-        for prefix in ("ws://", "wss://", "http://", "https://"):
-            if cms_host.startswith(prefix):
-                if prefix in ("wss://", "https://"):
-                    cms_tls = True
-                cms_host = cms_host[len(prefix):]
-        cms_host = cms_host.split("/")[0]
-        if ":" in cms_host:
-            parts = cms_host.rsplit(":", 1)
-            cms_host = parts[0]
-            try:
-                cms_port = int(parts[1])
-            except ValueError:
-                pass
+    cms_host, cms_port, cms_tls, host_error = _normalize_cms_host(
+        raw_cms_host, cms_tls, cms_port,
+    )
+    if host_error:
+        return JSONResponse(
+            {"success": False, "error": host_error}, status_code=400,
+        )
 
-        # Default port based on TLS
-        if cms_tls and cms_port == CMS_DEFAULT_PORT:
-            cms_port = 443
+    # Default port based on TLS
+    if cms_tls and cms_port == CMS_DEFAULT_PORT:
+        cms_port = 443
 
-        scheme = "wss" if cms_tls else "ws"
-        if cms_tls and cms_port == 443:
-            cms_url = f"{scheme}://{cms_host}/ws/device"
-        else:
-            cms_url = f"{scheme}://{cms_host}:{cms_port}/ws/device"
+    cms_url = _build_cms_url(cms_host, cms_port, cms_tls)
 
-        cms_config = {
-            "cms_host": cms_host,
-            "cms_port": cms_port,
-            "cms_tls": cms_tls,
-            "cms_url": cms_url,
-        }
-        cms_config_path = PERSIST_DIR / "cms_config.json"
-        cms_config_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cms_config_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cms_config, indent=2))
-        tmp.replace(cms_config_path)
+    cms_config = {
+        "cms_host": cms_host,
+        "cms_port": cms_port,
+        "cms_tls": cms_tls,
+        "cms_url": cms_url,
+    }
+    cms_config_path = PERSIST_DIR / "cms_config.json"
+    cms_config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cms_config_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cms_config, indent=2))
+    tmp.replace(cms_config_path)
 
     # Save device name if provided
     if device_name:
@@ -279,37 +343,23 @@ async def get_cms_config():
 async def reconfigure(request: Request):
     """Update CMS configuration (called from reconfigure page)."""
     body = await request.json()
-    cms_host = body.get("cms_host", "").strip()
+    raw_cms_host = body.get("cms_host", "")
     cms_port = int(body.get("cms_port", CMS_DEFAULT_PORT))
     cms_tls = bool(body.get("cms_tls", False))
 
-    if not cms_host:
-        cms_host = CMS_MDNS_HOST
-
-    # Strip protocol prefixes
-    for prefix in ("ws://", "wss://", "http://", "https://"):
-        if cms_host.startswith(prefix):
-            if prefix in ("wss://", "https://"):
-                cms_tls = True
-            cms_host = cms_host[len(prefix):]
-    cms_host = cms_host.split("/")[0]
-    if ":" in cms_host:
-        parts = cms_host.rsplit(":", 1)
-        cms_host = parts[0]
-        try:
-            cms_port = int(parts[1])
-        except ValueError:
-            pass
+    cms_host, cms_port, cms_tls, host_error = _normalize_cms_host(
+        raw_cms_host, cms_tls, cms_port,
+    )
+    if host_error:
+        return JSONResponse(
+            {"success": False, "error": host_error}, status_code=400,
+        )
 
     # Default port based on TLS
     if cms_tls and cms_port == CMS_DEFAULT_PORT:
         cms_port = 443
 
-    scheme = "wss" if cms_tls else "ws"
-    if cms_tls and cms_port == 443:
-        cms_url = f"{scheme}://{cms_host}/ws/device"
-    else:
-        cms_url = f"{scheme}://{cms_host}:{cms_port}/ws/device"
+    cms_url = _build_cms_url(cms_host, cms_port, cms_tls)
 
     cms_config = {
         "cms_host": cms_host,
