@@ -277,6 +277,28 @@ def _stop_spinner(stop_event: threading.Event, thread: threading.Thread | None) 
         thread.join(timeout=2)
 
 
+async def _wait_port_free(host: str, port: int, timeout: float = 10.0) -> bool:
+    """Wait for the given TCP port to become bindable.
+
+    Used before starting uvicorn for the reconfigure server so we don't
+    crash with ``OSError(EADDRINUSE)`` when a previous reconfigure
+    instance is still tearing down its listening socket. Returns True
+    once the port is free, False on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            s.close()
+            return True
+        except OSError:
+            s.close()
+            await asyncio.sleep(0.5)
+    return False
+
+
 def _try_mdns_discovery() -> bool:
     """Try mDNS auto-discovery for CMS and save config if found.
 
@@ -506,6 +528,17 @@ async def _run_reconfigure_server(
         except asyncio.QueueEmpty:
             break
 
+    # Wait for port 80 to be free. A previous reconfigure cycle may still
+    # be releasing its listening socket; without this we'd crash with
+    # OSError(EADDRINUSE), which uvicorn turns into ``sys.exit(1)`` and
+    # kills the entire provisioning service.
+    if not await _wait_port_free("0.0.0.0", PORTAL_PORT, timeout=10):
+        logger.error(
+            "Port %d still in use after 10s — skipping reconfigure server",
+            PORTAL_PORT,
+        )
+        return False
+
     config = uvicorn.Config(
         app, host="0.0.0.0", port=PORTAL_PORT,
         log_level="info", access_log=False,
@@ -533,8 +566,22 @@ async def _run_reconfigure_server(
                 server.should_exit = True
                 return
 
+    async def _serve_safe():
+        # Wrap server.serve() so a late EADDRINUSE (or any uvicorn
+        # bind error that triggers SystemExit) doesn't take down the
+        # whole provisioning service.
+        try:
+            await server.serve()
+        except SystemExit as e:
+            logger.error(
+                "Reconfigure server exited unexpectedly (SystemExit %s) — "
+                "likely port %d collision", e.code, PORTAL_PORT,
+            )
+        except OSError as e:
+            logger.error("Reconfigure server OSError: %s", e)
+
     tasks = [
-        asyncio.create_task(server.serve()),
+        asyncio.create_task(_serve_safe()),
         asyncio.create_task(_watch_shutdown()),
         asyncio.create_task(_watch_reconfigure()),
     ]
@@ -547,7 +594,8 @@ async def _run_reconfigure_server(
             await t
         except asyncio.CancelledError:
             pass
-    # Re-raise any exception from completed tasks
+    # Re-raise any exception from completed tasks (SystemExit/OSError
+    # are already swallowed inside _serve_safe).
     for t in done:
         if t.exception():
             raise t.exception()
@@ -733,6 +781,35 @@ async def run_service(force_oobe: bool = False) -> None:
 
         # ── Phase 1: Wi-Fi provisioning (loops on failure) ───────────
         while not shutdown_event.is_set():
+            # If Wi-Fi is already up — e.g. the provisioning service was
+            # restarted while we were mid-OOBE, or the user pre-configured
+            # NetworkManager — skip AP/portal entirely and go straight to
+            # Phase 2 (CMS adoption). Without this guard, restarting the
+            # service tears down the existing Wi-Fi connection just to
+            # re-establish it.
+            if _wait_for_wifi(timeout=5):
+                logger.info(
+                    "Wi-Fi already connected — skipping AP/portal phase",
+                )
+                _stop_spinner(welcome_spinner_stop, welcome_spinner_thread)
+
+                # Make sure the support services are running. They may
+                # already be up; ``systemctl start`` is idempotent.
+                for svc_name in ("agora-cms-client", "agora-api"):
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo", "systemctl", "start", svc_name,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc.wait()
+
+                if not _get_cms_host():
+                    _try_mdns_discovery()
+
+                display.show_wifi_connected(get_active_ssid() or "")
+                await asyncio.sleep(OOBE_DISPLAY_HOLD)
+                break
+
             # Prepare the phone-connect spinner (started after AP is up)
             phone_spinner_stop = threading.Event()
             phone_spinner_thread = threading.Thread(

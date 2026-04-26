@@ -23,7 +23,10 @@
                 <div class="form-row">
                     <div class="grow">
                         <label for="cms-host">Server Address</label>
-                        <input type="text" id="cms-host" placeholder="agora-cms.local">
+                        <input type="text" id="cms-host" placeholder="agora-cms.local"
+                               autocapitalize="off" autocorrect="off"
+                               spellcheck="false" inputmode="url"
+                               oninput="stripSmartChars(this)">
                     </div>
                     <div class="port">
                         <label for="cms-port">Port</label>
@@ -47,6 +50,16 @@
     </div>
 
     <script>
+    function stripSmartChars(el) {
+        var v = el.value;
+        var clean = v.replace(/[\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u2032\u2033\u00B4\u02BC]/g, "");
+        if (clean !== v) {
+            var pos = el.selectionStart;
+            el.value = clean;
+            try { el.setSelectionRange(pos, pos); } catch (e) {}
+        }
+    }
+
     function onTlsToggle(checked) {
         var portEl = document.getElementById("cms-port");
         if (checked && (portEl.value === "8080" || portEl.value === "")) {
