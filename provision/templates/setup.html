@@ -44,8 +44,11 @@
                         <input type="text" id="cms-port" placeholder="8080">
                     </div>
                 </div>
-                <label style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; cursor: pointer; font-size: 0.9rem;">
-                    <input type="checkbox" id="cms-tls" onchange="onTlsToggle(this.checked)">
+                <label class="toggle-row">
+                    <span class="toggle-switch">
+                        <input type="checkbox" id="cms-tls" onchange="onTlsToggle(this.checked)">
+                        <span class="slider"></span>
+                    </span>
                     <span>Use TLS (wss://)</span>
                 </label>
                 <span class="form-hint">Leave blank to auto-discover via mDNS (agora-cms.local), or enter an address manually. Enable TLS for cloud-hosted servers.</span>

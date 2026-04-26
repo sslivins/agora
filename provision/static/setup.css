@@ -177,6 +177,50 @@ button:disabled:hover { background: var(--primary); }
     color: var(--warning);
 }
 
+/* Toggle switch (used for "Use TLS") — matches CMS asset stream toggle. */
+.toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.5rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    user-select: none;
+}
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 36px;
+    height: 20px;
+    flex-shrink: 0;
+}
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+.toggle-switch .slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background: #555;
+    border-radius: 20px;
+    transition: background 0.2s;
+}
+.toggle-switch .slider::before {
+    content: "";
+    position: absolute;
+    height: 14px;
+    width: 14px;
+    left: 3px;
+    bottom: 3px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.2s;
+}
+.toggle-switch input:checked + .slider { background: var(--success, #2ecc71); }
+.toggle-switch input:checked + .slider::before { transform: translateX(16px); }
+
 /* Spinner */
 .spinner {
     display: inline-block;
