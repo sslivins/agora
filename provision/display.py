@@ -16,6 +16,7 @@ thread when used alongside asyncio.
 """
 
 import ctypes
+import json
 import logging
 import math
 import pathlib
@@ -581,6 +582,78 @@ class ProvisionDisplay:
             bw, bh = _draw_badge(ctx, cx, y, url, "Monospace Bold 28",
                         bg_color=(0.3, 0.3, 0.4))
             y += bh + 90
+        _draw_progress_dots(ctx, cx, h, 5)
+        self._blit()
+
+    def show_pairing_qr(
+        self,
+        *,
+        secret: str,
+        cms_host: str = "",
+        ip: str = "",
+        hostname: str = "",
+    ) -> None:
+        """Screen: show pairing QR for CMS scanner to adopt this device.
+
+        The QR encodes a compact JSON payload ``{"v":1,"secret":<secret>}``
+        which the CMS adoption scanner (`cms/static/app.js:_parsePairingQr`)
+        accepts directly.  The raw secret is also rendered below the QR as
+        a manual-entry fallback.
+        """
+        if not self.available:
+            return
+        ctx = self._ctx()
+        w, h = self._width, self._height
+        cx = w / 2
+        _draw_bg(ctx, w, h)
+
+        y = h * 0.06
+        y = _draw_logo(ctx, cx, y) + 10
+        th = _draw_text(ctx, cx, y, "Adopt this device", "Sans Bold 38", AMBER)
+        y += th + 18
+        th = _draw_text(
+            ctx, cx, y,
+            "Scan with the CMS Adopt button or your phone's camera.",
+            "Sans 22", WHITE, alpha=0.7, wrap_width=900,
+        )
+        y += th + 14
+
+        payload = json.dumps(
+            {"v": 1, "secret": secret}, separators=(",", ":"),
+        )
+        qr_center_y = y + 145
+        drawn = _draw_qr_code(ctx, cx, qr_center_y, payload, module_size=5)
+        if drawn:
+            y = qr_center_y + 165
+        else:
+            y += 30
+
+        # Manual-entry fallback: print the raw secret in monospace.
+        _draw_text(
+            ctx, cx, y,
+            "Or enter this code manually:",
+            "Sans 20", WHITE, alpha=0.5,
+        )
+        y += 30
+        bw, bh = _draw_badge(
+            ctx, cx, y, secret, "Monospace Bold 26",
+            bg_color=(0.3, 0.3, 0.4),
+        )
+        y += bh + 18
+
+        # LAN context: IP / hostname / cms_host badges (compact row).
+        for label, value, font in (
+            ("IP", ip, "Monospace Bold 22"),
+            ("mDNS", hostname, "Monospace Bold 22"),
+            ("CMS", cms_host, "Monospace Bold 22"),
+        ):
+            if not value:
+                continue
+            th = _draw_text(
+                ctx, cx, y, f"{label}: {value}", font, WHITE, alpha=0.55,
+            )
+            y += th + 4
+
         _draw_progress_dots(ctx, cx, h, 5)
         self._blit()
 
