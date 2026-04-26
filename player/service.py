@@ -1,6 +1,5 @@
 """Agora Player Service — watches desired state and manages media playback."""
 
-import itertools
 import json
 import logging
 import os
@@ -144,10 +143,6 @@ class AgoraPlayer:
     and mpv subprocess on Pi 4/Pi 5 for video playback with hardware decoding.
     """
 
-    # Class-level default so tests that bypass __init__ still see this
-    # attribute as None (matches "not in a slideshow").
-    _slideshow: Optional[dict] = None
-
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
         "jpegparse ! jpegdec ! videoconvert ! videoscale add-borders=true ! "
@@ -196,10 +191,6 @@ class AgoraPlayer:
         # involving None (indeterminate) commit immediately.
         self._display_pending: dict[str, tuple[Optional[bool], int]] = {}
 
-        # Slideshow sequencer state. None when not playing a slideshow.
-        # Populated by _start_slideshow; cleared by _clear_slideshow.
-        self._slideshow: Optional[dict] = None
-
         Gst.init(None)
 
     # ── Asset resolution ──
@@ -210,145 +201,6 @@ class AgoraPlayer:
             if path.is_file():
                 return path
         return None
-
-    # ── Slideshow sequencer ──
-
-    def _read_slideshow_manifest(self, name: str) -> Optional[dict]:
-        """Read and validate a slideshow manifest from the assets dir.
-
-        Returns the parsed dict or None if missing/invalid.
-        """
-        path = self.assets_dir / "slideshows" / f"{name}.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error("Slideshow manifest %s unreadable: %s", path, e)
-            return None
-        if not isinstance(data, dict):
-            return None
-        slides = data.get("slides")
-        if not isinstance(slides, list) or not slides:
-            return None
-        return data
-
-    def _cancel_slide_timeout(self) -> None:
-        """Cancel any pending GLib slide-advance timeout."""
-        ss = self._slideshow
-        if ss and ss.get("timeout_id"):
-            try:
-                GLib.source_remove(ss["timeout_id"])
-            except Exception:
-                pass
-            ss["timeout_id"] = None
-
-    def _clear_slideshow(self) -> None:
-        """Tear down slideshow state (cancel timeout, drop manifest)."""
-        self._cancel_slide_timeout()
-        self._slideshow = None
-
-    def _start_slideshow(self, name: str, loop_count: Optional[int]) -> None:
-        """Begin sequencing slides from the named slideshow manifest."""
-        manifest = self._read_slideshow_manifest(name)
-        if not manifest:
-            logger.error("Slideshow not playable: %s — showing splash", name)
-            self._update_current(error=f"Slideshow not found: {name}")
-            self._show_splash()
-            return
-        self._cancel_slide_timeout()
-        slides = manifest["slides"]
-        self._slideshow = {
-            "name": name,
-            "slides": slides,
-            "index": 0,
-            "loops_completed": 0,
-            "loop_count": loop_count,
-            "timeout_id": None,
-        }
-        self._loops_completed = 0
-        logger.info(
-            "Slideshow start: name=%s slides=%d loop_count=%s",
-            name, len(slides), loop_count,
-        )
-        self._play_next_slide()
-
-    def _play_next_slide(self) -> bool:
-        """Advance to the next slide in the active slideshow.
-
-        Loops back to the first slide when end is reached, honouring the
-        slideshow-level loop_count.  Returns False so it can also be used
-        as a one-shot GLib timeout callback.
-        """
-        ss = self._slideshow
-        if not ss:
-            return False
-
-        if ss["index"] >= len(ss["slides"]):
-            ss["loops_completed"] += 1
-            self._loops_completed = ss["loops_completed"]
-            target = ss.get("loop_count")
-            if target is not None and ss["loops_completed"] >= target:
-                logger.info(
-                    "Slideshow %s: completed %d/%d loops, → splash",
-                    ss["name"], ss["loops_completed"], target,
-                )
-                self._clear_slideshow()
-                self._show_splash()
-                return False
-            ss["index"] = 0  # next loop
-
-        slide = ss["slides"][ss["index"]]
-        ss["index"] += 1
-        slide_name = slide.get("name") or ""
-        path = self._resolve_asset(slide_name)
-        if not path:
-            logger.error(
-                "Slideshow %s: slide %d (%s) missing on disk — skipping",
-                ss["name"], ss["index"] - 1, slide_name,
-            )
-            return self._play_next_slide()
-
-        self._cancel_slide_timeout()
-        is_video_slide = (slide.get("asset_type") == "video")
-        play_to_end = bool(slide.get("play_to_end")) and is_video_slide
-
-        logger.info(
-            "Slideshow %s: slide %d/%d %s (play_to_end=%s)",
-            ss["name"], ss["index"], len(ss["slides"]),
-            slide_name, play_to_end,
-        )
-
-        if play_to_end:
-            # Video, run to end. We need a fresh mpv subprocess (not IPC
-            # loadfile) so the process actually exits on EOF and
-            # _monitor_mpv detects it to advance to the next slide.
-            self._stop_mpv()
-            self._start_mpv(path, loop=False)
-        else:
-            # Image, or video with fixed duration: load via IPC if possible
-            # then schedule a timed advance.  Loop the source so static
-            # images/short videos don't black out before the timeout fires.
-            if not self._loadfile_mpv(path, loop=True, muted=False):
-                self._start_mpv(path, loop=True)
-            duration_ms = int(slide.get("duration_ms") or 0)
-            if duration_ms <= 0:
-                duration_ms = 10000  # safe default
-            ss["timeout_id"] = GLib.timeout_add(
-                duration_ms, self._on_slide_timeout,
-            )
-            self._update_current(
-                mode=PlaybackMode.PLAY,
-                asset=ss["name"],
-                started_at=datetime.now(timezone.utc),
-            )
-        return False
-
-    def _on_slide_timeout(self) -> bool:
-        """GLib timeout callback for image slide expiry."""
-        ss = self._slideshow
-        if ss:
-            ss["timeout_id"] = None
-        self._play_next_slide()
-        return False  # one-shot
 
     def _find_splash(self) -> Optional[Path]:
         # 1. Check user-configured splash in state/splash
@@ -604,65 +456,6 @@ class AgoraPlayer:
 
     _IMAGE_EXTS = frozenset((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"))
 
-    # Per-command IPC timeout (seconds). mpv responds promptly under
-    # normal conditions; we'd rather log + fail than block forever.
-    _IPC_CMD_TIMEOUT_S = 1.5
-
-    def _ipc_call(self, sock, recv_buf: bytes, command: list, *,
-                  timeout_s: Optional[float] = None):
-        """Send a JSON IPC command stamped with a request_id and wait for the
-        matching response. Demultiplexes events that interleave on the same
-        socket (mpv broadcasts events to every connected client).
-
-        Returns ``(success: bool, data, new_recv_buf: bytes)``. On success
-        the response had ``error == "success"``; on parse / timeout / socket
-        error returns ``(False, None, recv_buf)``.
-
-        ``recv_buf`` carries any bytes already read but not yet parsed across
-        successive calls on the same socket so partial JSON lines are not
-        lost.
-        """
-        req_id = next(self._mpv_ipc_counter)
-        msg = json.dumps({"command": command, "request_id": req_id}).encode() + b"\n"
-        if timeout_s is None:
-            timeout_s = self._IPC_CMD_TIMEOUT_S
-        try:
-            sock.sendall(msg)
-        except OSError:
-            return False, None, recv_buf
-
-        deadline = time.monotonic() + timeout_s
-        while True:
-            # Drain any complete lines we already have buffered
-            while b"\n" in recv_buf:
-                line, recv_buf = recv_buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    resp = json.loads(line.decode())
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if "event" in resp:
-                    # mpv broadcasts events on every IPC client; drop
-                    continue
-                if resp.get("request_id") == req_id:
-                    return resp.get("error") == "success", resp.get("data"), recv_buf
-                # response for a different request_id — drop and keep looking
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False, None, recv_buf
-            try:
-                sock.settimeout(min(remaining, 0.5))
-                chunk = sock.recv(4096)
-            except OSError:
-                # socket.timeout is an OSError subclass since Python 3.10
-                return False, None, recv_buf
-            if not chunk:
-                return False, None, recv_buf
-            recv_buf += chunk
-
     def _loadfile_mpv(self, path: Path, *, loop: bool = False, muted: bool = True) -> bool:
         """Switch content in a running mpv via IPC socket. Returns True on success.
 
@@ -671,73 +464,60 @@ class AgoraPlayer:
         ``muted=False``. Because the underlying mpv process always launches
         with ``--ao=alsa --audio-device=…`` bound (see ``_build_mpv_command``),
         toggling mute via IPC is sufficient — no respawn needed.
-
-        Each command is correlated by ``request_id`` so events that interleave
-        on the same socket (mpv broadcasts events to every connected client)
-        cannot be mistaken for the response.
         """
         if self._mpv_process is None or self._mpv_process.poll() is not None:
             return False
         is_image = path.suffix.lower() in self._IMAGE_EXTS
-
-        # Fresh request_id sequence per IPC session — responses on this
-        # socket are single-shot, no need for global uniqueness.
-        self._mpv_ipc_counter = itertools.count()
-
-        sock = None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(2)
             sock.connect(MPV_IPC_SOCKET)
-            recv_buf = b""
-
+            # Set loop property before loading
             loop_val = "inf" if loop else "no"
-            ok, _, recv_buf = self._ipc_call(sock, recv_buf, ["set_property", "loop-file", loop_val])
-            if not ok:
-                logger.warning("mpv IPC: set loop-file failed")
-                return False
-
-            ok, _, recv_buf = self._ipc_call(sock, recv_buf, ["set_property", "mute", bool(muted)])
-            if not ok:
-                logger.warning("mpv IPC: set mute (pre-load) failed")
-                return False
-
+            sock.sendall(json.dumps({"command": ["set_property", "loop-file", loop_val]}).encode() + b"\n")
+            sock.recv(512)  # read response
+            # Toggle mute to match the policy for the incoming content
+            sock.sendall(json.dumps({"command": ["set_property", "mute", bool(muted)]}).encode() + b"\n")
+            sock.recv(512)
+            # Set image-display-duration based on content type
             if is_image:
-                ok, _, recv_buf = self._ipc_call(sock, recv_buf,
-                    ["set_property", "image-display-duration", "inf"])
-                if not ok:
-                    logger.warning("mpv IPC: set image-display-duration failed")
-                    return False
-                ok, _, recv_buf = self._ipc_call(sock, recv_buf,
-                    ["set_property", "hwdec", "no"])
+                sock.sendall(json.dumps({"command": ["set_property", "image-display-duration", "inf"]}).encode() + b"\n")
+                sock.recv(512)
+                sock.sendall(json.dumps({"command": ["set_property", "hwdec", "no"]}).encode() + b"\n")
+                sock.recv(512)
             else:
-                ok, _, recv_buf = self._ipc_call(sock, recv_buf,
-                    ["set_property", "hwdec", "drm-copy"])
-            if not ok:
-                logger.warning("mpv IPC: set hwdec failed")
+                sock.sendall(json.dumps({"command": ["set_property", "hwdec", "drm-copy"]}).encode() + b"\n")
+                sock.recv(512)
+            # Load the new file (replace = stop current, play new)
+            sock.sendall(json.dumps({"command": ["loadfile", str(path), "replace"]}).encode() + b"\n")
+            time.sleep(0.3)  # allow mpv to process and queue response + events
+            resp = sock.recv(4096)
+            # Parse response lines — look for the loadfile result, skip events
+            success = False
+            for line in resp.decode().strip().split("\n"):
+                try:
+                    msg = json.loads(line)
+                    if "event" not in msg and msg.get("error") == "success":
+                        success = True
+                        break
+                except json.JSONDecodeError:
+                    continue
+            if not success:
+                sock.close()
+                logger.warning("mpv IPC loadfile — no success in response: %s", resp[:200])
                 return False
-
-            ok, _, recv_buf = self._ipc_call(sock, recv_buf,
-                ["loadfile", str(path), "replace"])
-            if not ok:
-                logger.warning("mpv IPC: loadfile failed for %s", path.name)
-                return False
-
-            # Re-assert mute after loadfile — mpv can reset per-file audio
-            ok, _, recv_buf = self._ipc_call(sock, recv_buf,
-                ["set_property", "mute", bool(muted)])
-            if not ok:
-                logger.warning("mpv IPC: set mute (post-load) failed (continuing)")
-
-            # When loading an image, toggle fullscreen to force DRM plane refresh.
-            # Don't fail the whole call if a toggle drops; best-effort.
+            # Re-assert mute after loadfile — mpv can reset per-file audio state
+            sock.sendall(json.dumps({"command": ["set_property", "mute", bool(muted)]}).encode() + b"\n")
+            sock.recv(512)
+            # When loading an image, toggle fullscreen to force DRM plane refresh
             if is_image:
+                time.sleep(0.2)
                 for _ in range(3):
-                    _, _, recv_buf = self._ipc_call(sock, recv_buf,
-                        ["set_property", "fullscreen", False])
-                    _, _, recv_buf = self._ipc_call(sock, recv_buf,
-                        ["set_property", "fullscreen", True])
-
+                    sock.sendall(json.dumps({"command": ["set_property", "fullscreen", False]}).encode() + b"\n")
+                    sock.recv(512)
+                    sock.sendall(json.dumps({"command": ["set_property", "fullscreen", True]}).encode() + b"\n")
+                    sock.recv(512)
+            sock.close()
             logger.info(
                 "mpv IPC loadfile succeeded for %s (mute=%s)", path.name, muted,
             )
@@ -745,12 +525,6 @@ class AgoraPlayer:
         except (OSError, json.JSONDecodeError, IndexError, KeyError) as e:
             logger.warning("mpv IPC loadfile failed: %s — will restart mpv", e)
             return False
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
 
     def _start_mpv(self, path: Path, *, loop: bool = False) -> None:
         """Launch mpv subprocess for media playback via DRM output.
@@ -867,19 +641,10 @@ class AgoraPlayer:
         if self._mpv_process is None:
             return False
 
-        # Check if still supposed to be playing this asset.
-        # Slideshow mode: current_desired.asset is the slideshow name (e.g.
-        # "Test Slideshow"), but mpv was launched for an individual slide
-        # file. Skip the asset_name match in that case — exit handling
-        # routes through _play_next_slide which knows the slideshow state.
-        if self._slideshow is None and (
+        # Check if still supposed to be playing this asset
+        if (
             not self.current_desired
             or self.current_desired.asset != asset_name
-            or self.current_desired.mode != PlaybackMode.PLAY
-        ):
-            return False
-        if self._slideshow is not None and (
-            not self.current_desired
             or self.current_desired.mode != PlaybackMode.PLAY
         ):
             return False
@@ -900,10 +665,6 @@ class AgoraPlayer:
         if retcode == 0:
             # Normal exit — EOS
             logger.info("mpv finished playing %s", asset_name)
-            # Slideshow: advance to next slide regardless of slide loop flag.
-            if self._slideshow:
-                self._play_next_slide()
-                return False
             # Live streams: auto-restart on EOS (stream may have dropped)
             if (
                 self.current_desired
@@ -1333,19 +1094,16 @@ class AgoraPlayer:
         logger.info("Applying desired state: %s", desired.model_dump_json())
 
         if desired.mode == PlaybackMode.STOP:
-            self._clear_slideshow()
             self.current_desired = desired
             self._show_splash()
             return
 
         if desired.mode == PlaybackMode.SPLASH:
-            self._clear_slideshow()
             self.current_desired = desired
             self._show_splash()
             return
 
         if desired.mode == PlaybackMode.PLAY and desired.url:
-            self._clear_slideshow()
             # Stream assets → mpv (handles HLS/DASH/RTMP natively)
             if desired.asset_type == "stream":
                 mpv_proc = self._mpv_process
@@ -1372,25 +1130,6 @@ class AgoraPlayer:
             return
 
         if desired.mode == PlaybackMode.PLAY and desired.asset:
-            # Slideshow: read manifest from assets/slideshows/<name>.json
-            # and sequence slides ourselves.  Bypass single-file resolution.
-            if desired.asset_type == "slideshow":
-                # If the same slideshow is already running, leave it alone;
-                # otherwise (re)start.  Manifest changes show up via the
-                # CMS-side checksum and will arrive as a fresh fetch.
-                ss = self._slideshow
-                if ss and ss.get("name") == desired.asset:
-                    self.current_desired = desired
-                    return
-                self.current_desired = desired
-                self._health_retries = 0
-                self._loops_completed = 0
-                self._start_slideshow(desired.asset, desired.loop_count)
-                return
-
-            # Leaving any in-flight slideshow before single-asset playback.
-            self._clear_slideshow()
-
             path = self._resolve_asset(desired.asset)
             if not path:
                 logger.error("Asset not found: %s — showing splash", desired.asset)
