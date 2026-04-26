@@ -20,6 +20,21 @@ import pytest
 import uvicorn
 
 
+def _set_tls(page, checked: bool) -> None:
+    """Toggle the TLS checkbox by clicking its visible slider wrapper.
+
+    The native <input id="cms-tls"> is visually hidden (opacity:0) by the
+    slider CSS, so Playwright's check()/uncheck() report it as outside
+    the viewport. The wrapping <label class="toggle-row"> is the actual
+    click target for users; clicking it (when state needs to change)
+    flips the input and fires the change handler.
+    """
+    current = page.evaluate("document.getElementById('cms-tls').checked")
+    if current == checked:
+        return
+    page.locator("label.toggle-row").filter(has=page.locator("#cms-tls")).click()
+
+
 # ── Server fixtures ──────────────────────────────────────────────────────────
 
 
@@ -119,24 +134,22 @@ class TestSetupPageTlsToggle:
         """Enabling TLS should auto-switch port from 8080 to 443."""
         page.goto(provision_server)
         port = page.locator("#cms-port")
-        tls = page.locator("#cms-tls")
 
         port.fill("8080")
         assert port.input_value() == "8080"
 
-        tls.check(force=True)
+        _set_tls(page, True)
         assert port.input_value() == "443"
 
     def test_disable_tls_clears_port(self, page, provision_server):
         """Disabling TLS should clear port back to empty (placeholder 8080)."""
         page.goto(provision_server)
         port = page.locator("#cms-port")
-        tls = page.locator("#cms-tls")
 
-        tls.check(force=True)
+        _set_tls(page, True)
         assert port.input_value() == "443"
 
-        tls.uncheck(force=True)
+        _set_tls(page, False)
         assert port.input_value() == ""
         assert port.get_attribute("placeholder") == "8080"
 
@@ -144,20 +157,18 @@ class TestSetupPageTlsToggle:
         """A custom port (not 8080/443) should NOT be auto-switched."""
         page.goto(provision_server)
         port = page.locator("#cms-port")
-        tls = page.locator("#cms-tls")
 
         port.fill("9443")
-        tls.check(force=True)
+        _set_tls(page, True)
         assert port.input_value() == "9443"
 
     def test_empty_port_becomes_443_on_tls(self, page, provision_server):
         """Empty port should become 443 when TLS is enabled."""
         page.goto(provision_server)
         port = page.locator("#cms-port")
-        tls = page.locator("#cms-tls")
 
         port.fill("")
-        tls.check(force=True)
+        _set_tls(page, True)
         assert port.input_value() == "443"
 
 
@@ -176,28 +187,26 @@ class TestReconfigurePageTlsToggle:
     def test_enable_tls_switches_port(self, page, provision_server):
         page.goto(f"{provision_server}/reconfigure")
         port = page.locator("#cms-port")
-        tls = page.locator("#cms-tls")
 
         port.fill("8080")
-        tls.check(force=True)
+        _set_tls(page, True)
         assert port.input_value() == "443"
 
     def test_disable_tls_clears_port(self, page, provision_server):
         page.goto(f"{provision_server}/reconfigure")
         port = page.locator("#cms-port")
-        tls = page.locator("#cms-tls")
 
-        tls.check(force=True)
+        _set_tls(page, True)
         assert port.input_value() == "443"
 
-        tls.uncheck(force=True)
+        _set_tls(page, False)
         assert port.input_value() == ""
 
     def test_form_submits_tls_flag(self, page, provision_server):
         """Submitting the reconfigure form should include cms_tls in the payload."""
         page.goto(f"{provision_server}/reconfigure")
         page.fill("#cms-host", "cms.example.com")
-        page.check("#cms-tls", force=True)
+        _set_tls(page, True)
 
         with page.expect_request("**/api/reconfigure") as req_info:
             page.click("#submit-btn")
