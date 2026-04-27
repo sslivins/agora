@@ -540,7 +540,16 @@ class AgoraPlayer:
             return True
 
     def _teardown(self) -> None:
-        self._stop_mpv_event_listener()
+        # NOTE: do *not* stop the persistent mpv IPC event listener here.
+        # _teardown() runs from many normal-operation paths (mode
+        # switches, splash fallback, pipeline error/health-retry, stream
+        # start). Stopping the listener inside _teardown would leave us
+        # without an event source for the rest of the service lifetime —
+        # the thread is only started once at run() startup. Slideshow
+        # play_to_end and scheduled loop_count would then silently fall
+        # back to the legacy duration/respawn paths after the first
+        # teardown. The listener is shutdown explicitly from the run()
+        # signal handler and finally clause instead.
         self._stop_mpv()
         self._stop_cage()
         if self.pipeline:
@@ -864,11 +873,16 @@ class AgoraPlayer:
             # Always unpause before loadfile. If the previous file was
             # an image, mpv may be paused at frame 0; without this the
             # newly-loaded video would never advance and the listener
-            # would never observe end-file{reason=eof}.
+            # would never observe end-file{reason=eof}. Treat this as
+            # fatal: returning False lets _start_mpv() fall back to a
+            # fresh respawn rather than press on with an mpv that may
+            # be stuck paused — which would defeat the very fix this
+            # call exists for.
             ok, _, recv_buf = self._ipc_call(sock, recv_buf,
                 ["set_property", "pause", False])
             if not ok:
                 logger.warning("mpv IPC: set pause=False (pre-load) failed")
+                return False
 
             if is_image:
                 ok, _, recv_buf = self._ipc_call(sock, recv_buf,
@@ -1013,39 +1027,59 @@ class AgoraPlayer:
         ENOENT (mpv not up) and on connection close (mpv respawned).
         Each event dict is stamped with ``_generation`` matching the mpv
         instance that emitted it.
+
+        The outer loop is wrapped in a try/except so an unexpected
+        exception (e.g., from a malformed event or downstream consumer)
+        cannot kill the listener thread permanently — that would silently
+        strand any armed slideshow ``play_to_end`` or scheduled
+        ``loop_count`` since both rely on the listener for completion.
         """
         while not self._mpv_event_stop.is_set():
-            sock = self._mpv_event_connect()
-            if sock is None:
-                # No mpv yet — wait briefly, then retry. wait() returns
-                # True if stop was set during the sleep so we exit cleanly.
+            try:
+                sock = self._mpv_event_connect()
+                if sock is None:
+                    # No mpv yet — wait briefly, then retry. wait() returns
+                    # True if stop was set during the sleep so we exit cleanly.
+                    if self._mpv_event_stop.wait(self._MPV_EVENT_RECONNECT_DELAY_S):
+                        return
+                    continue
+
+                gen = self._mpv_generation
+                self._mpv_event_connected.set()
+                logger.debug("mpv event listener connected (gen %d)", gen)
+                # Subscribe to eof-reached. With keep-open=yes (which we use to
+                # avoid black flashes between assets), mpv suppresses the
+                # end-file{reason=eof} event and instead pauses on the last
+                # frame. The eof-reached property still flips to True at the
+                # natural end of file, so we observe that as our EOF signal.
+                try:
+                    sock.send((json.dumps(
+                        {"command": ["observe_property", 1, "eof-reached"]}
+                    ) + "\n").encode())
+                except OSError:
+                    logger.warning("mpv event listener: observe_property send failed")
+                try:
+                    self._mpv_event_read_loop(sock, gen)
+                finally:
+                    self._mpv_event_connected.clear()
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    logger.debug("mpv event listener disconnected; will retry")
+            except Exception:  # pragma: no cover — defensive self-heal
+                logger.exception(
+                    "mpv event listener: unexpected exception; "
+                    "reconnecting after backoff"
+                )
+                # Make sure consumers see us as not-ready so they fall
+                # back to legacy paths until we're reconnected.
+                try:
+                    self._mpv_event_connected.clear()
+                except Exception:
+                    pass
                 if self._mpv_event_stop.wait(self._MPV_EVENT_RECONNECT_DELAY_S):
                     return
-                continue
-
-            gen = self._mpv_generation
-            self._mpv_event_connected.set()
-            logger.debug("mpv event listener connected (gen %d)", gen)
-            # Subscribe to eof-reached. With keep-open=yes (which we use to
-            # avoid black flashes between assets), mpv suppresses the
-            # end-file{reason=eof} event and instead pauses on the last
-            # frame. The eof-reached property still flips to True at the
-            # natural end of file, so we observe that as our EOF signal.
-            try:
-                sock.send((json.dumps(
-                    {"command": ["observe_property", 1, "eof-reached"]}
-                ) + "\n").encode())
-            except OSError:
-                logger.warning("mpv event listener: observe_property send failed")
-            try:
-                self._mpv_event_read_loop(sock, gen)
-            finally:
-                self._mpv_event_connected.clear()
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-                logger.debug("mpv event listener disconnected; will retry")
 
     def _mpv_event_connect(self) -> Optional[socket.socket]:
         """Open a non-blocking-ish AF_UNIX connection to MPV_IPC_SOCKET.
@@ -2271,6 +2305,7 @@ class AgoraPlayer:
         def on_shutdown(signum, frame):
             logger.info("Received signal %d, shutting down", signum)
             self._running = False
+            self._stop_mpv_event_listener()
             self._teardown()
             self.loop.quit()
 
@@ -2282,5 +2317,6 @@ class AgoraPlayer:
         except KeyboardInterrupt:
             pass
         finally:
+            self._stop_mpv_event_listener()
             self._teardown()
             logger.info("Agora Player stopped")

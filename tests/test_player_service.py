@@ -2293,6 +2293,27 @@ class TestLoadfileMpvIpcHardening:
             assert b'"request_id"' in s, f"missing request_id in {s!r}"
 
 
+    @patch("player.service.socket")
+    def test_pause_false_failure_is_fatal(self, mock_socket_mod, mpv_player):
+        """Phase 6 regression: if mpv refuses the pre-load pause=False
+        IPC command, _loadfile_mpv must return False so callers fall
+        back to a fresh respawn. Pressing on with a possibly-paused mpv
+        defeats the very fix this command exists for (image→video
+        transitions where mpv is paused at frame 0 of the previous
+        image — the next loadfile would never advance, and the listener
+        would never observe end-file{reason=eof})."""
+        sock = self._setup(mpv_player, mock_socket_mod)
+        # loop-file ok, loop-playlist ok, mute ok, pause=False ERROR.
+        sock.recv.side_effect = [
+            self._ok(0),
+            self._ok(1),
+            self._ok(2),
+            b'{"request_id":3,"error":"property unavailable"}\n',
+            # No further responses should be requested.
+        ]
+        assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is False
+
+
 # ── mpv IPC event listener (Phase 1) ──
 
 
@@ -2395,6 +2416,59 @@ class TestMpvEventListener:
         self._prep(mpv_player)
         mpv_player._stop_mpv_event_listener()
         assert mpv_player._mpv_event_stop.is_set()
+
+    def test_teardown_does_not_stop_listener(self, mpv_player):
+        """Phase 6 regression: _teardown() must NOT kill the persistent
+        listener. _teardown runs from many normal-operation paths
+        (mode switches, fallback, health-retry); stopping the listener
+        there would silently strand all subsequent slideshow play_to_end
+        and scheduled loop_count arms for the rest of the service
+        lifetime — they would fall back to the legacy duration/respawn
+        paths and we would lose the seamless behavior of the refactor."""
+        self._prep(mpv_player)
+        fake_thread = MagicMock()
+        fake_thread.is_alive.return_value = True
+        mpv_player._mpv_event_thread = fake_thread
+        mpv_player._mpv_event_connected.set()
+        mpv_player._mpv_process = None
+        mpv_player.pipeline = None
+
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+            mpv_player._teardown()
+
+        # Listener must still be alive and unstopped.
+        assert mpv_player._mpv_event_thread is fake_thread
+        assert mpv_player._mpv_event_connected.is_set()
+        assert not mpv_player._mpv_event_stop.is_set()
+        fake_thread.join.assert_not_called()
+
+    def test_event_loop_self_heals_on_unexpected_exception(self, mpv_player):
+        """The outer listener loop must catch and recover from unexpected
+        exceptions — a single bad event must never permanently strand
+        finite loop_count or slideshow play_to_end consumers."""
+        self._prep(mpv_player)
+        mpv_player._MPV_EVENT_RECONNECT_DELAY_S = 0.001
+        mpv_player._mpv_event_connected.set()  # pretend prior connect
+        attempts = {"n": 0}
+
+        def fake_connect():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("simulated transient failure")
+            # Stop the loop on the second pass so the test terminates.
+            mpv_player._mpv_event_stop.set()
+            return None
+
+        with patch.object(mpv_player, "_mpv_event_connect", side_effect=fake_connect):
+            mpv_player._mpv_event_loop()
+
+        # Made it past the exception and reached a clean stop.
+        assert attempts["n"] >= 2
+        # Connected flag must be cleared after the exception so consumers
+        # see the listener as not-ready and fall back to legacy paths.
+        assert not mpv_player._mpv_event_connected.is_set()
 
     def test_is_listener_ready_reflects_connected_flag(self, mpv_player):
         self._prep(mpv_player)
