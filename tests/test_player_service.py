@@ -1926,27 +1926,33 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # recv: loop-file(0), mute(1), hwdec(2), loadfile(3), mute (post-load)(4)
+        # recv: loop-file(0), loop-playlist(1), mute(2), pause(3), hwdec(4),
+        # loadfile(5), mute (post-load)(6)
         mock_sock.recv.side_effect = [
             self._ok(0),                       # loop-file
-            self._ok(1),                       # mute (pre-load)
-            self._ok(2),                       # hwdec
-            self._make_success_response(3),    # loadfile
-            self._ok(4),                       # mute (post-load)
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False (pre-load)
+            self._ok(4),                       # hwdec
+            self._make_success_response(5),    # loadfile
+            self._ok(6),                       # mute (post-load)
         ]
 
         result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
         assert result is True
         mock_sock.close.assert_called_once()
 
-        # Should have sent: set loop-file, set hwdec drm-copy, loadfile
+        # Should have sent: set loop-file, loop-playlist, mute, pause,
+        # hwdec drm-copy, loadfile (post-load mute too)
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
         assert b'"loop-file"' in sends[0]
         assert b'"inf"' in sends[0]  # loop=True → inf
-        assert b'"mute"' in sends[1]
-        assert b'"hwdec"' in sends[2]
-        assert b'"drm-copy"' in sends[2]
-        assert b'"loadfile"' in sends[3]
+        assert b'"loop-playlist"' in sends[1]
+        assert b'"mute"' in sends[2]
+        assert b'"pause"' in sends[3]
+        assert b'"hwdec"' in sends[4]
+        assert b'"drm-copy"' in sends[4]
+        assert b'"loadfile"' in sends[5]
 
     @patch("player.service.socket")
     def test_image_loadfile_sends_image_properties(self, mock_socket_mod, mpv_player):
@@ -1959,26 +1965,30 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # recv: loop-file(0), mute(1), image-display-duration(2), hwdec(3),
-        # loadfile(4), mute post-load(5), 6x fullscreen toggles(6..11)
+        # recv: loop-file(0), loop-playlist(1), mute(2), pause(3),
+        # image-display-duration(4), hwdec(5), loadfile(6), mute post-load(7),
+        # 6x fullscreen toggles(8..13)
         mock_sock.recv.side_effect = [
             self._ok(0),                       # loop-file
-            self._ok(1),                       # mute (pre-load)
-            self._ok(2),                       # image-display-duration
-            self._ok(3),                       # hwdec
-            self._make_success_response(4),    # loadfile
-            self._ok(5),                       # mute (post-load)
-        ] + [self._ok(6 + i) for i in range(6)]  # 3x toggle (off+on)
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # image-display-duration
+            self._ok(5),                       # hwdec
+            self._make_success_response(6),    # loadfile
+            self._ok(7),                       # mute (post-load)
+        ] + [self._ok(8 + i) for i in range(6)]  # 3x toggle (off+on)
 
         result = mpv_player._loadfile_mpv(Path("/tmp/splash.png"), loop=True)
         assert result is True
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # loop-file, mute, image-display-duration, hwdec, loadfile, mute (post-load), 6x fullscreen
-        assert b'"image-display-duration"' in sends[2]
-        assert b'"inf"' in sends[2]
-        assert b'"hwdec"' in sends[3]
-        assert b'"no"' in sends[3]
+        # loop-file, loop-playlist, mute, pause, image-display-duration, hwdec,
+        # loadfile, mute (post-load), 6x fullscreen
+        assert b'"image-display-duration"' in sends[4]
+        assert b'"inf"' in sends[4]
+        assert b'"hwdec"' in sends[5]
+        assert b'"no"' in sends[5]
 
     def test_image_loadfile_triggers_fullscreen_toggle(self, mpv_player):
         """Image loadfile should toggle fullscreen 3x for DRM plane refresh."""
@@ -1994,19 +2004,22 @@ class TestLoadfileMpv:
             mock_socket_mod.SOCK_STREAM = 1
             mock_sock.recv.side_effect = [
                 self._ok(0),                       # loop-file
-                self._ok(1),                       # mute (pre-load)
-                self._ok(2),                       # image-display-duration
-                self._ok(3),                       # hwdec
-                self._make_success_response(4),    # loadfile
-                self._ok(5),                       # mute (post-load)
-            ] + [self._ok(6 + i) for i in range(6)]  # 3x toggle
+                self._ok(1),                       # loop-playlist
+                self._ok(2),                       # mute (pre-load)
+                self._ok(3),                       # pause=False
+                self._ok(4),                       # image-display-duration
+                self._ok(5),                       # hwdec
+                self._make_success_response(6),    # loadfile
+                self._ok(7),                       # mute (post-load)
+            ] + [self._ok(8 + i) for i in range(6)]  # 3x toggle
 
             result = mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
             assert result is True
 
             sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-            # loop-file, mute, img-dur, hwdec, loadfile, mute (post-load), 6x fullscreen
-            assert len(sends) == 12
+            # loop-file, loop-playlist, mute, pause, img-dur, hwdec, loadfile,
+            # mute (post-load), 6x fullscreen
+            assert len(sends) == 14
             # Filter to only fullscreen commands
             fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
             assert len(fullscreen_sends) == 6
@@ -2030,17 +2043,20 @@ class TestLoadfileMpv:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             self._ok(0),                       # loop-file
-            self._ok(1),                       # mute (pre-load)
-            self._ok(2),                       # hwdec
-            self._make_success_response(3),    # loadfile
-            self._ok(4),                       # mute (post-load)
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # hwdec
+            self._make_success_response(5),    # loadfile
+            self._ok(6),                       # mute (post-load)
         ]
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # 5 commands: loop-file, mute, hwdec, loadfile, mute (post-load) — no fullscreen
-        assert len(sends) == 5
+        # 7 commands: loop-file, loop-playlist, mute, pause, hwdec, loadfile,
+        # mute (post-load) — no fullscreen
+        assert len(sends) == 7
         for s in sends:
             assert b'"fullscreen"' not in s
 
@@ -2059,8 +2075,10 @@ class TestLoadfileMpv:
         bad_resp = b'{"event":"end-file","reason":"error"}\n'
         mock_sock.recv.side_effect = [
             self._ok(0),                       # loop-file
-            self._ok(1),                       # mute (pre-load)
-            self._ok(2),                       # hwdec
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # hwdec
             bad_resp,                          # loadfile — only event
             b"",                               # subsequent recv: socket closed
         ]
@@ -2116,10 +2134,12 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # First recv works, mute works, then hwdec times out
+        # First recv works, then through to hwdec which times out
         mock_sock.recv.side_effect = [
             self._ok(0),                       # loop-file ok
-            self._ok(1),                       # mute (pre-load) ok
+            self._ok(1),                       # loop-playlist ok
+            self._ok(2),                       # mute (pre-load) ok
+            self._ok(3),                       # pause=False ok
             real_socket.timeout("timed out"),  # hwdec times out
         ]
 
@@ -2139,10 +2159,12 @@ class TestLoadfileMpv:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             self._ok(0),                       # loop-file
-            self._ok(1),                       # mute (pre-load)
-            self._ok(2),                       # hwdec
-            self._make_success_response(3),    # loadfile
-            self._ok(4),                       # mute (post-load)
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # hwdec
+            self._make_success_response(5),    # loadfile
+            self._ok(6),                       # mute (post-load)
         ]
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
@@ -2189,10 +2211,12 @@ class TestLoadfileMpvIpcHardening:
         # First command's response is preceded by an unrelated event on the same recv
         sock.recv.side_effect = [
             b'{"event":"playback-restart"}\n' + self._ok(0),  # loop-file
-            self._ok(1),                                       # mute (pre-load)
-            self._ok(2),                                       # hwdec
-            self._ok(3),                                       # loadfile
-            self._ok(4),                                       # mute (post-load)
+            self._ok(1),                                       # loop-playlist
+            self._ok(2),                                       # mute (pre-load)
+            self._ok(3),                                       # pause=False
+            self._ok(4),                                       # hwdec
+            self._ok(5),                                       # loadfile
+            self._ok(6),                                       # mute (post-load)
         ]
         assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True) is True
 
@@ -2211,6 +2235,8 @@ class TestLoadfileMpvIpcHardening:
             self._ok(2),
             self._ok(3),
             self._ok(4),
+            self._ok(5),
+            self._ok(6),
         ]
         assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is True
 
@@ -2226,6 +2252,8 @@ class TestLoadfileMpvIpcHardening:
             self._ok(2),
             self._ok(3),
             self._ok(4),
+            self._ok(5),
+            self._ok(6),
         ]
         assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is True
 
@@ -2247,16 +2275,17 @@ class TestLoadfileMpvIpcHardening:
         sock = self._setup(mpv_player, mock_socket_mod)
         sock.recv.side_effect = [self._ok(i) for i in range(20)]
         # Override the loadfile response to carry the right id
-        # (responses use sequential ids 0..4; the loadfile is index 3)
+        # (responses use sequential ids 0..6; the loadfile is index 5)
         # Default _ok already matches sequential ids since helper uses
         # itertools.count(); keep simple list above.
-        # Replace index 3 with the loadfile-shaped success response
         sock.recv.side_effect = [
             self._ok(0),
             self._ok(1),
             self._ok(2),
             self._ok(3),
             self._ok(4),
+            self._ok(5),
+            self._ok(6),
         ]
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
         sends = [c[0][0] for c in sock.sendall.call_args_list]
@@ -2520,10 +2549,12 @@ class TestStartMpvIpcFallback:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":1,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":2,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":2},"request_id":3,"error":"success"}\n',  # loadfile
-            b'{"request_id":4,"error":"success"}\n',  # mute (post-load)
+            b'{"request_id":1,"error":"success"}\n',  # loop-playlist
+            b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":3,"error":"success"}\n',  # pause=False
+            b'{"request_id":4,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":2},"request_id":5,"error":"success"}\n',  # loadfile
+            b'{"request_id":6,"error":"success"}\n',  # mute (post-load)
         ]
 
         with patch.object(mpv_player, "_update_current"), \
@@ -2589,10 +2620,12 @@ class TestMutePolicy:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":1,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":2,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":1},"request_id":3,"error":"success"}\n',  # loadfile
-            b'{"request_id":4,"error":"success"}\n',  # mute (post-load)
+            b'{"request_id":1,"error":"success"}\n',  # loop-playlist
+            b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":3,"error":"success"}\n',  # pause=False
+            b'{"request_id":4,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n',  # loadfile
+            b'{"request_id":6,"error":"success"}\n',  # mute (post-load)
         ]
 
         result = mpv_player._loadfile_mpv(Path("/tmp/video.mp4"), loop=True, muted=False)
@@ -2617,18 +2650,20 @@ class TestMutePolicy:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":1,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":2,"error":"success"}\n',  # image-display-duration
-            b'{"request_id":3,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":1},"request_id":4,"error":"success"}\n',  # loadfile
-            b'{"request_id":5,"error":"success"}\n',  # mute (post-load)
+            b'{"request_id":1,"error":"success"}\n',  # loop-playlist
+            b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":3,"error":"success"}\n',  # pause=False
+            b'{"request_id":4,"error":"success"}\n',  # image-display-duration
+            b'{"request_id":5,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":1},"request_id":6,"error":"success"}\n',  # loadfile
+            b'{"request_id":7,"error":"success"}\n',  # mute (post-load)
         ] + [
-            b'{"request_id":6,"error":"success"}\n',
-            b'{"request_id":7,"error":"success"}\n',
             b'{"request_id":8,"error":"success"}\n',
             b'{"request_id":9,"error":"success"}\n',
             b'{"request_id":10,"error":"success"}\n',
             b'{"request_id":11,"error":"success"}\n',
+            b'{"request_id":12,"error":"success"}\n',
+            b'{"request_id":13,"error":"success"}\n',
         ]  # fullscreen toggles
 
         result = mpv_player._loadfile_mpv(Path("/tmp/splash.png"), loop=True, muted=True)

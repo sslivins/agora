@@ -830,6 +830,17 @@ class AgoraPlayer:
                 logger.warning("mpv IPC: set loop-file failed")
                 return False
 
+            # Always force loop-playlist=no for IPC loads. The first mpv
+            # may have been spawned with --loop=inf for the splash image,
+            # which mpv treats as loop-playlist=inf — that would silently
+            # loop a video instead of emitting end-file{reason=eof}, so
+            # the play_to_end path would never advance.
+            ok, _, recv_buf = self._ipc_call(sock, recv_buf,
+                ["set_property", "loop-playlist", "no"])
+            if not ok:
+                logger.warning("mpv IPC: set loop-playlist failed")
+                return False
+
             # Set keep-open lazily: only when transitioning. Default is
             # "no" (mpv's own default), so we only send a command when
             # arming play_to_end (keep_open=True) or when un-arming after
@@ -849,6 +860,15 @@ class AgoraPlayer:
             if not ok:
                 logger.warning("mpv IPC: set mute (pre-load) failed")
                 return False
+
+            # Always unpause before loadfile. If the previous file was
+            # an image, mpv may be paused at frame 0; without this the
+            # newly-loaded video would never advance and the listener
+            # would never observe end-file{reason=eof}.
+            ok, _, recv_buf = self._ipc_call(sock, recv_buf,
+                ["set_property", "pause", False])
+            if not ok:
+                logger.warning("mpv IPC: set pause=False (pre-load) failed")
 
             if is_image:
                 ok, _, recv_buf = self._ipc_call(sock, recv_buf,
@@ -1006,6 +1026,17 @@ class AgoraPlayer:
             gen = self._mpv_generation
             self._mpv_event_connected.set()
             logger.debug("mpv event listener connected (gen %d)", gen)
+            # Subscribe to eof-reached. With keep-open=yes (which we use to
+            # avoid black flashes between assets), mpv suppresses the
+            # end-file{reason=eof} event and instead pauses on the last
+            # frame. The eof-reached property still flips to True at the
+            # natural end of file, so we observe that as our EOF signal.
+            try:
+                sock.send((json.dumps(
+                    {"command": ["observe_property", 1, "eof-reached"]}
+                ) + "\n").encode())
+            except OSError:
+                logger.warning("mpv event listener: observe_property send failed")
             try:
                 self._mpv_event_read_loop(sock, gen)
             finally:
@@ -1121,6 +1152,26 @@ class AgoraPlayer:
             mpv playlist redirects) and must not double-advance.
         """
         evt_name = event.get("event")
+        # Translate property-change(eof-reached=True) into a synthetic
+        # end-file{reason=eof} for the currently-armed entry. mpv with
+        # keep-open=yes pauses on last frame instead of emitting end-file,
+        # so this is our only natural-EOF signal.
+        if evt_name == "property-change" and event.get("name") == "eof-reached" \
+                and event.get("data") is True:
+            gen = event.get("_generation")
+            armed_entry = None
+            if self._slideshow:
+                pending = self._slideshow.get("pending_play_to_end") or {}
+                armed_entry = pending.get("entry_id")
+            if armed_entry is None and self._scheduled_pending:
+                armed_entry = self._scheduled_pending.get("entry_id")
+            event = {
+                "event": "end-file",
+                "reason": "eof",
+                "playlist_entry_id": armed_entry,
+                "_generation": gen,
+            }
+            evt_name = "end-file"
         if evt_name != "end-file":
             return
         # Slideshow play_to_end has its own pending dict per slide.
