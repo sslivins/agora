@@ -19,13 +19,23 @@ _cached_probe: Optional[DisplayProbe] = None
 def build_probe(board: Board, ports: list[HdmiPort]) -> DisplayProbe:
     """Return the best :class:`DisplayProbe` for *board* and *ports*.
 
-    * Pi 5 / CM 5 → :class:`DrmSysfsDisplayProbe`
-    * Pi Zero 2 W / Pi 3 / Pi 4 → :class:`I2cEdidDisplayProbe`
+    * Pi 4 / Pi 5 / CM 5 → :class:`DrmSysfsDisplayProbe`
+    * Pi Zero 2 W / Pi 3 → :class:`I2cEdidDisplayProbe`
     * Unknown → :class:`NullDisplayProbe`
+
+    Pi 4 was historically routed through :class:`I2cEdidDisplayProbe` on the
+    assumption that VC4 sysfs lied under ``hdmi_force_hotplug=1``.  In
+    practice on modern Raspberry Pi OS (``vc4-kms-v3d``) the DDC i2c
+    buses moved to ``/dev/i2c-20`` and ``/dev/i2c-21`` while the per-port
+    ``i2c_bus`` config still pointed at ``/dev/i2c-1`` / ``/dev/i2c-10``,
+    so the i2c probe always returned ``None``.  The DRM sysfs probe
+    cross-checks ``status`` against an EDID read, which makes it
+    reliable on Pi 4 and immune to GPIO-header i2c bus contention from
+    HATs (e.g. the InnoMaker HiFi DAC).
     """
-    if board is Board.PI_5:
+    if board in (Board.PI_4, Board.PI_5):
         return DrmSysfsDisplayProbe(ports)
-    if board in (Board.PI_4, Board.ZERO_2W):
+    if board is Board.ZERO_2W:
         return I2cEdidDisplayProbe(ports)
     return NullDisplayProbe(ports)
 
