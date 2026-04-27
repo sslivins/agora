@@ -1886,12 +1886,16 @@ class TestMpvProcessLifecycle:
 class TestLoadfileMpv:
     """Tests for _loadfile_mpv IPC switching."""
 
-    def _make_success_response(self):
-        """Build a raw IPC response with events + success."""
+    @staticmethod
+    def _ok(req_id: int) -> bytes:
+        return f'{{"request_id":{req_id},"error":"success"}}\n'.encode()
+
+    def _make_success_response(self, req_id: int = 0):
+        """Build a raw IPC response with events + a success keyed to req_id."""
         lines = [
             '{"event":"video-reconfig"}',
             '{"event":"end-file","reason":"stop","playlist_entry_id":1}',
-            '{"data":{"playlist_entry_id":2},"request_id":0,"error":"success"}',
+            f'{{"data":{{"playlist_entry_id":2}},"request_id":{req_id},"error":"success"}}',
             '{"event":"start-file","playlist_entry_id":2}',
             '{"event":"file-loaded"}',
         ]
@@ -1912,8 +1916,7 @@ class TestLoadfileMpv:
         assert result is False
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_video_loadfile_success(self, mock_time, mock_socket_mod, mpv_player):
+    def test_video_loadfile_success(self, mock_socket_mod, mpv_player):
         """Successful video loadfile via IPC."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -1923,31 +1926,36 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # recv: loop-file, mute (pre-load), hwdec, loadfile, mute (post-load)
+        # recv: loop-file(0), loop-playlist(1), mute(2), pause(3), hwdec(4),
+        # loadfile(5), mute (post-load)(6)
         mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            self._make_success_response(),             # loadfile
-            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
+            self._ok(0),                       # loop-file
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False (pre-load)
+            self._ok(4),                       # hwdec
+            self._make_success_response(5),    # loadfile
+            self._ok(6),                       # mute (post-load)
         ]
 
         result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
         assert result is True
         mock_sock.close.assert_called_once()
 
-        # Should have sent: set loop-file, set hwdec drm-copy, loadfile
+        # Should have sent: set loop-file, loop-playlist, mute, pause,
+        # hwdec drm-copy, loadfile (post-load mute too)
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
         assert b'"loop-file"' in sends[0]
         assert b'"inf"' in sends[0]  # loop=True → inf
-        assert b'"mute"' in sends[1]
-        assert b'"hwdec"' in sends[2]
-        assert b'"drm-copy"' in sends[2]
-        assert b'"loadfile"' in sends[3]
+        assert b'"loop-playlist"' in sends[1]
+        assert b'"mute"' in sends[2]
+        assert b'"pause"' in sends[3]
+        assert b'"hwdec"' in sends[4]
+        assert b'"drm-copy"' in sends[4]
+        assert b'"loadfile"' in sends[5]
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_image_loadfile_sends_image_properties(self, mock_time, mock_socket_mod, mpv_player):
+    def test_image_loadfile_sends_image_properties(self, mock_socket_mod, mpv_player):
         """Image loadfile should set image-display-duration=inf and hwdec=no."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -1957,31 +1965,35 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # recv: loop-file, mute, image-display-duration, hwdec, loadfile, mute (post-load), 6x fullscreen toggles
+        # recv: loop-file(0), loop-playlist(1), mute(2), pause(3),
+        # image-display-duration(4), hwdec(5), loadfile(6), mute post-load(7),
+        # 6x fullscreen toggles(8..13)
         mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # image-display-duration
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            self._make_success_response(),             # loadfile
-            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
-        ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle (off+on)
+            self._ok(0),                       # loop-file
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # image-display-duration
+            self._ok(5),                       # hwdec
+            self._make_success_response(6),    # loadfile
+            self._ok(7),                       # mute (post-load)
+        ] + [self._ok(8 + i) for i in range(6)]  # 3x toggle (off+on)
 
         result = mpv_player._loadfile_mpv(Path("/tmp/splash.png"), loop=True)
         assert result is True
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # loop-file, mute, image-display-duration, hwdec, loadfile, mute (post-load), 6x fullscreen
-        assert b'"image-display-duration"' in sends[2]
-        assert b'"inf"' in sends[2]
-        assert b'"hwdec"' in sends[3]
-        assert b'"no"' in sends[3]
+        # loop-file, loop-playlist, mute, pause, image-display-duration, hwdec,
+        # loadfile, mute (post-load), 6x fullscreen
+        assert b'"image-display-duration"' in sends[4]
+        assert b'"inf"' in sends[4]
+        assert b'"hwdec"' in sends[5]
+        assert b'"no"' in sends[5]
 
     def test_image_loadfile_triggers_fullscreen_toggle(self, mpv_player):
         """Image loadfile should toggle fullscreen 3x for DRM plane refresh."""
         svc = sys.modules["player.service"]
-        with patch.object(svc, "time"), \
-             patch.object(svc, "socket") as mock_socket_mod:
+        with patch.object(svc, "socket") as mock_socket_mod:
             mock_proc = MagicMock()
             mock_proc.poll.return_value = None
             mpv_player._mpv_process = mock_proc
@@ -1991,20 +2003,23 @@ class TestLoadfileMpv:
             mock_socket_mod.AF_UNIX = 1
             mock_socket_mod.SOCK_STREAM = 1
             mock_sock.recv.side_effect = [
-                b'{"request_id":0,"error":"success"}\n',  # loop-file
-                b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-                b'{"request_id":0,"error":"success"}\n',  # image-display-duration
-                b'{"request_id":0,"error":"success"}\n',  # hwdec
-                self._make_success_response(),             # loadfile
-                b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
-            ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # 3x toggle
+                self._ok(0),                       # loop-file
+                self._ok(1),                       # loop-playlist
+                self._ok(2),                       # mute (pre-load)
+                self._ok(3),                       # pause=False
+                self._ok(4),                       # image-display-duration
+                self._ok(5),                       # hwdec
+                self._make_success_response(6),    # loadfile
+                self._ok(7),                       # mute (post-load)
+            ] + [self._ok(8 + i) for i in range(6)]  # 3x toggle
 
             result = mpv_player._loadfile_mpv(Path("/tmp/test.jpg"), loop=False)
             assert result is True
 
             sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-            # loop-file, mute, img-dur, hwdec, loadfile, mute (post-load), 6x fullscreen
-            assert len(sends) == 12
+            # loop-file, loop-playlist, mute, pause, img-dur, hwdec, loadfile,
+            # mute (post-load), 6x fullscreen
+            assert len(sends) == 14
             # Filter to only fullscreen commands
             fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
             assert len(fullscreen_sends) == 6
@@ -2016,8 +2031,7 @@ class TestLoadfileMpv:
                     assert b"true" in s
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_video_loadfile_no_fullscreen_toggle(self, mock_time, mock_socket_mod, mpv_player):
+    def test_video_loadfile_no_fullscreen_toggle(self, mock_socket_mod, mpv_player):
         """Video loadfile should NOT trigger fullscreen toggle."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -2028,24 +2042,26 @@ class TestLoadfileMpv:
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            self._make_success_response(),             # loadfile
-            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
+            self._ok(0),                       # loop-file
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # hwdec
+            self._make_success_response(5),    # loadfile
+            self._ok(6),                       # mute (post-load)
         ]
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # 5 commands: loop-file, mute, hwdec, loadfile, mute (post-load) — no fullscreen
-        assert len(sends) == 5
+        # 7 commands: loop-file, loop-playlist, mute, pause, hwdec, loadfile,
+        # mute (post-load) — no fullscreen
+        assert len(sends) == 7
         for s in sends:
             assert b'"fullscreen"' not in s
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_loadfile_returns_false_on_no_success(self, mock_time, mock_socket_mod, mpv_player):
+    def test_loadfile_returns_false_on_no_success(self, mock_socket_mod, mpv_player):
         """Should return False when IPC response has no success message."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -2055,13 +2071,16 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # Only events, no success response
-        bad_resp = '{"event":"end-file","reason":"error"}\n'.encode()
+        # Only events, no success response → loadfile gets empty recv → fails
+        bad_resp = b'{"event":"end-file","reason":"error"}\n'
         mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            bad_resp,                                   # loadfile — no success
+            self._ok(0),                       # loop-file
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # hwdec
+            bad_resp,                          # loadfile — only event
+            b"",                               # subsequent recv: socket closed
         ]
 
         result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
@@ -2069,8 +2088,7 @@ class TestLoadfileMpv:
         mock_sock.close.assert_called_once()
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_loadfile_returns_false_on_connect_error(self, mock_time, mock_socket_mod, mpv_player):
+    def test_loadfile_returns_false_on_connect_error(self, mock_socket_mod, mpv_player):
         """Should return False when IPC socket connection fails."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -2086,8 +2104,7 @@ class TestLoadfileMpv:
         assert result is False
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_loadfile_returns_false_on_timeout(self, mock_time, mock_socket_mod, mpv_player):
+    def test_loadfile_returns_false_on_timeout(self, mock_socket_mod, mpv_player):
         """Should return False when IPC socket times out."""
         import socket as real_socket
 
@@ -2105,8 +2122,7 @@ class TestLoadfileMpv:
         assert result is False
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_loadfile_returns_false_on_recv_timeout(self, mock_time, mock_socket_mod, mpv_player):
+    def test_loadfile_returns_false_on_recv_timeout(self, mock_socket_mod, mpv_player):
         """Should return False when recv times out after sending loadfile."""
         import socket as real_socket
 
@@ -2118,19 +2134,20 @@ class TestLoadfileMpv:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        # First recv works, mute works, then hwdec times out
+        # First recv works, then through to hwdec which times out
         mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',  # loop-file ok
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load) ok
-            real_socket.timeout("timed out"),           # hwdec times out
+            self._ok(0),                       # loop-file ok
+            self._ok(1),                       # loop-playlist ok
+            self._ok(2),                       # mute (pre-load) ok
+            self._ok(3),                       # pause=False ok
+            real_socket.timeout("timed out"),  # hwdec times out
         ]
 
         result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"))
         assert result is False
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_loadfile_loop_false_sets_no(self, mock_time, mock_socket_mod, mpv_player):
+    def test_loadfile_loop_false_sets_no(self, mock_socket_mod, mpv_player):
         """loop=False should set loop-file to 'no'."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -2141,11 +2158,13 @@ class TestLoadfileMpv:
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
-            b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            self._make_success_response(),             # loadfile
-            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
+            self._ok(0),                       # loop-file
+            self._ok(1),                       # loop-playlist
+            self._ok(2),                       # mute (pre-load)
+            self._ok(3),                       # pause=False
+            self._ok(4),                       # hwdec
+            self._make_success_response(5),    # loadfile
+            self._ok(6),                       # mute (post-load)
         ]
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
@@ -2154,8 +2173,7 @@ class TestLoadfileMpv:
         assert b'"no"' in first_send  # loop-file = "no"
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_socket_cleanup_on_stale_socket(self, mock_time, mock_socket_mod, mpv_player):
+    def test_socket_cleanup_on_stale_socket(self, mock_socket_mod, mpv_player):
         """IPC socket file should be cleaned up by _stop_mpv."""
         import os
         mock_proc = MagicMock()
@@ -2167,6 +2185,419 @@ class TestLoadfileMpv:
             mock_unlink.assert_called_once_with("/tmp/mpv-socket")
 
 
+class TestLoadfileMpvIpcHardening:
+    """Phase 0 tests: command IPC parser correctly demuxes events from
+    responses and matches by request_id."""
+
+    @staticmethod
+    def _ok(req_id: int) -> bytes:
+        return f'{{"request_id":{req_id},"error":"success"}}\n'.encode()
+
+    def _setup(self, mpv_player, mock_socket_mod):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mpv_player._mpv_process = mock_proc
+        mock_sock = MagicMock()
+        mock_socket_mod.socket.return_value = mock_sock
+        mock_socket_mod.AF_UNIX = 1
+        mock_socket_mod.SOCK_STREAM = 1
+        return mock_sock
+
+    @patch("player.service.socket")
+    def test_event_interleaved_before_response_is_skipped(self, mock_socket_mod, mpv_player):
+        """An event arriving before the matching response must be dropped,
+        not mistaken for the response."""
+        sock = self._setup(mpv_player, mock_socket_mod)
+        # First command's response is preceded by an unrelated event on the same recv
+        sock.recv.side_effect = [
+            b'{"event":"playback-restart"}\n' + self._ok(0),  # loop-file
+            self._ok(1),                                       # loop-playlist
+            self._ok(2),                                       # mute (pre-load)
+            self._ok(3),                                       # pause=False
+            self._ok(4),                                       # hwdec
+            self._ok(5),                                       # loadfile
+            self._ok(6),                                       # mute (post-load)
+        ]
+        assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True) is True
+
+    @patch("player.service.socket")
+    def test_response_split_across_recvs(self, mock_socket_mod, mpv_player):
+        """A JSON line that arrives split across two recv() calls is parsed
+        correctly once both halves are accumulated."""
+        sock = self._setup(mpv_player, mock_socket_mod)
+        # Split the loop-file response into two recvs
+        first = b'{"request_id":0,"error":"succ'
+        rest = b'ess"}\n'
+        sock.recv.side_effect = [
+            first,
+            rest,
+            self._ok(1),
+            self._ok(2),
+            self._ok(3),
+            self._ok(4),
+            self._ok(5),
+            self._ok(6),
+        ]
+        assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is True
+
+    @patch("player.service.socket")
+    def test_wrong_request_id_then_right_one(self, mock_socket_mod, mpv_player):
+        """A response carrying a stale request_id must be skipped while the
+        helper waits for the matching one."""
+        sock = self._setup(mpv_player, mock_socket_mod)
+        # Send a stale id 99 first (not what we asked for), then the real response
+        sock.recv.side_effect = [
+            b'{"request_id":99,"error":"success"}\n' + self._ok(0),
+            self._ok(1),
+            self._ok(2),
+            self._ok(3),
+            self._ok(4),
+            self._ok(5),
+            self._ok(6),
+        ]
+        assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is True
+
+    @patch("player.service.socket")
+    def test_timeout_when_no_matching_response(self, mock_socket_mod, mpv_player):
+        """If the matching request_id never arrives, the helper times out
+        cleanly and the loadfile call returns False (no infinite hang)."""
+        import itertools as _it
+        sock = self._setup(mpv_player, mock_socket_mod)
+        # Endless event stream — none of these match the request_id
+        sock.recv.side_effect = _it.repeat(b'{"event":"playback-restart"}\n')
+        # Tighten the per-command timeout so the test runs fast
+        mpv_player._IPC_CMD_TIMEOUT_S = 0.05
+        assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is False
+
+    @patch("player.service.socket")
+    def test_request_id_is_present_in_every_command(self, mock_socket_mod, mpv_player):
+        """Every JSON command sent must include a request_id field."""
+        sock = self._setup(mpv_player, mock_socket_mod)
+        sock.recv.side_effect = [self._ok(i) for i in range(20)]
+        # Override the loadfile response to carry the right id
+        # (responses use sequential ids 0..6; the loadfile is index 5)
+        # Default _ok already matches sequential ids since helper uses
+        # itertools.count(); keep simple list above.
+        sock.recv.side_effect = [
+            self._ok(0),
+            self._ok(1),
+            self._ok(2),
+            self._ok(3),
+            self._ok(4),
+            self._ok(5),
+            self._ok(6),
+        ]
+        mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
+        sends = [c[0][0] for c in sock.sendall.call_args_list]
+        for s in sends:
+            assert b'"request_id"' in s, f"missing request_id in {s!r}"
+
+
+    @patch("player.service.socket")
+    def test_pause_false_failure_is_fatal(self, mock_socket_mod, mpv_player):
+        """Phase 6 regression: if mpv refuses the pre-load pause=False
+        IPC command, _loadfile_mpv must return False so callers fall
+        back to a fresh respawn. Pressing on with a possibly-paused mpv
+        defeats the very fix this command exists for (image→video
+        transitions where mpv is paused at frame 0 of the previous
+        image — the next loadfile would never advance, and the listener
+        would never observe end-file{reason=eof})."""
+        sock = self._setup(mpv_player, mock_socket_mod)
+        # loop-file ok, loop-playlist ok, mute ok, pause=False ERROR.
+        sock.recv.side_effect = [
+            self._ok(0),
+            self._ok(1),
+            self._ok(2),
+            b'{"request_id":3,"error":"property unavailable"}\n',
+            # No further responses should be requested.
+        ]
+        assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is False
+
+
+# ── mpv IPC event listener (Phase 1) ──
+
+
+class TestMpvEventListener:
+    """Tests for the persistent mpv IPC event listener thread."""
+
+    @staticmethod
+    def _prep(mpv_player):
+        """Initialise listener-related attributes on a bypass-init fixture."""
+        import queue as _queue
+        import threading as _threading
+
+        mpv_player._mpv_event_thread = None
+        mpv_player._mpv_event_stop = _threading.Event()
+        mpv_player._mpv_event_queue = _queue.Queue()
+        mpv_player._mpv_event_connected = _threading.Event()
+        mpv_player._mpv_generation = 0
+        mpv_player._mpv_drain_lock = _threading.Lock()
+        mpv_player._mpv_drain_pending = False
+
+    def test_schedule_drain_is_idempotent_while_pending(self, mpv_player):
+        """_schedule_drain should call GLib.idle_add at most once until the
+        drain callback runs."""
+        self._prep(mpv_player)
+        with patch("player.service.GLib") as glib:
+            mpv_player._schedule_drain()
+            mpv_player._schedule_drain()
+            mpv_player._schedule_drain()
+        assert glib.idle_add.call_count == 1
+        assert mpv_player._mpv_drain_pending is True
+
+    def test_drain_dispatches_all_queued_events_in_order(self, mpv_player):
+        """_drain_mpv_events should pop every queued event and call
+        _on_mpv_event in FIFO order, then return False (one-shot)."""
+        self._prep(mpv_player)
+        seen = []
+        mpv_player._on_mpv_event = lambda evt: seen.append(evt["event"])
+        mpv_player._mpv_drain_pending = True
+        for name in ("start-file", "playback-restart", "end-file"):
+            mpv_player._mpv_event_queue.put({"event": name})
+        result = mpv_player._drain_mpv_events()
+        assert result is False
+        assert seen == ["start-file", "playback-restart", "end-file"]
+        assert mpv_player._mpv_drain_pending is False
+
+    def test_drain_re_enables_scheduling_after_running(self, mpv_player):
+        """After drain runs, the next _schedule_drain should call idle_add
+        again."""
+        self._prep(mpv_player)
+        mpv_player._mpv_drain_pending = True
+        mpv_player._drain_mpv_events()
+        with patch("player.service.GLib") as glib:
+            mpv_player._schedule_drain()
+        assert glib.idle_add.call_count == 1
+
+    def test_drain_swallows_handler_exceptions(self, mpv_player):
+        """A buggy handler must not break the drain loop or leave
+        _mpv_drain_pending stuck."""
+        self._prep(mpv_player)
+        calls = []
+
+        def boom(evt):
+            calls.append(evt["event"])
+            if evt["event"] == "start-file":
+                raise RuntimeError("boom")
+
+        mpv_player._on_mpv_event = boom
+        mpv_player._mpv_drain_pending = True
+        mpv_player._mpv_event_queue.put({"event": "start-file"})
+        mpv_player._mpv_event_queue.put({"event": "end-file"})
+        mpv_player._drain_mpv_events()
+        assert calls == ["start-file", "end-file"]
+        assert mpv_player._mpv_drain_pending is False
+
+    def test_start_listener_is_idempotent(self, mpv_player):
+        """Calling _start_mpv_event_listener twice creates only one thread."""
+        self._prep(mpv_player)
+        with patch("player.service.threading.Thread") as ThreadCls:
+            ThreadCls.return_value.is_alive.return_value = True
+            mpv_player._start_mpv_event_listener()
+            mpv_player._start_mpv_event_listener()
+        assert ThreadCls.call_count == 1
+
+    def test_stop_listener_sets_stop_and_joins(self, mpv_player):
+        """_stop_mpv_event_listener must set stop, clear connected, and
+        join the thread."""
+        self._prep(mpv_player)
+        fake_thread = MagicMock()
+        fake_thread.is_alive.return_value = True
+        mpv_player._mpv_event_thread = fake_thread
+        mpv_player._mpv_event_connected.set()
+        mpv_player._stop_mpv_event_listener()
+        assert mpv_player._mpv_event_stop.is_set()
+        assert not mpv_player._mpv_event_connected.is_set()
+        fake_thread.join.assert_called_once_with(timeout=2.0)
+        assert mpv_player._mpv_event_thread is None
+
+    def test_stop_listener_no_thread_is_safe(self, mpv_player):
+        """Stopping with no thread set is a no-op."""
+        self._prep(mpv_player)
+        mpv_player._stop_mpv_event_listener()
+        assert mpv_player._mpv_event_stop.is_set()
+
+    def test_teardown_does_not_stop_listener(self, mpv_player):
+        """Phase 6 regression: _teardown() must NOT kill the persistent
+        listener. _teardown runs from many normal-operation paths
+        (mode switches, fallback, health-retry); stopping the listener
+        there would silently strand all subsequent slideshow play_to_end
+        and scheduled loop_count arms for the rest of the service
+        lifetime — they would fall back to the legacy duration/respawn
+        paths and we would lose the seamless behavior of the refactor."""
+        self._prep(mpv_player)
+        fake_thread = MagicMock()
+        fake_thread.is_alive.return_value = True
+        mpv_player._mpv_event_thread = fake_thread
+        mpv_player._mpv_event_connected.set()
+        mpv_player._mpv_process = None
+        mpv_player.pipeline = None
+
+        with patch("player.service.Gst") as mock_gst:
+            mock_gst.State.NULL = "NULL"
+            mock_gst.CLOCK_TIME_NONE = 0
+            mpv_player._teardown()
+
+        # Listener must still be alive and unstopped.
+        assert mpv_player._mpv_event_thread is fake_thread
+        assert mpv_player._mpv_event_connected.is_set()
+        assert not mpv_player._mpv_event_stop.is_set()
+        fake_thread.join.assert_not_called()
+
+    def test_event_loop_self_heals_on_unexpected_exception(self, mpv_player):
+        """The outer listener loop must catch and recover from unexpected
+        exceptions — a single bad event must never permanently strand
+        finite loop_count or slideshow play_to_end consumers."""
+        self._prep(mpv_player)
+        mpv_player._MPV_EVENT_RECONNECT_DELAY_S = 0.001
+        mpv_player._mpv_event_connected.set()  # pretend prior connect
+        attempts = {"n": 0}
+
+        def fake_connect():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("simulated transient failure")
+            # Stop the loop on the second pass so the test terminates.
+            mpv_player._mpv_event_stop.set()
+            return None
+
+        with patch.object(mpv_player, "_mpv_event_connect", side_effect=fake_connect):
+            mpv_player._mpv_event_loop()
+
+        # Made it past the exception and reached a clean stop.
+        assert attempts["n"] >= 2
+        # Connected flag must be cleared after the exception so consumers
+        # see the listener as not-ready and fall back to legacy paths.
+        assert not mpv_player._mpv_event_connected.is_set()
+
+    def test_is_listener_ready_reflects_connected_flag(self, mpv_player):
+        self._prep(mpv_player)
+        assert mpv_player.is_mpv_event_listener_ready() is False
+        mpv_player._mpv_event_connected.set()
+        assert mpv_player.is_mpv_event_listener_ready() is True
+
+    @patch("player.service.GLib")
+    def test_read_loop_parses_lines_and_stamps_generation(self, _glib, mpv_player):
+        """The reader should split incoming bytes on newline, JSON-decode,
+        push events (and only events) onto the queue, and stamp each with
+        the generation it was given."""
+        self._prep(mpv_player)
+        events = [
+            b'{"event":"start-file","playlist_entry_id":7}\n',
+            b'{"event":"end-file","reason":"eof","playlist_entry_id":7}\n',
+            b'{"request_id":1,"error":"success"}\n',  # response — must be skipped
+            b'{"event":"shutdown"}\n',
+            b'',  # connection close
+        ]
+        sock = MagicMock()
+        sock.recv.side_effect = events
+        mpv_player._mpv_event_read_loop(sock, generation=42)
+        drained = []
+        while True:
+            try:
+                drained.append(mpv_player._mpv_event_queue.get_nowait())
+            except Exception:
+                break
+        assert [e["event"] for e in drained] == ["start-file", "end-file", "shutdown"]
+        assert all(e["_generation"] == 42 for e in drained)
+        assert all("request_id" not in e for e in drained)
+
+    @patch("player.service.GLib")
+    def test_read_loop_handles_split_lines(self, _glib, mpv_player):
+        """A JSON object split across two recv() calls should still parse."""
+        self._prep(mpv_player)
+        sock = MagicMock()
+        sock.recv.side_effect = [
+            b'{"event":"start-',
+            b'file","playlist_entry_id":3}\n',
+            b'',
+        ]
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        evt = mpv_player._mpv_event_queue.get_nowait()
+        assert evt["event"] == "start-file"
+        assert evt["playlist_entry_id"] == 3
+
+    @patch("player.service.GLib")
+    def test_read_loop_skips_garbage_lines(self, _glib, mpv_player):
+        """Lines that aren't valid JSON must not crash the loop."""
+        self._prep(mpv_player)
+        sock = MagicMock()
+        sock.recv.side_effect = [
+            b'not json\n',
+            b'{"event":"end-file","reason":"eof"}\n',
+            b'',
+        ]
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        evt = mpv_player._mpv_event_queue.get_nowait()
+        assert evt["event"] == "end-file"
+
+    @patch("player.service.GLib")
+    def test_read_loop_continues_after_socket_timeout(self, _glib, mpv_player):
+        """A socket.timeout (used to keep checking the stop flag) must not
+        terminate the reader."""
+        self._prep(mpv_player)
+        import socket as _socket
+        sock = MagicMock()
+        sock.recv.side_effect = [
+            _socket.timeout("read timeout"),
+            b'{"event":"end-file","reason":"eof"}\n',
+            b'',
+        ]
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        evt = mpv_player._mpv_event_queue.get_nowait()
+        assert evt["event"] == "end-file"
+
+    @patch("player.service.GLib")
+    def test_read_loop_exits_when_stop_set(self, _glib, mpv_player):
+        """Setting _mpv_event_stop should make the reader return on the
+        next timeout."""
+        self._prep(mpv_player)
+        import socket as _socket
+        mpv_player._mpv_event_stop.set()
+        sock = MagicMock()
+        # First call would time out, but stop is already set so the loop
+        # should exit before recv is called.
+        sock.recv.side_effect = _socket.timeout("read timeout")
+        mpv_player._mpv_event_read_loop(sock, generation=1)
+        # Either zero recvs (loop saw stop first) or one followed by exit.
+        assert mpv_player._mpv_event_queue.empty()
+
+    def test_event_loop_retries_when_socket_unavailable(self, mpv_player):
+        """If MPV_IPC_SOCKET doesn't exist yet, the listener should sleep
+        and retry rather than spin or crash."""
+        self._prep(mpv_player)
+        attempts = {"n": 0}
+
+        def fake_connect():
+            attempts["n"] += 1
+            if attempts["n"] >= 3:
+                # Trip the stop event so the loop exits cleanly
+                mpv_player._mpv_event_stop.set()
+            return None  # simulate "not available yet"
+
+        with patch.object(mpv_player, "_mpv_event_connect", side_effect=fake_connect):
+            mpv_player._mpv_event_loop()
+        assert attempts["n"] >= 2
+
+    def test_event_loop_sets_connected_flag_then_clears_on_disconnect(self, mpv_player):
+        """While a connection is live, _mpv_event_connected should be set;
+        after the read loop returns, it should be cleared."""
+        self._prep(mpv_player)
+        states = []
+
+        def fake_read(sock, generation):
+            states.append(("during", mpv_player._mpv_event_connected.is_set()))
+            mpv_player._mpv_event_stop.set()
+
+        fake_sock = MagicMock()
+        with patch.object(mpv_player, "_mpv_event_connect", return_value=fake_sock), \
+             patch.object(mpv_player, "_mpv_event_read_loop", side_effect=fake_read):
+            mpv_player._mpv_event_loop()
+        states.append(("after", mpv_player._mpv_event_connected.is_set()))
+        assert states == [("during", True), ("after", False)]
+        fake_sock.close.assert_called()
+
+
 # ── mpv IPC start_mpv integration ──
 
 
@@ -2174,8 +2605,7 @@ class TestStartMpvIpcFallback:
     """Tests for _start_mpv trying IPC first, falling back to restart."""
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_start_mpv_uses_ipc_when_available(self, mock_time, mock_socket_mod, mpv_player, tmp_path):
+    def test_start_mpv_uses_ipc_when_available(self, mock_socket_mod, mpv_player, tmp_path):
         """_start_mpv should use IPC loadfile when mpv is already running."""
         video = tmp_path / "test.mp4"
         video.write_bytes(b"\x00" * 100)
@@ -2191,15 +2621,14 @@ class TestStartMpvIpcFallback:
         mock_socket_mod.socket.return_value = mock_sock
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
-        lines = [
-            '{"data":{"playlist_entry_id":2},"request_id":0,"error":"success"}',
-        ]
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            ("\n".join(lines) + "\n").encode(),       # loadfile
-            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
+            b'{"request_id":1,"error":"success"}\n',  # loop-playlist
+            b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":3,"error":"success"}\n',  # pause=False
+            b'{"request_id":4,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":2},"request_id":5,"error":"success"}\n',  # loadfile
+            b'{"request_id":6,"error":"success"}\n',  # mute (post-load)
         ]
 
         with patch.object(mpv_player, "_update_current"), \
@@ -2253,8 +2682,7 @@ class TestMutePolicy:
     """
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_loadfile_for_scheduled_asset_sets_mute_false(self, mock_time, mock_socket_mod, mpv_player):
+    def test_loadfile_for_scheduled_asset_sets_mute_false(self, mock_socket_mod, mpv_player):
         """_loadfile_mpv(muted=False) must send set_property mute false to running mpv."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -2266,10 +2694,12 @@ class TestMutePolicy:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":1},"request_id":0,"error":"success"}\n',  # loadfile
-            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
+            b'{"request_id":1,"error":"success"}\n',  # loop-playlist
+            b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":3,"error":"success"}\n',  # pause=False
+            b'{"request_id":4,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n',  # loadfile
+            b'{"request_id":6,"error":"success"}\n',  # mute (post-load)
         ]
 
         result = mpv_player._loadfile_mpv(Path("/tmp/video.mp4"), loop=True, muted=False)
@@ -2282,8 +2712,7 @@ class TestMutePolicy:
             assert b"false" in s or b"False" in s, f"expected mute=false, got {s!r}"
 
     @patch("player.service.socket")
-    @patch("player.service.time")
-    def test_loadfile_for_splash_sets_mute_true(self, mock_time, mock_socket_mod, mpv_player):
+    def test_loadfile_for_splash_sets_mute_true(self, mock_socket_mod, mpv_player):
         """_loadfile_mpv(muted=True) must send set_property mute true to running mpv."""
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -2295,12 +2724,21 @@ class TestMutePolicy:
         mock_socket_mod.SOCK_STREAM = 1
         mock_sock.recv.side_effect = [
             b'{"request_id":0,"error":"success"}\n',  # loop-file
-            b'{"request_id":0,"error":"success"}\n',  # mute (pre-load)
-            b'{"request_id":0,"error":"success"}\n',  # image-display-duration
-            b'{"request_id":0,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":1},"request_id":0,"error":"success"}\n',  # loadfile
-            b'{"request_id":0,"error":"success"}\n',  # mute (post-load)
-        ] + [b'{"request_id":0,"error":"success"}\n'] * 6  # fullscreen toggles
+            b'{"request_id":1,"error":"success"}\n',  # loop-playlist
+            b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
+            b'{"request_id":3,"error":"success"}\n',  # pause=False
+            b'{"request_id":4,"error":"success"}\n',  # image-display-duration
+            b'{"request_id":5,"error":"success"}\n',  # hwdec
+            b'{"data":{"playlist_entry_id":1},"request_id":6,"error":"success"}\n',  # loadfile
+            b'{"request_id":7,"error":"success"}\n',  # mute (post-load)
+        ] + [
+            b'{"request_id":8,"error":"success"}\n',
+            b'{"request_id":9,"error":"success"}\n',
+            b'{"request_id":10,"error":"success"}\n',
+            b'{"request_id":11,"error":"success"}\n',
+            b'{"request_id":12,"error":"success"}\n',
+            b'{"request_id":13,"error":"success"}\n',
+        ]  # fullscreen toggles
 
         result = mpv_player._loadfile_mpv(Path("/tmp/splash.png"), loop=True, muted=True)
         assert result is True
