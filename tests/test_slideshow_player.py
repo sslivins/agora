@@ -507,3 +507,72 @@ class TestScheduledLoopCountIpcDriven:
         player._find_splash = MagicMock(return_value=None)
         svc.AgoraPlayer._show_splash(player)
         assert player._scheduled_pending is None
+
+
+
+class TestMonitorMpvListenerSafetyNet:
+    """Phase 4: _monitor_mpv defensively clears stale listener-armed
+    pending records when mpv exits, so re-entrant transitions don't fire."""
+
+    def test_rc0_with_scheduled_pending_clears_and_logs(self, mpv_player, caplog):
+        player, svc = mpv_player
+        # Stub a finished mpv process.
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.stderr.read.return_value = b""
+        player._mpv_process = proc
+        player._scheduled_pending = {
+            "entry_id": 1, "generation": 1, "asset_name": "v.mp4",
+            "target_count": 5, "completed_count": 2,
+        }
+        player.current_desired = svc.DesiredState(
+            mode=svc.PlaybackMode.PLAY, asset="v.mp4",
+            loop=False, loop_count=None,
+        )
+        with caplog.at_level("WARNING"):
+            with patch.object(svc, "GLib"):
+                player._monitor_mpv("v.mp4")
+        assert player._scheduled_pending is None
+        assert any("listener missed events" in r.message for r in caplog.records)
+
+    def test_rc0_with_slideshow_pending_clears_arm(self, mpv_player):
+        player, svc = mpv_player
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.stderr.read.return_value = b""
+        player._mpv_process = proc
+        player._slideshow = {
+            "name": "S", "slides": [], "index": 1, "loop_count": None,
+            "loops_completed": 0, "epoch": 1,
+            "pending_play_to_end": {
+                "entry_id": 1, "generation": 1,
+                "slide_index": 1, "slide_name": "x.mp4",
+                "watchdog_id": 99,
+            },
+        }
+        player.current_desired = svc.DesiredState(
+            mode=svc.PlaybackMode.PLAY, asset="S",
+        )
+        player._play_next_slide = MagicMock()
+        with patch.object(svc, "GLib") as glib:
+            player._monitor_mpv("x.mp4")
+            glib.source_remove.assert_any_call(99)
+        assert player._slideshow["pending_play_to_end"] is None
+        player._play_next_slide.assert_called_once()
+
+    def test_error_rc_clears_stale_pendings(self, mpv_player):
+        player, svc = mpv_player
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        proc.stderr.read.return_value = b"some error"
+        player._mpv_process = proc
+        player._scheduled_pending = {
+            "entry_id": 1, "generation": 1, "asset_name": "v.mp4",
+            "target_count": 3, "completed_count": 0,
+        }
+        player.current_desired = svc.DesiredState(
+            mode=svc.PlaybackMode.PLAY, asset="v.mp4",
+        )
+        with patch.object(svc, "GLib"):
+            player._monitor_mpv("v.mp4")
+        assert player._scheduled_pending is None

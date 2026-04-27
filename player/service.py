@@ -1401,7 +1401,33 @@ class AgoraPlayer:
         self._mpv_process = None
 
         if retcode == 0:
-            # Normal exit — EOS
+            # Normal exit — EOS.
+            # If the IPC event listener was armed for this generation, it
+            # means it missed the corresponding end-file event (or mpv exited
+            # before delivering it). Log loudly and clear the stale arm so
+            # we don't fire splash twice.
+            if self._scheduled_pending is not None:
+                logger.warning(
+                    "mpv exited (rc=0) while _scheduled_pending was armed "
+                    "for %s (%d/%d loops) — listener missed events; "
+                    "monitor will handle splash transition",
+                    self._scheduled_pending.get("asset_name"),
+                    self._scheduled_pending.get("completed_count"),
+                    self._scheduled_pending.get("target_count"),
+                )
+                self._scheduled_pending = None
+            if self._slideshow is not None:
+                pending_pte = self._slideshow.get("pending_play_to_end")
+                if pending_pte is not None:
+                    logger.warning(
+                        "mpv exited (rc=0) while slideshow pending_play_to_end "
+                        "was armed for slide %d (%s) — listener missed events; "
+                        "monitor will advance",
+                        pending_pte.get("slide_index"),
+                        pending_pte.get("slide_name"),
+                    )
+                    self._cancel_play_to_end_watchdog()
+                    self._slideshow["pending_play_to_end"] = None
             logger.info("mpv finished playing %s", asset_name)
             # Slideshow: advance to next slide regardless of slide loop flag.
             if self._slideshow:
@@ -1438,6 +1464,13 @@ class AgoraPlayer:
                 logger.info("Playback complete (no loop), switching to splash")
                 self._show_splash()
         else:
+            # Error exit — also clear any stale listener-armed pendings so
+            # they can't drive a re-entrant transition.
+            if self._scheduled_pending is not None:
+                self._scheduled_pending = None
+            if self._slideshow is not None and self._slideshow.get("pending_play_to_end"):
+                self._cancel_play_to_end_watchdog()
+                self._slideshow["pending_play_to_end"] = None
             # Error exit
             error_msg = f"mpv exited with code {retcode}"
             if stderr_output:
