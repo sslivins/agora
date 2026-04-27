@@ -27,10 +27,10 @@ Depends: python3 (>= 3.11),
  chromium
 Recommends: gstreamer1.0-v4l2
 Filename: pool/agora_1.11.26_arm64.deb
-Size: 1949122
-MD5sum: 45ab62aae79f4dd8de93de747bfb9b30
-SHA1: 45d1e5c33ff31d519d556971caedd3bd7ef9c699
-SHA256: b8fe7c1724491992b5ec868c6c7e76dfc1a52bd750a6805a6483cc314283e928
+Size: 1947220
+MD5sum: bf93902b1e8122ef49df693d82219f92
+SHA1: 96090a979f64d6aae939e529dd9ff7f477217fc1
+SHA256: 919c907080e5cc75c408983b0f1dcb69b5d43d30ed83428707f6e3bbd62505b2
 Section: multimedia
 Priority: optional
 Description: Agora media playback system for Raspberry Pi
