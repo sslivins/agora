@@ -1257,18 +1257,34 @@ class CMSClient:
                     self._last_eval_state = ("waiting", default_asset, default_checksum)
                 return
 
-            state_key = ("default", default_asset, default_checksum)
+            # Detect slideshow defaults from local asset registry — the sync
+            # payload doesn't carry a default_asset_type, but the asset
+            # manager records the storage subdir, so a slideshow manifest
+            # registered as `slideshows/<name>/...` is recognizable here.
+            default_asset_type = "slideshow" if self._is_slideshow_asset(default_asset) else None
+
+            state_key = ("default", default_asset, default_checksum, default_asset_type)
             if self._last_eval_state == state_key:
                 return
 
             # Leaving a scheduled playback → default asset
             self._end_current_playback()
 
-            desired = DesiredState(mode=PlaybackMode.PLAY, asset=default_asset, loop=True, expected_checksum=default_checksum)
+            desired = DesiredState(
+                mode=PlaybackMode.PLAY,
+                asset=default_asset,
+                asset_type=default_asset_type,
+                loop=True,
+                expected_checksum=default_checksum,
+            )
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(default_asset)
             self._last_eval_state = state_key
-            logger.info("Schedule: playing default asset %s", default_asset)
+            logger.info(
+                "Schedule: playing default asset %s%s",
+                default_asset,
+                f" (asset_type={default_asset_type})" if default_asset_type else "",
+            )
         else:
             state_key = ("splash", None)
             if self._last_eval_state == state_key:

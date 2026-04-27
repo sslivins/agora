@@ -208,3 +208,80 @@ class TestPlayWithoutAsset:
         sync_data = _make_schedule_data([_active_entry("video.mp4", "abc123")])
         cms_client._evaluate_schedule(sync_data)
         # Should not raise
+
+
+class TestSlideshowDefaultAsset:
+    """Default asset that is a slideshow must be played as a slideshow.
+
+    The sync payload doesn't carry default_asset_type, but the asset
+    manager records the storage subdir locally.  _evaluate_schedule
+    must consult that to set asset_type='slideshow' on DesiredState,
+    otherwise the player falls through to single-asset playback and
+    the slideshow never renders.
+    """
+
+    def test_slideshow_default_sets_asset_type(self, cms_client):
+        from shared.models import DesiredState
+        from shared.state import read_state
+
+        cms_client.asset_manager.has_asset.return_value = True
+        # Asset manager registers the default as a slideshow manifest
+        cms_client.asset_manager.get.return_value = {"path": "slideshows/myshow/myshow.json"}
+
+        sync_data = _make_schedule_data(
+            schedules=[],
+            default_asset="myshow",
+            default_asset_checksum="abc",
+        )
+        cms_client._evaluate_schedule(sync_data)
+
+        desired = read_state(cms_client.settings.desired_state_path, DesiredState)
+        assert desired.mode == "play"
+        assert desired.asset == "myshow"
+        assert desired.asset_type == "slideshow"
+
+    def test_non_slideshow_default_has_no_asset_type(self, cms_client):
+        """Image/video defaults must not get a spurious asset_type."""
+        from shared.models import DesiredState
+        from shared.state import read_state
+
+        cms_client.asset_manager.has_asset.return_value = True
+        # Registered as an image, not a slideshow
+        cms_client.asset_manager.get.return_value = {"path": "images/photo.jpg"}
+
+        sync_data = _make_schedule_data(
+            schedules=[],
+            default_asset="photo.jpg",
+            default_asset_checksum="def",
+        )
+        cms_client._evaluate_schedule(sync_data)
+
+        desired = read_state(cms_client.settings.desired_state_path, DesiredState)
+        assert desired.mode == "play"
+        assert desired.asset == "photo.jpg"
+        # Either unset (None) or the empty string — must NOT be 'slideshow'
+        assert desired.asset_type != "slideshow"
+
+    def test_slideshow_state_key_includes_asset_type(self, cms_client):
+        """Switching default from image→slideshow at the same name should rewrite state."""
+        from shared.models import DesiredState
+        from shared.state import read_state
+
+        cms_client.asset_manager.has_asset.return_value = True
+
+        # First eval: registered as image
+        cms_client.asset_manager.get.return_value = {"path": "images/myasset"}
+        sync_data = _make_schedule_data(
+            schedules=[],
+            default_asset="myasset",
+            default_asset_checksum="abc",
+        )
+        cms_client._evaluate_schedule(sync_data)
+        first = read_state(cms_client.settings.desired_state_path, DesiredState)
+        assert first.asset_type != "slideshow"
+
+        # Same asset name + checksum, but now registered as slideshow
+        cms_client.asset_manager.get.return_value = {"path": "slideshows/myasset/myasset.json"}
+        cms_client._evaluate_schedule(sync_data)
+        second = read_state(cms_client.settings.desired_state_path, DesiredState)
+        assert second.asset_type == "slideshow"

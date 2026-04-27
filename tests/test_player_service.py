@@ -1927,23 +1927,23 @@ class TestLoadfileMpv:
         mock_socket_mod.AF_UNIX = 1
         mock_socket_mod.SOCK_STREAM = 1
         # recv: loop-file(0), loop-playlist(1), mute(2), pause(3), hwdec(4),
-        # loadfile(5), mute (post-load)(6)
+        # loadfile(5), mute (post-load)(6), 6x fullscreen toggles(7..12)
         mock_sock.recv.side_effect = [
             self._ok(0),                       # loop-file
             self._ok(1),                       # loop-playlist
             self._ok(2),                       # mute (pre-load)
             self._ok(3),                       # pause=False (pre-load)
             self._ok(4),                       # hwdec
-            self._make_success_response(5),    # loadfile
+            self._make_success_response(5),    # loadfile (carries start-file/file-loaded events)
             self._ok(6),                       # mute (post-load)
-        ]
+        ] + [self._ok(7 + i) for i in range(6)]  # 3x toggle (off+on)
 
         result = mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
         assert result is True
         mock_sock.close.assert_called_once()
 
         # Should have sent: set loop-file, loop-playlist, mute, pause,
-        # hwdec drm-copy, loadfile (post-load mute too)
+        # hwdec drm-copy, loadfile, mute (post-load), 6x fullscreen
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
         assert b'"loop-file"' in sends[0]
         assert b'"inf"' in sends[0]  # loop=True → inf
@@ -2031,8 +2031,14 @@ class TestLoadfileMpv:
                     assert b"true" in s
 
     @patch("player.service.socket")
-    def test_video_loadfile_no_fullscreen_toggle(self, mock_socket_mod, mpv_player):
-        """Video loadfile should NOT trigger fullscreen toggle."""
+    def test_video_loadfile_triggers_fullscreen_toggle(self, mock_socket_mod, mpv_player):
+        """Video loadfile must also trigger the 3× fullscreen toggle.
+
+        Originally images-only — extended to videos because mpv with
+        ``vo=drm`` does not always commit the first video frame to the
+        connector primary plane after an image→video swap until the
+        toggle nudges it (see fix/splash-config-watch).
+        """
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
         mpv_player._mpv_process = mock_proc
@@ -2049,16 +2055,21 @@ class TestLoadfileMpv:
             self._ok(4),                       # hwdec
             self._make_success_response(5),    # loadfile
             self._ok(6),                       # mute (post-load)
-        ]
+        ] + [self._ok(7 + i) for i in range(6)]  # 3x toggle
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True)
 
         sends = [c[0][0] for c in mock_sock.sendall.call_args_list]
-        # 7 commands: loop-file, loop-playlist, mute, pause, hwdec, loadfile,
-        # mute (post-load) — no fullscreen
-        assert len(sends) == 7
-        for s in sends:
-            assert b'"fullscreen"' not in s
+        # 13 commands: loop-file, loop-playlist, mute, pause, hwdec,
+        # loadfile, mute (post-load), 6x fullscreen
+        assert len(sends) == 13
+        fullscreen_sends = [s for s in sends if b'"fullscreen"' in s]
+        assert len(fullscreen_sends) == 6
+        for i, s in enumerate(fullscreen_sends):
+            if i % 2 == 0:
+                assert b"false" in s
+            else:
+                assert b"true" in s
 
     @patch("player.service.socket")
     def test_loadfile_returns_false_on_no_success(self, mock_socket_mod, mpv_player):
@@ -2165,7 +2176,7 @@ class TestLoadfileMpv:
             self._ok(4),                       # hwdec
             self._make_success_response(5),    # loadfile
             self._ok(6),                       # mute (post-load)
-        ]
+        ] + [self._ok(7 + i) for i in range(6)]  # 3x toggle
 
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
 
@@ -2215,9 +2226,12 @@ class TestLoadfileMpvIpcHardening:
             self._ok(2),                                       # mute (pre-load)
             self._ok(3),                                       # pause=False
             self._ok(4),                                       # hwdec
-            self._ok(5),                                       # loadfile
+            # loadfile response + start-file/file-loaded events for entry_id=1
+            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n'
+            b'{"event":"start-file","playlist_entry_id":1}\n'
+            b'{"event":"file-loaded","playlist_entry_id":1}\n',
             self._ok(6),                                       # mute (post-load)
-        ]
+        ] + [self._ok(7 + i) for i in range(6)]                # 3x toggle
         assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=True) is True
 
     @patch("player.service.socket")
@@ -2235,9 +2249,11 @@ class TestLoadfileMpvIpcHardening:
             self._ok(2),
             self._ok(3),
             self._ok(4),
-            self._ok(5),
+            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n'
+            b'{"event":"start-file","playlist_entry_id":1}\n'
+            b'{"event":"file-loaded","playlist_entry_id":1}\n',
             self._ok(6),
-        ]
+        ] + [self._ok(7 + i) for i in range(6)]
         assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is True
 
     @patch("player.service.socket")
@@ -2252,9 +2268,11 @@ class TestLoadfileMpvIpcHardening:
             self._ok(2),
             self._ok(3),
             self._ok(4),
-            self._ok(5),
+            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n'
+            b'{"event":"start-file","playlist_entry_id":1}\n'
+            b'{"event":"file-loaded","playlist_entry_id":1}\n',
             self._ok(6),
-        ]
+        ] + [self._ok(7 + i) for i in range(6)]
         assert mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False) is True
 
     @patch("player.service.socket")
@@ -2284,9 +2302,11 @@ class TestLoadfileMpvIpcHardening:
             self._ok(2),
             self._ok(3),
             self._ok(4),
-            self._ok(5),
+            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n'
+            b'{"event":"start-file","playlist_entry_id":1}\n'
+            b'{"event":"file-loaded","playlist_entry_id":1}\n',
             self._ok(6),
-        ]
+        ] + [self._ok(7 + i) for i in range(6)]
         mpv_player._loadfile_mpv(Path("/tmp/test.mp4"), loop=False)
         sends = [c[0][0] for c in sock.sendall.call_args_list]
         for s in sends:
@@ -2627,9 +2647,15 @@ class TestStartMpvIpcFallback:
             b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
             b'{"request_id":3,"error":"success"}\n',  # pause=False
             b'{"request_id":4,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":2},"request_id":5,"error":"success"}\n',  # loadfile
+            # loadfile response + start-file/file-loaded events for entry_id=2
+            b'{"data":{"playlist_entry_id":2},"request_id":5,"error":"success"}\n'
+            b'{"event":"start-file","playlist_entry_id":2}\n'
+            b'{"event":"file-loaded","playlist_entry_id":2}\n',
             b'{"request_id":6,"error":"success"}\n',  # mute (post-load)
-        ]
+        ] + [
+            b'{"request_id":' + str(7 + i).encode() + b',"error":"success"}\n'
+            for i in range(6)
+        ]  # 3x fullscreen toggle
 
         with patch.object(mpv_player, "_update_current"), \
              patch("player.service.subprocess") as mock_subprocess:
@@ -2698,9 +2724,15 @@ class TestMutePolicy:
             b'{"request_id":2,"error":"success"}\n',  # mute (pre-load)
             b'{"request_id":3,"error":"success"}\n',  # pause=False
             b'{"request_id":4,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n',  # loadfile
+            # loadfile response + start-file/file-loaded events for entry_id=1
+            b'{"data":{"playlist_entry_id":1},"request_id":5,"error":"success"}\n'
+            b'{"event":"start-file","playlist_entry_id":1}\n'
+            b'{"event":"file-loaded","playlist_entry_id":1}\n',
             b'{"request_id":6,"error":"success"}\n',  # mute (post-load)
-        ]
+        ] + [
+            f'{{"request_id":{7+i},"error":"success"}}\n'.encode()
+            for i in range(6)
+        ]  # 3x fullscreen toggle
 
         result = mpv_player._loadfile_mpv(Path("/tmp/video.mp4"), loop=True, muted=False)
         assert result is True
@@ -2729,7 +2761,10 @@ class TestMutePolicy:
             b'{"request_id":3,"error":"success"}\n',  # pause=False
             b'{"request_id":4,"error":"success"}\n',  # image-display-duration
             b'{"request_id":5,"error":"success"}\n',  # hwdec
-            b'{"data":{"playlist_entry_id":1},"request_id":6,"error":"success"}\n',  # loadfile
+            # loadfile response + start-file/file-loaded events for entry_id=1
+            b'{"data":{"playlist_entry_id":1},"request_id":6,"error":"success"}\n'
+            b'{"event":"start-file","playlist_entry_id":1}\n'
+            b'{"event":"file-loaded","playlist_entry_id":1}\n',
             b'{"request_id":7,"error":"success"}\n',  # mute (post-load)
         ] + [
             b'{"request_id":8,"error":"success"}\n',
@@ -2989,3 +3024,44 @@ class TestChromiumLowMemFlags:
         # Baseline flags still present
         assert "--kiosk" in cmd
         assert "https://example.com" in cmd
+
+
+class TestSplashConfigWatch:
+    """Tests for the inotify-driven splash config re-render path.
+
+    The CMS rewrites the splash config file (persist_dir/splash) when the
+    user picks a new splash. Before the fix, inotify only watched
+    state_dir, so this rewrite was invisible to the running player and
+    the new splash never appeared until a service restart. The fix adds
+    a watch on persist_dir and triggers _on_splash_config_changed, which
+    re-renders the splash if SPLASH/STOP is currently active.
+    """
+
+    def test_splash_mode_rerenders(self, mpv_player):
+        mpv_player.current_desired = DesiredState(mode=PlaybackMode.SPLASH)
+        with patch.object(mpv_player, "_show_splash") as show:
+            result = mpv_player._on_splash_config_changed()
+        assert result is False
+        show.assert_called_once_with()
+
+    def test_stop_mode_rerenders(self, mpv_player):
+        mpv_player.current_desired = DesiredState(mode=PlaybackMode.STOP)
+        with patch.object(mpv_player, "_show_splash") as show:
+            mpv_player._on_splash_config_changed()
+        show.assert_called_once_with()
+
+    def test_play_mode_defers(self, mpv_player):
+        mpv_player.current_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="vid.mp4", loop=False,
+        )
+        with patch.object(mpv_player, "_show_splash") as show:
+            mpv_player._on_splash_config_changed()
+        show.assert_not_called()
+
+    def test_no_current_desired_rerenders(self, mpv_player):
+        # Defensive: at boot before apply_desired runs, current_desired
+        # may still be None. Re-render so the new splash is honoured.
+        mpv_player.current_desired = None
+        with patch.object(mpv_player, "_show_splash") as show:
+            mpv_player._on_splash_config_changed()
+        show.assert_called_once_with()
