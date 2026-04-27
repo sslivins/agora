@@ -173,6 +173,7 @@ class AgoraPlayer:
     _mpv_generation: int = 0
     _mpv_active_entry_id: Optional[int] = None
     _mpv_keep_open_active: bool = False
+    _scheduled_pending: Optional[dict] = None
 
     def __init__(self, base_path: str = "/opt/agora"):
         self.base = Path(base_path)
@@ -229,6 +230,7 @@ class AgoraPlayer:
         self._mpv_generation: int = 0
         self._mpv_active_entry_id: Optional[int] = None
         self._mpv_keep_open_active: bool = False
+        self._scheduled_pending: Optional[dict] = None
         self._mpv_drain_lock = threading.Lock()
         self._mpv_drain_pending: bool = False
 
@@ -1121,6 +1123,15 @@ class AgoraPlayer:
         evt_name = event.get("event")
         if evt_name != "end-file":
             return
+        # Slideshow play_to_end has its own pending dict per slide.
+        if self._slideshow:
+            self._dispatch_end_file_to_slideshow(event)
+        # Scheduled finite-loop playback has its own pending dict.
+        if self._scheduled_pending:
+            self._dispatch_end_file_to_scheduled(event)
+
+    def _dispatch_end_file_to_slideshow(self, event: dict) -> None:
+        """Dispatch an end-file event to slideshow play_to_end logic."""
         ss = self._slideshow
         if not ss:
             return
@@ -1153,11 +1164,51 @@ class AgoraPlayer:
                 "mpv end-file reason=%s for slide %d (%s) — advancing",
                 reason, pending["slide_index"], pending["slide_name"],
             )
-        # Cancel watchdog and clear pending before advancing so a re-entrant
-        # _play_next_slide can install a fresh pending dict.
         self._cancel_play_to_end_watchdog()
         ss["pending_play_to_end"] = None
         self._play_next_slide()
+
+    def _dispatch_end_file_to_scheduled(self, event: dict) -> None:
+        """Dispatch an end-file event to scheduled finite-loop logic.
+
+        We let mpv loop natively (--loop-file=inf) and count ``end-file``
+        events here. When the count hits the requested ``loop_count``,
+        we IPC-load the splash so the transition happens without an mpv
+        respawn (no black flash).
+        """
+        sp = self._scheduled_pending
+        if not sp:
+            return
+        if event.get("_generation") != sp["generation"]:
+            return
+        if event.get("playlist_entry_id") != sp["entry_id"]:
+            return
+        reason = event.get("reason")
+        if reason in ("stop", "quit", "redirect"):
+            # Caller initiated (loadfile of next asset, _show_splash,
+            # _stop_mpv): don't double-advance.
+            return
+        if reason == "error":
+            logger.warning(
+                "Scheduled play hit error mid-loop (%s %d/%d) — splashing",
+                sp["asset_name"], sp["completed_count"], sp["target_count"],
+            )
+            self._scheduled_pending = None
+            self._show_splash()
+            return
+        # reason == "eof" (or any non-caller-initiated end): one loop completed.
+        sp["completed_count"] += 1
+        logger.info(
+            "Scheduled play loop %d/%d for %s",
+            sp["completed_count"], sp["target_count"], sp["asset_name"],
+        )
+        if sp["completed_count"] >= sp["target_count"]:
+            logger.info(
+                "Completed %d/%d loops, switching to splash (IPC)",
+                sp["completed_count"], sp["target_count"],
+            )
+            self._scheduled_pending = None
+            self._show_splash()
 
     def _cancel_play_to_end_watchdog(self) -> None:
         """Cancel any pending play_to_end watchdog timeout."""
@@ -1226,6 +1277,7 @@ class AgoraPlayer:
             self._mpv_generation += 1
             self._mpv_keep_open_active = False
             self._mpv_active_entry_id = None
+            self._scheduled_pending = None
             self._mpv_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -1268,6 +1320,7 @@ class AgoraPlayer:
             self._mpv_generation += 1
             self._mpv_keep_open_active = False
             self._mpv_active_entry_id = None
+            self._scheduled_pending = None
             self._mpv_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -1553,6 +1606,9 @@ class AgoraPlayer:
 
     def _show_splash(self) -> bool:
         """Show splash screen. Returns False to cancel GLib timeout repeat."""
+        # Clear any armed scheduled-pending so a stale event arriving from
+        # the file we're about to replace can't re-trigger _show_splash.
+        self._scheduled_pending = None
         self._stop_cage()
         error = self._pending_error
         self._pending_error = None
@@ -1577,6 +1633,7 @@ class AgoraPlayer:
                         self._mpv_generation += 1
                         self._mpv_keep_open_active = False
                         self._mpv_active_entry_id = None
+                        self._scheduled_pending = None
                         self._mpv_process = subprocess.Popen(
                             cmd,
                             stdout=subprocess.DEVNULL,
@@ -1879,9 +1936,46 @@ class AgoraPlayer:
             if self._player_backend == "mpv":
                 loop = bool(desired.loop)
                 # For finite loop count, let mpv handle it naturally
-                if is_video and desired.loop_count is not None and desired.loop_count > 0:
-                    loop = False  # Don't use --loop=inf; monitor exits instead
-                self._start_mpv(path, loop=loop)
+                finite_loop = bool(
+                    is_video
+                    and desired.loop_count is not None
+                    and desired.loop_count > 0
+                )
+                if finite_loop:
+                    loop = False  # legacy fallback path: monitor exits per loop
+                # Phase 3 IPC-driven path: if listener is ready and finite
+                # loop_count is requested, IPC-load with --loop-file=inf and
+                # count end-file events. mpv loops natively (no respawn,
+                # no black flash); we IPC-load splash on the Nth EOF.
+                used_ipc_loop_count = False
+                if (
+                    finite_loop
+                    and self.is_mpv_event_listener_ready()
+                    and self._loadfile_mpv(path, loop=True, muted=False)
+                ):
+                    entry_id = self._mpv_active_entry_id
+                    if entry_id is not None:
+                        self._scheduled_pending = {
+                            "entry_id": entry_id,
+                            "generation": self._mpv_generation,
+                            "asset_name": desired.asset,
+                            "target_count": int(desired.loop_count),
+                            "completed_count": 0,
+                        }
+                        used_ipc_loop_count = True
+                        self._update_current(
+                            mode=PlaybackMode.PLAY,
+                            asset=desired.asset,
+                            started_at=datetime.now(timezone.utc),
+                        )
+                        logger.info(
+                            "Scheduled finite-loop armed via IPC: %s "
+                            "loop_count=%d entry_id=%s gen=%d",
+                            desired.asset, desired.loop_count,
+                            entry_id, self._mpv_generation,
+                        )
+                if not used_ipc_loop_count:
+                    self._start_mpv(path, loop=loop)
                 GLib.timeout_add_seconds(10, self._update_position)
             else:
                 self._teardown()

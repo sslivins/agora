@@ -416,3 +416,94 @@ class TestPlayToEndIpcDriven:
         assert player._slideshow["pending_play_to_end"] is not None
         assert player._slideshow["index"] == before_idx
 
+
+
+class TestScheduledLoopCountIpcDriven:
+    """Phase 3: regular schedule finite loop_count via mpv native loop-file=inf.
+
+    Listener counts end-file events; on the Nth match we IPC-load splash.
+    No mpv respawn between loops.
+    """
+
+    def _arm(self, mpv_player, target_count=3):
+        player, svc = mpv_player
+        player._scheduled_pending = {
+            "entry_id": 17,
+            "generation": 5,
+            "asset_name": "video.mp4",
+            "target_count": target_count,
+            "completed_count": 0,
+        }
+        return player, svc
+
+    def test_eof_increments_count_below_target(self, mpv_player):
+        player, _ = self._arm(mpv_player, target_count=3)
+        player._on_mpv_event({
+            "event": "end-file", "reason": "eof",
+            "playlist_entry_id": 17, "_generation": 5,
+        })
+        assert player._scheduled_pending["completed_count"] == 1
+        player._show_splash.assert_not_called()
+
+    def test_eof_at_target_triggers_splash(self, mpv_player):
+        player, _ = self._arm(mpv_player, target_count=2)
+        player._on_mpv_event({
+            "event": "end-file", "reason": "eof",
+            "playlist_entry_id": 17, "_generation": 5,
+        })
+        assert player._scheduled_pending["completed_count"] == 1
+        player._show_splash.assert_not_called()
+        player._on_mpv_event({
+            "event": "end-file", "reason": "eof",
+            "playlist_entry_id": 17, "_generation": 5,
+        })
+        assert player._scheduled_pending is None
+        player._show_splash.assert_called_once()
+
+    def test_eof_ignored_for_mismatched_entry_id(self, mpv_player):
+        player, _ = self._arm(mpv_player)
+        player._on_mpv_event({
+            "event": "end-file", "reason": "eof",
+            "playlist_entry_id": 99, "_generation": 5,
+        })
+        assert player._scheduled_pending["completed_count"] == 0
+        player._show_splash.assert_not_called()
+
+    def test_eof_ignored_for_stale_generation(self, mpv_player):
+        player, _ = self._arm(mpv_player)
+        player._on_mpv_event({
+            "event": "end-file", "reason": "eof",
+            "playlist_entry_id": 17, "_generation": 4,
+        })
+        assert player._scheduled_pending["completed_count"] == 0
+        player._show_splash.assert_not_called()
+
+    def test_stop_reason_ignored(self, mpv_player):
+        player, _ = self._arm(mpv_player)
+        for reason in ("stop", "quit", "redirect"):
+            player._on_mpv_event({
+                "event": "end-file", "reason": reason,
+                "playlist_entry_id": 17, "_generation": 5,
+            })
+        assert player._scheduled_pending["completed_count"] == 0
+        player._show_splash.assert_not_called()
+
+    def test_error_reason_clears_and_splashes(self, mpv_player):
+        player, _ = self._arm(mpv_player)
+        player._on_mpv_event({
+            "event": "end-file", "reason": "error",
+            "playlist_entry_id": 17, "_generation": 5,
+        })
+        assert player._scheduled_pending is None
+        player._show_splash.assert_called_once()
+
+    def test_show_splash_clears_pending_defensively(self, mpv_player):
+        player, svc = mpv_player
+        player._scheduled_pending = {
+            "entry_id": 1, "generation": 1, "asset_name": "a.mp4",
+            "target_count": 5, "completed_count": 2,
+        }
+        player._stop_cage = MagicMock()
+        player._find_splash = MagicMock(return_value=None)
+        svc.AgoraPlayer._show_splash(player)
+        assert player._scheduled_pending is None
