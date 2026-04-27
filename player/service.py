@@ -17,7 +17,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-from shared.board import Board, alsa_card, get_board, player_backend, supported_codecs  # noqa: E402
+from shared.board import Board, alsa_device_string, alsa_device_string_gst, get_board, player_backend, supported_codecs  # noqa: E402
 from hardware.display import PortStatus, get_display_probe  # noqa: E402
 from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
@@ -36,13 +36,13 @@ def _build_video_pipeline_str(board: Board) -> str:
     else:
         decode = "h264parse ! v4l2h264dec"
 
-    _card = alsa_card()
+    _gst_dev = alsa_device_string_gst()
     return (
         'filesrc location="{path}" ! '
         "qtdemux name=dmux "
         f"dmux.video_0 ! queue ! {decode} ! kmssink driver-name=vc4 sync=true "
         "dmux.audio_0 ! queue ! decodebin ! audioconvert ! audioresample ! "
-        f'alsasink device="hdmi:CARD={_card},DEV=0"'
+        f'alsasink device="{_gst_dev}"'
     )
 
 
@@ -92,7 +92,7 @@ def _build_mpv_command(path: Path, *, muted: bool = True, loop: bool = False) ->
         "--no-osc",
         f"--input-ipc-server={MPV_IPC_SOCKET}",
         "--ao=alsa",
-        f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0",
+        f"--audio-device={alsa_device_string()}",
     ]
     if is_image:
         cmd.append("--image-display-duration=inf")
@@ -130,7 +130,7 @@ def _build_stream_command(url: str) -> list[str]:
         # Loop for VOD streams (harmless for live — they don't end)
         "--loop=inf",
         "--ao=alsa",
-        f"--audio-device=alsa/hdmi:CARD={alsa_card()},DEV=0",
+        f"--audio-device={alsa_device_string()}",
         url,
     ]
     return cmd

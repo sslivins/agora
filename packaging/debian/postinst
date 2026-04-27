@@ -168,6 +168,19 @@ if [ -f "${BOOT_CFG}" ]; then
             echo "Agora: added ${setting} to ${BOOT_CFG}"
         fi
     done
+    # ── HiFi DAC HAT (InnoMaker PCM5122 / HiFiBerry-compatible) ──
+    # Loading the overlay on boards without the HAT is harmless: the I²C
+    # probe fails and no card is registered, leaving HDMI audio intact.
+    # We also disable the onboard analog jack (agora doesn't use the
+    # 3.5mm output) to avoid contention with the DAC for ALSA card 0.
+    # Use exact-line match (not key-only) because dtoverlay/dtparam can
+    # legitimately appear multiple times in config.txt.
+    for line in 'dtoverlay=hifiberry-dacplus' 'dtparam=audio=off'; do
+        if ! grep -qxF "${line}" "${BOOT_CFG}"; then
+            echo "${line}" >> "${BOOT_CFG}"
+            echo "Agora: added ${line} to ${BOOT_CFG}"
+        fi
+    done
 fi
 
 # ── Disable console login on HDMI (tty1) ──
