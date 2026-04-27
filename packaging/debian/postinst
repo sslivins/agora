@@ -175,7 +175,22 @@ if [ -f "${BOOT_CFG}" ]; then
     # 3.5mm output) to avoid contention with the DAC for ALSA card 0.
     # Use exact-line match (not key-only) because dtoverlay/dtparam can
     # legitimately appear multiple times in config.txt.
-    for line in 'dtoverlay=hifiberry-dacplus' 'dtparam=audio=off'; do
+    #
+    # Overlay choice: hifiberry-dacplus-std is correct for PCM5122 boards
+    # *without* a CS2000 master clock chip (which the InnoMaker HAT lacks).
+    # The plain hifiberry-dacplus overlay assumes a CS2000 is present and
+    # mis-programs sample-rate clocks — symptom is audio playing at ~2x
+    # speed. The hifiberry-dac overlay targets PCM5102A (no I²C control)
+    # and produces a card with no working clocks on the PCM5122 — symptom
+    # is silence. See agora-cms PR #149 for original wiring.
+    #
+    # Migrate any pre-existing buggy 'hifiberry-dacplus' line (without the
+    # -std suffix) installed by older agora packages.
+    if grep -qxF 'dtoverlay=hifiberry-dacplus' "${BOOT_CFG}"; then
+        sed -i 's|^dtoverlay=hifiberry-dacplus$|dtoverlay=hifiberry-dacplus-std|' "${BOOT_CFG}"
+        echo "Agora: migrated dtoverlay=hifiberry-dacplus -> hifiberry-dacplus-std in ${BOOT_CFG}"
+    fi
+    for line in 'dtoverlay=hifiberry-dacplus-std' 'dtparam=audio=off'; do
         if ! grep -qxF "${line}" "${BOOT_CFG}"; then
             echo "${line}" >> "${BOOT_CFG}"
             echo "Agora: added ${line} to ${BOOT_CFG}"
