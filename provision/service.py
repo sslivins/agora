@@ -78,6 +78,7 @@ CMS_STATUS_PATH = STATE_DIR / "cms_status.json"
 
 WIFI_CONNECT_TIMEOUT = 60   # seconds to wait for Wi-Fi on boot
 AP_SESSION_TIMEOUT = 600    # 10 minutes in AP mode before retrying Wi-Fi
+ETHERNET_LINK_WAIT_S = 30   # seconds to wait for ethernet link/DHCP after boot
 PORTAL_PORT = 80
 
 WIFI_RETRY_COUNT = 3        # attempts before returning to AP mode
@@ -686,6 +687,24 @@ async def run_service(force_oobe: bool = False) -> None:
     # ── Ethernet fast-path ───────────────────────────────────────────
     # If ethernet is connected (Pi 4, Pi 5, CM5), skip OOBE entirely.
     # The device is immediately reachable on the LAN.
+    #
+    # On boards with no Wi-Fi (e.g. CM5 Lite), we MUST take this path —
+    # falling through to the AP-mode branch will fail because there is
+    # no Wi-Fi interface to host the captive portal. NetworkManager may
+    # take a few seconds after boot to bring the link up and assign an
+    # IP, so wait briefly for `is_ethernet_connected()` to become true
+    # if an ethernet interface is present.
+    if run_oobe and get_ethernet_interface() and not is_ethernet_connected():
+        logger.info(
+            "Ethernet interface present but not yet connected — waiting up to %ds",
+            ETHERNET_LINK_WAIT_S,
+        )
+        for _ in range(ETHERNET_LINK_WAIT_S):
+            await asyncio.sleep(1)
+            if is_ethernet_connected():
+                logger.info("Ethernet link came up")
+                break
+
     if run_oobe and is_ethernet_connected():
         logger.info("Ethernet connected on first boot — skipping Wi-Fi OOBE")
 
