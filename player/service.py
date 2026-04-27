@@ -734,6 +734,7 @@ class AgoraPlayer:
     # Per-command IPC timeout (seconds). mpv responds promptly under
     # normal conditions; we'd rather log + fail than block forever.
     _IPC_CMD_TIMEOUT_S = 1.5
+    _MPV_LOAD_WAIT_S = 0.75
 
     def _ipc_call(self, sock, recv_buf: bytes, command: list, *,
                   timeout_s: Optional[float] = None):
@@ -748,6 +749,12 @@ class AgoraPlayer:
         ``recv_buf`` carries any bytes already read but not yet parsed across
         successive calls on the same socket so partial JSON lines are not
         lost.
+
+        Events seen while waiting for the response are appended to
+        ``self._mpv_event_buf`` rather than discarded, so a subsequent
+        ``_wait_for_mpv_load_complete`` (which runs after several IPC calls)
+        can still observe ``start-file`` / ``file-loaded`` / ``end-file``
+        events that arrived bundled with an earlier response chunk.
         """
         req_id = next(self._mpv_ipc_counter)
         msg = json.dumps({"command": command, "request_id": req_id}).encode() + b"\n"
@@ -771,7 +778,13 @@ class AgoraPlayer:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 if "event" in resp:
-                    # mpv broadcasts events on every IPC client; drop
+                    # mpv broadcasts events on every IPC client. Stash
+                    # them so _wait_for_mpv_load_complete can replay them
+                    # after the multi-call IPC sequence completes.
+                    try:
+                        self._mpv_event_buf.append(resp)
+                    except AttributeError:
+                        self._mpv_event_buf = [resp]
                     continue
                 if resp.get("request_id") == req_id:
                     return resp.get("error") == "success", resp.get("data"), recv_buf
@@ -788,6 +801,101 @@ class AgoraPlayer:
                 return False, None, recv_buf
             if not chunk:
                 return False, None, recv_buf
+            recv_buf += chunk
+
+    def _wait_for_mpv_load_complete(self, sock, recv_buf: bytes, *,
+                                     expected_entry_id: Optional[int],
+                                     expected_path: Path,
+                                     timeout_s: float = 0.5) -> tuple[bool, bytes]:
+        """Wait for mpv to finish loading the file just submitted via ``loadfile``.
+
+        Returns ``(loaded, new_recv_buf)``. ``loaded`` is True when mpv emits a
+        ``file-loaded`` event for our load (matched on ``playlist_entry_id`` if
+        present, or implicitly on the next file-loaded after a matching
+        ``start-file``). False on timeout or on ``end-file`` with an error
+        reason matching our entry_id.
+
+        Reads newline-delimited JSON from the same socket the loadfile was
+        submitted on. Command responses for unrelated request_ids are dropped.
+        Other events (video-reconfig, property-change, etc.) are skipped.
+
+        This avoids the GLib-loop deadlock that would occur if we waited on
+        the persistent listener thread's queue, since that queue is drained
+        on the GLib main loop and ``_loadfile_mpv`` blocks the main loop.
+        """
+        start_file_seen = (expected_entry_id is None)
+        deadline = time.monotonic() + timeout_s
+
+        # Replay any events captured by prior _ipc_calls on this socket —
+        # mpv often emits start-file / file-loaded in the same chunk as
+        # the loadfile success response, so the post-load mute call may
+        # have already consumed those event lines from the wire.
+        replay = list(getattr(self, "_mpv_event_buf", ()) or ())
+        try:
+            self._mpv_event_buf.clear()
+        except AttributeError:
+            self._mpv_event_buf = []
+        for msg in replay:
+            ev = msg.get("event")
+            if ev is None:
+                continue
+            eid = msg.get("playlist_entry_id")
+            if ev == "start-file":
+                if expected_entry_id is None or eid == expected_entry_id:
+                    start_file_seen = True
+            elif ev == "end-file":
+                if (expected_entry_id is None or eid == expected_entry_id) \
+                        and msg.get("reason") == "error":
+                    logger.warning(
+                        "mpv: load failed for %s (entry_id=%s, reason=error, file_error=%s)",
+                        expected_path.name, eid, msg.get("file_error"),
+                    )
+                    return False, recv_buf
+            elif ev == "file-loaded":
+                if expected_entry_id is None or eid == expected_entry_id or eid is None:
+                    if start_file_seen:
+                        return True, recv_buf
+
+        while True:
+            while b"\n" in recv_buf:
+                line, recv_buf = recv_buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode())
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                ev = msg.get("event")
+                if ev is None:
+                    continue
+                eid = msg.get("playlist_entry_id")
+                if ev == "start-file":
+                    if expected_entry_id is None or eid == expected_entry_id:
+                        start_file_seen = True
+                elif ev == "end-file":
+                    if (expected_entry_id is None or eid == expected_entry_id) \
+                            and msg.get("reason") == "error":
+                        logger.warning(
+                            "mpv: load failed for %s (entry_id=%s, reason=error, file_error=%s)",
+                            expected_path.name, eid, msg.get("file_error"),
+                        )
+                        return False, recv_buf
+                elif ev == "file-loaded":
+                    if expected_entry_id is None or eid == expected_entry_id or eid is None:
+                        if start_file_seen:
+                            return True, recv_buf
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, recv_buf
+            try:
+                sock.settimeout(min(remaining, 0.25))
+                chunk = sock.recv(4096)
+            except OSError:
+                return False, recv_buf
+            if not chunk:
+                return False, recv_buf
             recv_buf += chunk
 
     def _loadfile_mpv(self, path: Path, *, loop: bool = False,
@@ -825,6 +933,8 @@ class AgoraPlayer:
         # Fresh request_id sequence per IPC session — responses on this
         # socket are single-shot, no need for global uniqueness.
         self._mpv_ipc_counter = itertools.count()
+        # Fresh event capture for this load — see _ipc_call docstring.
+        self._mpv_event_buf = []
 
         sock = None
         try:
@@ -920,14 +1030,31 @@ class AgoraPlayer:
             if not ok:
                 logger.warning("mpv IPC: set mute (post-load) failed (continuing)")
 
-            # When loading an image, toggle fullscreen to force DRM plane refresh.
-            # Don't fail the whole call if a toggle drops; best-effort.
-            if is_image:
-                for _ in range(3):
-                    _, _, recv_buf = self._ipc_call(sock, recv_buf,
-                        ["set_property", "fullscreen", False])
-                    _, _, recv_buf = self._ipc_call(sock, recv_buf,
-                        ["set_property", "fullscreen", True])
+            # Wait briefly for mpv to actually finish loading the new file,
+            # then toggle fullscreen 3× to force a DRM plane refresh. Without
+            # the wait, under rapid successive loadfile calls the toggle can
+            # fire before mpv has decoded the new content. Without the
+            # toggle, image→video and image→image transitions can leave the
+            # previous frame committed to the connector's primary plane even
+            # though mpv has internally swapped to the new file. The toggle
+            # is best-effort; don't fail the call on a dropped command.
+            loaded, recv_buf = self._wait_for_mpv_load_complete(
+                sock, recv_buf,
+                expected_entry_id=entry_id,
+                expected_path=path,
+                timeout_s=self._MPV_LOAD_WAIT_S,
+            )
+            if not loaded:
+                logger.warning(
+                    "mpv IPC: timed out waiting for file-loaded for %s "
+                    "(entry_id=%s); forcing refresh anyway",
+                    path.name, entry_id,
+                )
+            for _ in range(3):
+                _, _, recv_buf = self._ipc_call(sock, recv_buf,
+                    ["set_property", "fullscreen", False])
+                _, _, recv_buf = self._ipc_call(sock, recv_buf,
+                    ["set_property", "fullscreen", True])
 
             logger.info(
                 "mpv IPC loadfile succeeded for %s (mute=%s keep_open=%s entry_id=%s)",
@@ -2181,28 +2308,68 @@ class AgoraPlayer:
     # ── State file watcher ──
 
     def _setup_inotify(self) -> bool:
-        """Watch desired.json via inotify. Returns True on success."""
+        """Watch desired.json and the splash config file via inotify.
+
+        Returns True on success.
+
+        Two directories are watched because the two files live in
+        different parents: ``desired.json`` is in ``state_dir`` while the
+        splash config is in ``persist_dir``. Without watching the splash
+        config, CMS-driven splash changes (which only rewrite that file)
+        would never wake the player and the new splash would not appear
+        until the next service restart.
+        """
         try:
             from inotify_simple import INotify, flags as inotify_flags
 
             inotify = INotify()
-            inotify.add_watch(
-                str(self.state_dir),
-                inotify_flags.CLOSE_WRITE | inotify_flags.MOVED_TO,
-            )
+            mask = inotify_flags.CLOSE_WRITE | inotify_flags.MOVED_TO
+            state_wd = inotify.add_watch(str(self.state_dir), mask)
+            self.persist_dir.mkdir(parents=True, exist_ok=True)
+            persist_wd = inotify.add_watch(str(self.persist_dir), mask)
+            splash_name = self.splash_config_path.name
 
             def on_inotify_event(fd, condition):
                 for event in inotify.read():
-                    if event.name == "desired.json":
+                    if event.wd == state_wd and event.name == "desired.json":
                         logger.debug("desired.json changed (inotify)")
                         GLib.idle_add(self.apply_desired)
+                    elif event.wd == persist_wd and event.name == splash_name:
+                        logger.debug("splash config changed (inotify)")
+                        GLib.idle_add(self._on_splash_config_changed)
                 return True
 
             GLib.io_add_watch(inotify.fd, GLib.IO_IN, on_inotify_event)
-            logger.info("Watching state dir via inotify")
+            logger.info("Watching state and persist dirs via inotify")
             return True
         except ImportError:
             return False
+
+    def _on_splash_config_changed(self) -> bool:
+        """Re-render the splash if it's currently the on-screen content.
+
+        Called from inotify when the splash config file is rewritten
+        (e.g. via the CMS ``/assets/{name}/set-splash`` API). When the
+        player is currently in SPLASH or STOP mode, re-invoke
+        :meth:`_show_splash` so the new splash appears immediately via
+        the seamless mpv IPC path. When the player is currently in PLAY
+        mode, do nothing — the schedule keeps running and the new splash
+        will be picked up automatically the next time we transition to
+        splash.
+
+        Returns False so GLib.idle_add does not repeat.
+        """
+        cd = self.current_desired
+        mode = cd.mode if cd is not None else None
+        if mode in (PlaybackMode.SPLASH, PlaybackMode.STOP, None):
+            logger.info("Splash config changed — re-rendering splash")
+            self._show_splash()
+        else:
+            logger.info(
+                "Splash config changed — current mode is %s, "
+                "deferring until next transition", mode,
+            )
+        return False
 
     def _poll_state(self) -> bool:
         """Poll-based fallback for state changes."""
