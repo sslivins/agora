@@ -21,7 +21,7 @@ from shared.board import Board, HdmiPort
     "board,expected_cls",
     [
         (Board.PI_5, DrmSysfsDisplayProbe),
-        (Board.PI_4, I2cEdidDisplayProbe),
+        (Board.PI_4, DrmSysfsDisplayProbe),
         (Board.ZERO_2W, I2cEdidDisplayProbe),
         (Board.UNKNOWN, NullDisplayProbe),
     ],
