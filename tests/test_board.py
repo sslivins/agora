@@ -8,6 +8,10 @@ from shared.board import (
     Board,
     HdmiPort,
     _detect_board,
+    alsa_card,
+    alsa_device_string,
+    alsa_device_string_gst,
+    detect_audio_device,
     get_board,
     get_cpu_temp,
     get_i2c_bus,
@@ -27,8 +31,10 @@ import shared.board as board_module
 def _reset_cache():
     """Reset the cached board detection before each test."""
     board_module._cached_board = None
+    board_module._cached_audio_device = None
     yield
     board_module._cached_board = None
+    board_module._cached_audio_device = None
 
 
 # ── Board detection from model string ──
@@ -269,3 +275,96 @@ class TestPlayerBackend:
     def test_unknown_board_uses_gstreamer(self):
         with patch.object(board_module, "_read_model_string", return_value="Something Else"):
             assert player_backend() == "gstreamer"
+
+
+# ── Audio device detection (HiFi DAC HAT vs HDMI) ──
+
+
+_HDMI_ONLY_CARDS = """\
+ 0 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0
+                      vc4-hdmi-0
+ 1 [vc4hdmi1       ]: vc4-hdmi - vc4-hdmi-1
+                      vc4-hdmi-1
+"""
+
+_HAT_PRESENT_CARDS = """\
+ 0 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0
+                      vc4-hdmi-0
+ 1 [sndrpihifiberry]: simple-card - snd_rpi_hifiberry_dacplus
+                      snd_rpi_hifiberry_dacplus
+"""
+
+
+class TestDetectAudioDevice:
+    def test_hat_present_overrides_hdmi(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HAT_PRESENT_CARDS):
+                assert detect_audio_device() == ("sndrpihifiberry", "hw")
+
+    def test_no_hat_falls_back_to_hdmi_pi4(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HDMI_ONLY_CARDS):
+                assert detect_audio_device() == ("vc4hdmi", "hdmi")
+
+    def test_no_hat_falls_back_to_hdmi_pi5(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 5"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HDMI_ONLY_CARDS):
+                assert detect_audio_device() == ("vc4hdmi0", "hdmi")
+
+    def test_no_hat_falls_back_to_hdmi_zero2w(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi Zero 2 W"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HDMI_ONLY_CARDS):
+                assert detect_audio_device() == ("vc4hdmi", "hdmi")
+
+    def test_missing_proc_file_falls_back_to_hdmi(self):
+        """If /proc/asound/cards is missing entirely, treat as no HAT."""
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value=""):
+                assert detect_audio_device() == ("vc4hdmi", "hdmi")
+
+    def test_malformed_proc_file_does_not_crash(self):
+        """Garbage content should fall back to HDMI rather than blow up."""
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value="not a real cards file\n\x00\x01"):
+                assert detect_audio_device() == ("vc4hdmi", "hdmi")
+
+    def test_result_is_cached(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HAT_PRESENT_CARDS) as mock:
+                detect_audio_device()
+                detect_audio_device()
+                detect_audio_device()
+                mock.assert_called_once()
+
+    def test_alsa_card_returns_hat_when_present(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HAT_PRESENT_CARDS):
+                assert alsa_card() == "sndrpihifiberry"
+
+    def test_alsa_card_returns_hdmi_when_no_hat(self):
+        """Backwards-compat: existing callers that only need the card name."""
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HDMI_ONLY_CARDS):
+                assert alsa_card() == "vc4hdmi"
+
+    def test_alsa_device_string_hat(self):
+        """mpv-form string for the HAT path."""
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 4 Model B"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HAT_PRESENT_CARDS):
+                assert alsa_device_string() == "alsa/hw:CARD=sndrpihifiberry,DEV=0"
+
+    def test_alsa_device_string_hdmi(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi 5"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HDMI_ONLY_CARDS):
+                assert alsa_device_string() == "alsa/hdmi:CARD=vc4hdmi0,DEV=0"
+
+    def test_alsa_device_string_gst_hat(self):
+        """GStreamer-form string (no ``alsa/`` prefix) for the HAT path."""
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi Zero 2 W"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HAT_PRESENT_CARDS):
+                assert alsa_device_string_gst() == "hw:CARD=sndrpihifiberry,DEV=0"
+
+    def test_alsa_device_string_gst_hdmi(self):
+        with patch.object(board_module, "_read_model_string", return_value="Raspberry Pi Zero 2 W"):
+            with patch.object(board_module, "_read_asound_cards", return_value=_HDMI_ONLY_CARDS):
+                assert alsa_device_string_gst() == "hdmi:CARD=vc4hdmi,DEV=0"

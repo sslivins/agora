@@ -13,6 +13,18 @@ logger = logging.getLogger("agora.board")
 # Device tree model file (standard on all Raspberry Pi boards)
 _MODEL_PATH = Path("/proc/device-tree/model")
 
+# ALSA card-list file used to detect attached audio devices at runtime.
+# Format example:
+#     0 [vc4hdmi0       ]: vc4-hdmi - vc4-hdmi-0
+#                          vc4-hdmi-0
+#     1 [sndrpihifiberry]: simple-card - snd_rpi_hifiberry_dacplus
+#                          snd_rpi_hifiberry_dacplus
+_ASOUND_CARDS_PATH = Path("/proc/asound/cards")
+
+# ALSA card name used by the upstream snd_soc_hifiberry_dacplus driver
+# (which the InnoMaker PCM5122 HAT binds against via dtoverlay=hifiberry-dacplus).
+_HIFIBERRY_CARD = "sndrpihifiberry"
+
 
 class Board(str, enum.Enum):
     """Supported Raspberry Pi board variants."""
@@ -87,6 +99,10 @@ _UNKNOWN_CONFIG: dict = {
 
 # Cached board detection result
 _cached_board: Board | None = None
+
+# Cached audio-device detection result (card_name, device_prefix).
+# Audio cards do not change at runtime, so probe once per process.
+_cached_audio_device: tuple[str, str] | None = None
 
 
 def _read_model_string() -> str:
@@ -191,9 +207,77 @@ def player_backend() -> str:
     return _config()["player_backend"]
 
 
+def _read_asound_cards() -> str:
+    """Read /proc/asound/cards. Returns "" if the file is missing or unreadable.
+
+    Wrapped for easy mocking in tests; not part of the public API.
+    """
+    try:
+        return _ASOUND_CARDS_PATH.read_text()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def detect_audio_device() -> tuple[str, str]:
+    """Return ``(card_name, device_prefix)`` for the active audio output.
+
+    If a HiFiBerry-compatible DAC HAT (e.g. the InnoMaker PCM5122 HAT) is
+    present, ``/proc/asound/cards`` will list a ``sndrpihifiberry`` card
+    once ``dtoverlay=hifiberry-dacplus`` has registered the driver. In
+    that case audio is routed via ALSA ``hw:`` (raw PCM, no HDMI quirks),
+    and we return ``("sndrpihifiberry", "hw")``.
+
+    Otherwise we fall back to the per-board HDMI card from
+    ``_BOARD_CONFIG`` and a ``hdmi`` device prefix — preserving the
+    pre-HAT behaviour on Pis without the DAC.
+
+    Cached after the first call: audio cards do not appear/disappear at
+    runtime on these boards.
+    """
+    global _cached_audio_device
+    if _cached_audio_device is not None:
+        return _cached_audio_device
+    cards = _read_asound_cards()
+    if _HIFIBERRY_CARD in cards:
+        _cached_audio_device = (_HIFIBERRY_CARD, "hw")
+        logger.info("Detected HiFiBerry-compatible DAC HAT (%s); routing audio via ALSA hw:", _HIFIBERRY_CARD)
+    else:
+        _cached_audio_device = (_config()["alsa_card"], "hdmi")
+        logger.info("No DAC HAT detected; routing audio via HDMI card %s", _cached_audio_device[0])
+    return _cached_audio_device
+
+
 def alsa_card() -> str:
-    """Return the ALSA card name for HDMI audio on the current board."""
-    return _config()["alsa_card"]
+    """Return the ALSA card name for the active audio output.
+
+    On boards with a HiFiBerry-compatible DAC HAT this returns
+    ``sndrpihifiberry``; otherwise it returns the per-board HDMI card
+    name from ``_BOARD_CONFIG``. Kept for backwards compatibility — new
+    callers should prefer :func:`alsa_device_string` /
+    :func:`alsa_device_string_gst` so the device prefix (``hw`` vs.
+    ``hdmi``) is consistent with the card.
+    """
+    return detect_audio_device()[0]
+
+
+def alsa_device_string() -> str:
+    """Return the mpv-form ALSA device string, e.g. ``alsa/hw:CARD=…,DEV=0``.
+
+    Used for ``mpv --audio-device=…``. Reflects DAC vs. HDMI routing
+    based on :func:`detect_audio_device`.
+    """
+    card, prefix = detect_audio_device()
+    return f"alsa/{prefix}:CARD={card},DEV=0"
+
+
+def alsa_device_string_gst() -> str:
+    """Return the GStreamer-form ALSA device string, e.g. ``hw:CARD=…,DEV=0``.
+
+    Used for ``alsasink device=…``. Reflects DAC vs. HDMI routing based
+    on :func:`detect_audio_device`.
+    """
+    card, prefix = detect_audio_device()
+    return f"{prefix}:CARD={card},DEV=0"
 
 
 def _detect_wifi_interface() -> bool:

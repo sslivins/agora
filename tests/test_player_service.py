@@ -1561,6 +1561,56 @@ class TestBuildMpvCommand:
             cmd = svc._build_mpv_command(Path("/test.mp4"), loop=True)
             assert "--loop=inf" in cmd
 
+    def test_audio_device_routes_to_dac_when_hat_present(self):
+        """When a HiFiBerry-compatible DAC HAT is detected, the mpv
+        --audio-device flag must use ``alsa/hw:CARD=sndrpihifiberry,DEV=0``
+        instead of the HDMI form."""
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import shared.board as board_module
+            import player.service as svc
+            importlib.reload(svc)
+
+            board_module._cached_audio_device = None
+            try:
+                with patch.object(
+                    board_module,
+                    "_read_asound_cards",
+                    return_value=" 1 [sndrpihifiberry]: simple-card - snd_rpi_hifiberry_dacplus\n",
+                ):
+                    cmd = svc._build_mpv_command(Path("/test.mp4"))
+                    assert "--ao=alsa" in cmd
+                    assert "--audio-device=alsa/hw:CARD=sndrpihifiberry,DEV=0" in cmd
+                    assert not any(a.startswith("--audio-device=alsa/hdmi:") for a in cmd)
+            finally:
+                board_module._cached_audio_device = None
+
+    def test_stream_command_routes_to_dac_when_hat_present(self):
+        """The streaming mpv command must also route audio through the DAC."""
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import shared.board as board_module
+            import player.service as svc
+            importlib.reload(svc)
+
+            board_module._cached_audio_device = None
+            try:
+                with patch.object(
+                    board_module,
+                    "_read_asound_cards",
+                    return_value=" 1 [sndrpihifiberry]: simple-card - snd_rpi_hifiberry_dacplus\n",
+                ):
+                    cmd = svc._build_stream_command("https://example.com/live.m3u8")
+                    assert "--audio-device=alsa/hw:CARD=sndrpihifiberry,DEV=0" in cmd
+            finally:
+                board_module._cached_audio_device = None
+
 
 # ── mpv player backend selection ──
 
