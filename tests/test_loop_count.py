@@ -207,6 +207,9 @@ class TestApplyDesiredSkipsRebuildWithLoopCount:
         player.current_desired = DesiredState(
             mode=PlaybackMode.PLAY, asset="v.mp4", loop=True, loop_count=5,
         )
+        # Prove the renderer applied this same desired previously so the
+        # postcondition short-circuit can fire.
+        player._applied_desired = desired.model_copy(deep=True)
         player.pipeline = MagicMock()
         player._current_path = video
         player._current_mtime = video.stat().st_mtime

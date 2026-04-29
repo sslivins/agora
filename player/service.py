@@ -1,5 +1,6 @@
 """Agora Player Service — watches desired state and manages media playback."""
 
+import hashlib
 import itertools
 import json
 import logging
@@ -149,6 +150,11 @@ class AgoraPlayer:
     # Class-level default so tests that bypass __init__ still see this
     # attribute as None (matches "not in a slideshow").
     _slideshow: Optional[dict] = None
+    # Likewise for the new postcondition-tracking attributes.  Tests
+    # that build instances via ``__new__`` only set the legacy fields.
+    _applied_desired: Optional[DesiredState] = None
+    _current_url: Optional[str] = None
+    _slideshow_manifest_digest: Optional[str] = None
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -195,6 +201,21 @@ class AgoraPlayer:
         self.current_desired: Optional[DesiredState] = None
         self._current_path: Optional[Path] = None  # file being played
         self._current_mtime: Optional[float] = None  # mtime when pipeline was built
+        # URL currently rendered by Cage (webpage mode) — None otherwise.
+        self._current_url: Optional[str] = None
+        # Last desired state successfully applied to the renderer.
+        # Used by ``_already_satisfied`` to avoid redundant rebuilds.
+        # Set ONLY at the end of a successful apply branch in
+        # ``apply_desired`` after a postcondition check confirms the
+        # renderer is in a state matching ``desired``.  Never mutated by
+        # ``_show_splash`` or error-fallback paths, unlike
+        # ``current_desired`` which is overwritten by splash for
+        # status-report semantics.
+        self._applied_desired: Optional[DesiredState] = None
+        # SHA-256 of the slideshow manifest bytes captured when the
+        # current slideshow started.  Used to detect manifest edits in
+        # ``_already_satisfied`` so a rewritten manifest forces restart.
+        self._slideshow_manifest_digest: Optional[str] = None
         self._loops_completed: int = 0
         self._health_retries: int = 0
         self._error_retry_delay: int = 3
@@ -247,15 +268,20 @@ class AgoraPlayer:
 
     # ── Slideshow sequencer ──
 
-    def _read_slideshow_manifest(self, name: str) -> Optional[dict]:
+    def _read_slideshow_manifest(self, name: str) -> Optional[tuple[dict, str]]:
         """Read and validate a slideshow manifest from the assets dir.
 
-        Returns the parsed dict or None if missing/invalid.
+        Returns ``(parsed_dict, digest_hex)`` or ``None`` if missing/invalid.
+        ``digest_hex`` is the SHA-256 hex digest of the raw manifest bytes
+        and is used by ``_already_satisfied`` to detect manifest edits
+        between apply_desired calls (which would otherwise be invisible
+        because manifest contents are not part of DesiredState).
         """
         path = self.assets_dir / "slideshows" / f"{name}.json"
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
+            raw = path.read_bytes()
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error("Slideshow manifest %s unreadable: %s", path, e)
             return None
         if not isinstance(data, dict):
@@ -263,7 +289,7 @@ class AgoraPlayer:
         slides = data.get("slides")
         if not isinstance(slides, list) or not slides:
             return None
-        return data
+        return data, hashlib.sha256(raw).hexdigest()
 
     def _cancel_slide_timeout(self) -> None:
         """Cancel any pending GLib slide-advance timeout."""
@@ -280,15 +306,21 @@ class AgoraPlayer:
         self._cancel_slide_timeout()
         self._cancel_play_to_end_watchdog()
         self._slideshow = None
+        self._slideshow_manifest_digest = None
 
     def _start_slideshow(self, name: str, loop_count: Optional[int]) -> None:
         """Begin sequencing slides from the named slideshow manifest."""
-        manifest = self._read_slideshow_manifest(name)
-        if not manifest:
+        result = self._read_slideshow_manifest(name)
+        if not result:
             logger.error("Slideshow not playable: %s — showing splash", name)
             self._update_current(error=f"Slideshow not found: {name}")
+            # Make sure no stale slideshow timer/watchdog survives the
+            # fallback to splash — otherwise an in-flight tick can
+            # restart the prior slideshow on top of the splash.
+            self._clear_slideshow()
             self._show_splash()
             return
+        manifest, digest = result
         self._cancel_slide_timeout()
         slides = manifest["slides"]
         # ``epoch`` is bumped each time a slideshow starts so a stale
@@ -304,11 +336,15 @@ class AgoraPlayer:
             "timeout_id": None,
             "epoch": prev_epoch + 1,
             "pending_play_to_end": None,
+            # Misses-this-cycle counter guards against runaway recursion
+            # when every slide in the manifest is missing on disk.
+            "misses_this_cycle": 0,
         }
+        self._slideshow_manifest_digest = digest
         self._loops_completed = 0
         logger.info(
-            "Slideshow start: name=%s slides=%d loop_count=%s epoch=%d",
-            name, len(slides), loop_count, self._slideshow["epoch"],
+            "Slideshow start: name=%s slides=%d loop_count=%s epoch=%d digest=%s",
+            name, len(slides), loop_count, self._slideshow["epoch"], digest[:8],
         )
         self._play_next_slide()
 
@@ -336,6 +372,7 @@ class AgoraPlayer:
                 self._show_splash()
                 return False
             ss["index"] = 0  # next loop
+            ss["misses_this_cycle"] = 0
 
         slide = ss["slides"][ss["index"]]
         ss["index"] += 1
@@ -346,7 +383,21 @@ class AgoraPlayer:
                 "Slideshow %s: slide %d (%s) missing on disk — skipping",
                 ss["name"], ss["index"] - 1, slide_name,
             )
+            ss["misses_this_cycle"] = ss.get("misses_this_cycle", 0) + 1
+            if ss["misses_this_cycle"] >= len(ss["slides"]):
+                logger.error(
+                    "Slideshow %s: all %d slides missing on disk — "
+                    "aborting → splash",
+                    ss["name"], len(ss["slides"]),
+                )
+                self._clear_slideshow()
+                self._show_splash()
+                return False
             return self._play_next_slide()
+
+        # Found a real slide — reset the miss counter so future gaps
+        # within this cycle don't trip the abort guard prematurely.
+        ss["misses_this_cycle"] = 0
 
         self._cancel_slide_timeout()
         is_video_slide = (slide.get("asset_type") == "video")
@@ -637,6 +688,7 @@ class AgoraPlayer:
             )
             self._current_path = None
             self._current_mtime = None
+            self._current_url = url
             self._update_current(mode=PlaybackMode.PLAY, asset=url)
             # Schedule periodic monitoring to detect Cage/Chromium crashes
             GLib.timeout_add_seconds(3, self._monitor_cage, url)
@@ -666,6 +718,7 @@ class AgoraPlayer:
                 except subprocess.TimeoutExpired:
                     pass
         self._cage_process = None
+        self._current_url = None
 
     def _monitor_cage(self, url: str) -> bool:
         """Periodic check for Cage process exit. Returns False to stop timer."""
@@ -2039,6 +2092,155 @@ class AgoraPlayer:
             logger.debug("Display probe tick failed", exc_info=True)
         return True  # Keep the timer running for the lifetime of the service
 
+    # ── apply_desired postcondition helpers ──
+
+    def _mpv_alive(self) -> bool:
+        proc = self._mpv_process
+        return bool(proc and proc.poll() is None)
+
+    def _cage_alive(self) -> bool:
+        proc = self._cage_process
+        return bool(proc and proc.poll() is None)
+
+    def _pipeline_alive(self) -> bool:
+        return self.pipeline is not None
+
+    def _renderer_alive(self) -> bool:
+        return self._mpv_alive() or self._cage_alive() or self._pipeline_alive()
+
+    def _is_showing_splash(self) -> bool:
+        """True iff the current renderer state is the splash file."""
+        splash = self._find_splash()
+        if not splash or self._current_path != splash:
+            return False
+        if not (self._mpv_alive() or self._pipeline_alive()):
+            return False
+        # mtime invariant: if the splash file was replaced under us we
+        # must rebuild so the new artwork is rendered.
+        try:
+            return splash.stat().st_mtime == self._current_mtime
+        except OSError:
+            return False
+
+    @staticmethod
+    def _desired_kind(d: DesiredState) -> str:
+        """Classify a DesiredState the same way ``apply_desired`` does.
+
+        Returns one of: ``"stop"``, ``"splash"``, ``"stream"``,
+        ``"webpage"``, ``"slideshow"``, ``"file"``, ``"unknown"``.
+        Mirrors the dispatch order in ``apply_desired`` so a missing
+        ``asset_type`` (legacy desired.json) classifies the same way in
+        both places.
+        """
+        if d.mode == PlaybackMode.STOP:
+            return "stop"
+        if d.mode == PlaybackMode.SPLASH:
+            return "splash"
+        if d.mode == PlaybackMode.PLAY and d.url:
+            if d.asset_type == "stream":
+                return "stream"
+            return "webpage"
+        if d.mode == PlaybackMode.PLAY and d.asset:
+            if d.asset_type == "slideshow":
+                return "slideshow"
+            return "file"
+        return "unknown"
+
+    @classmethod
+    def _desireds_equivalent(cls, a: DesiredState, b: DesiredState) -> bool:
+        """True iff ``a`` and ``b`` would produce identical playback.
+
+        Ignores ``timestamp``.  For each kind only the fields that
+        actually drive the renderer matter — comparing every field would
+        force needless rebuilds when the CMS reposts (e.g.) a slideshow
+        with the ``url`` field newly None.
+        """
+        if cls._desired_kind(a) != cls._desired_kind(b):
+            return False
+        kind = cls._desired_kind(a)
+        if kind in ("stop", "splash"):
+            return True
+        if kind == "stream":
+            return a.url == b.url
+        if kind == "webpage":
+            return a.url == b.url
+        if kind == "slideshow":
+            return a.asset == b.asset and a.loop_count == b.loop_count
+        if kind == "file":
+            return (
+                a.asset == b.asset
+                and bool(a.loop) == bool(b.loop)
+                and a.loop_count == b.loop_count
+                and a.expected_checksum == b.expected_checksum
+            )
+        return False
+
+    def _slideshow_manifest_unchanged(self, name: str) -> bool:
+        """True iff the on-disk manifest still hashes to the digest we
+        captured when the slideshow started."""
+        if not self._slideshow_manifest_digest:
+            return False
+        path = self.assets_dir / "slideshows" / f"{name}.json"
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return False
+        return hashlib.sha256(raw).hexdigest() == self._slideshow_manifest_digest
+
+    def _already_satisfied(self, desired: DesiredState) -> bool:
+        """True iff the renderer is already in a state matching ``desired``.
+
+        Combines (a) field-equality of ``_applied_desired`` with
+        ``desired`` for the relevant fields and (b) renderer-state
+        invariants.  Returning True lets ``apply_desired`` skip rebuild
+        without falling back on path-equality alone (which was the
+        bug — a slideshow whose first slide happens to match the new
+        desired's resolved path otherwise short-circuits and keeps
+        running).
+        """
+        applied = self._applied_desired
+        if not applied:
+            return False
+        if not self._desireds_equivalent(applied, desired):
+            return False
+        kind = self._desired_kind(desired)
+        if kind in ("stop", "splash"):
+            return self._slideshow is None and self._is_showing_splash()
+        if kind == "stream":
+            return (
+                self._slideshow is None
+                and self._mpv_alive()
+                and self._current_url is None
+            )
+        if kind == "webpage":
+            return (
+                self._slideshow is None
+                and self._cage_alive()
+                and self._current_url == desired.url
+            )
+        if kind == "slideshow":
+            ss = self._slideshow
+            if not ss or ss.get("name") != desired.asset:
+                return False
+            if ss.get("loop_count") != desired.loop_count:
+                return False
+            if not self._slideshow_manifest_unchanged(desired.asset):
+                return False
+            return self._renderer_alive()
+        if kind == "file":
+            if self._slideshow is not None:
+                return False
+            resolved = self._resolve_asset(desired.asset) if desired.asset else None
+            if not resolved or self._current_path != resolved:
+                return False
+            try:
+                if resolved.stat().st_mtime != self._current_mtime:
+                    return False
+            except OSError:
+                return False
+            return self._mpv_alive() or self._pipeline_alive()
+        return False
+
     def apply_desired(self) -> None:
         """Read desired state and apply it to the player."""
         if not self.desired_path.exists():
@@ -2049,41 +2251,35 @@ class AgoraPlayer:
 
         desired = read_state(self.desired_path, DesiredState)
 
-        # Skip if unchanged (same timestamp)
+        # Same-timestamp short-circuit.  Use ``_applied_desired`` rather
+        # than ``current_desired`` because the latter is mutated by
+        # ``_show_splash`` for status-report semantics and would falsely
+        # claim the original PLAY desired is current right after an
+        # error fallback to splash.
+        applied = self._applied_desired
         if (
-            self.current_desired
-            and desired.timestamp == self.current_desired.timestamp
+            applied
+            and applied.timestamp == desired.timestamp
+            and self._desireds_equivalent(applied, desired)
         ):
             return
 
-        # Skip pipeline rebuild if the same file is already being displayed.
-        # Covers CMS re-syncs, mode changes (SPLASH→PLAY) for the same image,
-        # and timestamp-only updates.  Avoids a visible black flash.
-        # Compare resolved file path + mtime to detect content changes even if
-        # the filename is reused.  Also compares loop_count since that affects
-        # video playback behaviour.
-        is_active = (
-            self.pipeline
-            or (self._mpv_process and self._mpv_process.poll() is None)
-            or (self._cage_process and self._cage_process.poll() is None)
-        )
-        if is_active and self._current_path and desired.asset:
-            new_path = self._resolve_asset(desired.asset)
-            cur_loop_count = self.current_desired.loop_count if self.current_desired else None
-            if (
-                new_path and new_path == self._current_path
-                and desired.loop_count == cur_loop_count
-            ):
-                # Same path — verify file hasn't been replaced (mtime check)
-                try:
-                    current_mtime = self._current_path.stat().st_mtime
-                except OSError:
-                    current_mtime = None
-                if current_mtime == self._current_mtime:
-                    logger.info("Same file already playing (%s), skipping rebuild", new_path.name)
-                    self.current_desired = desired
-                    self._update_current(mode=desired.mode, asset=desired.asset)
-                    return
+        # Predicate-based short-circuit.  Replaces the old resolved-path
+        # equality fast path which was the source of the slideshow leak
+        # (slide-1 file == new desired.asset → return without
+        # ``_clear_slideshow()``).  ``_already_satisfied`` insists the
+        # renderer state matches ``desired``'s mode, so a slideshow that
+        # accidentally shows the right file does NOT count as
+        # "satisfied" for a single-asset desired.
+        if self._already_satisfied(desired):
+            logger.info(
+                "Already satisfied (kind=%s asset=%s url=%s) — skipping rebuild",
+                self._desired_kind(desired), desired.asset, desired.url,
+            )
+            self.current_desired = desired
+            self._applied_desired = desired.model_copy(deep=True)
+            self._update_current(mode=desired.mode, asset=desired.asset)
+            return
 
         logger.info("Applying desired state: %s", desired.model_dump_json())
 
@@ -2091,56 +2287,46 @@ class AgoraPlayer:
             self._clear_slideshow()
             self.current_desired = desired
             self._show_splash()
+            if self._is_showing_splash():
+                self._applied_desired = desired.model_copy(deep=True)
             return
 
         if desired.mode == PlaybackMode.SPLASH:
             self._clear_slideshow()
             self.current_desired = desired
             self._show_splash()
+            if self._is_showing_splash():
+                self._applied_desired = desired.model_copy(deep=True)
             return
 
         if desired.mode == PlaybackMode.PLAY and desired.url:
             self._clear_slideshow()
             # Stream assets → mpv (handles HLS/DASH/RTMP natively)
             if desired.asset_type == "stream":
-                mpv_proc = self._mpv_process
-                if mpv_proc and mpv_proc.poll() is None:
-                    if self.current_desired and self.current_desired.url == desired.url:
-                        logger.info("Same stream already playing (%s), skipping", desired.url)
-                        self.current_desired = desired
-                        return
                 self.current_desired = desired
                 self._start_stream(desired.url)
+                if self._mpv_alive():
+                    self._applied_desired = desired.model_copy(deep=True)
                 return
 
             # Webpage rendering via Cage+Chromium
-            cage_proc = self._cage_process
-            if cage_proc and cage_proc.poll() is None:
-                # Cage is still running — skip if same URL
-                if self.current_desired and self.current_desired.url == desired.url:
-                    logger.info("Same webpage already rendering (%s), skipping", desired.url)
-                    self.current_desired = desired
-                    return
-            # Cage not running or different URL — (re)start
             self.current_desired = desired
             self._start_cage(desired.url)
+            if self._cage_alive() and self._current_url == desired.url:
+                self._applied_desired = desired.model_copy(deep=True)
             return
 
         if desired.mode == PlaybackMode.PLAY and desired.asset:
             # Slideshow: read manifest from assets/slideshows/<name>.json
             # and sequence slides ourselves.  Bypass single-file resolution.
             if desired.asset_type == "slideshow":
-                # If the same slideshow is already running, leave it alone;
-                # otherwise (re)start.  Manifest changes show up via the
-                # CMS-side checksum and will arrive as a fresh fetch.
-                ss = self._slideshow
-                if ss and ss.get("name") == desired.asset:
-                    self.current_desired = desired
-                    return
                 self.current_desired = desired
                 self._health_retries = 0
                 self._loops_completed = 0
                 self._start_slideshow(desired.asset, desired.loop_count)
+                ss = self._slideshow
+                if ss and ss.get("name") == desired.asset:
+                    self._applied_desired = desired.model_copy(deep=True)
                 return
 
             # Leaving any in-flight slideshow before single-asset playback.
@@ -2235,6 +2421,15 @@ class AgoraPlayer:
                 )
                 # Periodic position updates for CMS status reporting
                 GLib.timeout_add_seconds(10, self._update_position)
+            # Postcondition: only mark applied when the renderer is in a
+            # state matching the file desired.  ``_already_satisfied``
+            # checks ``_current_path == resolved`` and renderer alive,
+            # so honour the same invariant here.
+            if (
+                self._current_path == path
+                and (self._mpv_alive() or self._pipeline_alive())
+            ):
+                self._applied_desired = desired.model_copy(deep=True)
 
     _HEALTH_CHECK_MAX_RETRIES = 3
 
