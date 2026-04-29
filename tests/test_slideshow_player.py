@@ -73,10 +73,12 @@ class TestManifestRead:
         _write_manifest(player, "Show", [
             {"name": "a.png", "asset_type": "image", "duration_ms": 1000},
         ])
-        m = player._read_slideshow_manifest("Show")
-        assert m is not None
+        result = player._read_slideshow_manifest("Show")
+        assert result is not None
+        m, digest = result
         assert m["name"] == "Show"
         assert len(m["slides"]) == 1
+        assert isinstance(digest, str) and len(digest) == 64
 
     def test_returns_none_when_missing(self, mpv_player):
         player, _ = mpv_player
@@ -206,6 +208,10 @@ class TestApplyDesiredRoutes:
             asset="Show",
             asset_type="slideshow",
         )
+        # Prove the renderer already applied this exact desired; the
+        # timestamp/equivalence short-circuit should then no-op without
+        # touching _start_slideshow.
+        player._applied_desired = desired.model_copy(deep=True)
         from shared.state import write_state
         write_state(player.desired_path, desired)
         with patch.object(player, "_start_slideshow") as start:
@@ -576,3 +582,160 @@ class TestMonitorMpvListenerSafetyNet:
         with patch.object(svc, "GLib"):
             player._monitor_mpv("v.mp4")
         assert player._scheduled_pending is None
+
+
+# === Regression tests for the slideshow short-circuit bug ===
+
+class TestSlideshowShortCircuitRegression:
+    """Regression tests for the bug where ending a schedule early left a
+    slideshow advancing forever because ``apply_desired`` short-circuited
+    on resolved-path equality without verifying renderer state matched
+    the new ``desired``.
+
+    Repro on Pi 192.168.1.114 (firmware 1.11.31):
+      1. Schedule plays slideshow ``S`` whose first slide is
+         ``goodwill_splash.png``.
+      2. Operator ends the schedule early; CMS posts desired = STOP /
+         then default-asset PLAY of ``goodwill_splash.png``.
+      3. Old code: ``_resolve_asset(goodwill_splash.png)`` matched
+         ``_current_path`` → fast-path return → slide-advance timer
+         survived → slideshow keeps cycling.
+    """
+
+    @staticmethod
+    def _seed_running_slideshow(player, name="Show", first_slide="a.png",
+                                loop_count=None, timeout_id=42, digest="cafebabe"):
+        """Pretend slideshow ``name`` is currently mid-flight."""
+        (player.assets_dir / "images" / first_slide).touch()
+        manifest = _write_manifest(player, name, [
+            {"name": first_slide, "asset_type": "image", "duration_ms": 1000},
+        ])
+        # Use the real digest so _slideshow_manifest_unchanged matches
+        # when the test wants the "still running" path.
+        import hashlib
+        real_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        player._slideshow = {
+            "name": name,
+            "slides": [{"name": first_slide, "asset_type": "image",
+                         "duration_ms": 1000}],
+            "index": 1,
+            "loops_completed": 0,
+            "loop_count": loop_count,
+            "timeout_id": timeout_id,
+        }
+        player._slideshow_manifest_digest = real_digest
+        # Simulate that slide 1 has been loaded into the renderer.
+        player._current_path = player.assets_dir / "images" / first_slide
+        player._current_mtime = player._current_path.stat().st_mtime
+        player.pipeline = MagicMock()
+        # The slideshow itself was applied, so _applied_desired reflects
+        # *that*, not a single-asset desired.
+        player._applied_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset=name, asset_type="slideshow",
+        )
+        player.current_desired = player._applied_desired
+
+    def test_smoking_gun_slideshow_to_single_asset_same_path(self, mpv_player):
+        """Slideshow active → desired single asset whose resolved path matches
+        slide 1. Old code returned without _clear_slideshow(); new code must
+        tear down the slideshow."""
+        player, svc = mpv_player
+        self._seed_running_slideshow(player, name="Show",
+                                      first_slide="goodwill_splash.png",
+                                      timeout_id=99)
+        # New desired: single-asset PLAY of the file that happens to be
+        # slide 1. (Real bug: CMS reposted default-asset after STOP.)
+        new_desired = DesiredState(
+            mode=PlaybackMode.PLAY,
+            asset="goodwill_splash.png",
+        )
+        from shared.state import write_state
+        write_state(player.desired_path, new_desired)
+        with patch.object(svc, "GLib") as glib:
+            with patch.object(player, "_build_pipeline") as build:
+                build.return_value = MagicMock()
+                player.apply_desired()
+        # The pending slide-advance timer MUST be cancelled.
+        glib.source_remove.assert_any_call(99)
+        # And the slideshow record itself MUST be cleared so a future
+        # tick can't restart it.
+        assert player._slideshow is None
+        assert player._slideshow_manifest_digest is None
+
+    def test_same_slideshow_different_loop_count_restarts(self, mpv_player):
+        """Same slideshow name but different loop_count — must rebuild,
+        not short-circuit, because user changed playback semantics."""
+        player, svc = mpv_player
+        self._seed_running_slideshow(player, name="Show", loop_count=None)
+        # Reset _applied_desired to reflect the currently-running state
+        player._applied_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="Show", asset_type="slideshow",
+            loop_count=None,
+        )
+        new_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="Show", asset_type="slideshow",
+            loop_count=3,
+        )
+        from shared.state import write_state
+        write_state(player.desired_path, new_desired)
+        with patch.object(player, "_start_slideshow") as start:
+            player.apply_desired()
+        start.assert_called_once_with("Show", 3)
+
+    def test_same_slideshow_manifest_changed_restarts(self, mpv_player):
+        """Same slideshow name + same loop_count, but the manifest file
+        was rewritten on disk → must rebuild so new slides take effect."""
+        player, svc = mpv_player
+        self._seed_running_slideshow(player, name="Show")
+        # Rewrite manifest with a different slide list → digest changes.
+        _write_manifest(player, "Show", [
+            {"name": "b.png", "asset_type": "image", "duration_ms": 2000},
+        ])
+        (player.assets_dir / "images" / "b.png").touch()
+        new_desired = DesiredState(
+            mode=PlaybackMode.PLAY, asset="Show", asset_type="slideshow",
+        )
+        from shared.state import write_state
+        write_state(player.desired_path, new_desired)
+        with patch.object(player, "_start_slideshow") as start:
+            player.apply_desired()
+        start.assert_called_once_with("Show", None)
+
+    def test_apply_desired_idempotent_via_predicate(self, mpv_player):
+        """Apply same desired twice with different timestamps — the
+        timestamp short-circuit can't fire (timestamps differ), so the
+        only thing that prevents rebuild is the postcondition predicate.
+        Verifies _already_satisfied actually does its job."""
+        player, svc = mpv_player
+        self._seed_running_slideshow(player, name="Show")
+        # Mock _renderer_alive so the predicate can return True without
+        # actually inspecting a real subprocess.
+        with patch.object(type(player), "_renderer_alive", return_value=True):
+            from datetime import datetime, timezone
+            d1 = DesiredState(
+                mode=PlaybackMode.PLAY, asset="Show", asset_type="slideshow",
+                timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            player._applied_desired = d1.model_copy(deep=True)
+            d2 = d1.model_copy(update={
+                "timestamp": datetime(2026, 1, 2, tzinfo=timezone.utc),
+            })
+            from shared.state import write_state
+            write_state(player.desired_path, d2)
+            with patch.object(player, "_start_slideshow") as start:
+                player.apply_desired()
+            start.assert_not_called()
+
+    def test_slideshow_to_slideshow_missing_manifest_clears_state(self, mpv_player):
+        """Transition from slideshow A to slideshow B; B's manifest is
+        missing. _start_slideshow must clear A's state before falling
+        back to splash so a stale slide-tick can't restart A."""
+        player, svc = mpv_player
+        self._seed_running_slideshow(player, name="A", timeout_id=77)
+        # No manifest for "B"
+        with patch.object(svc, "GLib") as glib:
+            player._start_slideshow("B", None)
+        glib.source_remove.assert_any_call(77)
+        assert player._slideshow is None
+        assert player._slideshow_manifest_digest is None
+        player._show_splash.assert_called_once()

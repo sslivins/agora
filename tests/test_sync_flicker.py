@@ -227,9 +227,13 @@ class TestPlayerSkipRebuild:
         player.pipeline = MagicMock()
         player._current_path = asset_path
         player._current_mtime = asset_path.stat().st_mtime
-        player.current_desired = DesiredState(
+        prior = DesiredState(
             mode=PlaybackMode.PLAY, asset="test.jpg", loop=True
         )
+        player.current_desired = prior
+        # Prove the renderer applied this exact desired previously so
+        # the equivalence short-circuit can fire.
+        player._applied_desired = prior.model_copy(deep=True)
 
         # Write desired.json with same content but new timestamp
         new_desired = DesiredState(
@@ -357,20 +361,32 @@ class TestPlayerSkipRebuild:
         # Should rebuild because mtime changed
         mock_gst.parse_launch.assert_called_once()
 
-    def test_splash_to_play_same_file_skips_rebuild(self, tmp_path):
-        """SPLASH→PLAY for the same image should skip pipeline rebuild."""
+    def test_splash_to_play_same_file_does_rebuild(self, tmp_path):
+        """SPLASH→PLAY for the same image MUST rebuild — the prior
+        renderer state was a splash, not the requested PLAY, so we
+        cannot claim the new desired is already satisfied just because
+        the file path happens to match.  This is the regression guard
+        for the ``apply_desired`` postcondition rewrite.
+        """
         player, mock_gst = self._make_player(tmp_path)
 
         asset_path = tmp_path / "assets" / "images" / "test.jpg"
+        # Make the file pass the >=8-byte header sanity check so we
+        # actually exercise the rebuild path, not the splash fallback.
+        asset_path.write_bytes(b"\x00" * 16)
 
         # Simulate splash playing test.jpg
         player.pipeline = MagicMock()
         player._current_path = asset_path
         player._current_mtime = asset_path.stat().st_mtime
-        player.current_desired = DesiredState(
+        prior_splash = DesiredState(
             mode=PlaybackMode.SPLASH,
             timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
+        player.current_desired = prior_splash
+        # Splash branch sets _applied_desired on success — replicate
+        # that so the new contract sees an honest prior state.
+        player._applied_desired = prior_splash.model_copy(deep=True)
 
         # CMS pushes PLAY for same file
         new_desired = DesiredState(
@@ -380,6 +396,9 @@ class TestPlayerSkipRebuild:
 
         player.apply_desired()
 
-        # Should NOT rebuild — same file already on screen
-        player.pipeline.set_state.assert_not_called()
+        # MUST rebuild — different mode means renderer must commit to
+        # PLAY (loop counter, watchdog, etc.).  The path-equality
+        # short-circuit that previously skipped this is the root cause
+        # of the slideshow-stuck bug.
+        assert mock_gst.parse_launch.call_count >= 1
         assert player.current_desired.mode == PlaybackMode.PLAY
