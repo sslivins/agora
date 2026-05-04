@@ -30,9 +30,24 @@ on:
         required: false
         default: false
         type: boolean
+  # Auto-build all boards when a stable release is published. The image is
+  # left tenant-agnostic (no CMS URL, no WiFi pre-config) — downstream CMS
+  # instances pull these via the catalog manifest and inject their own
+  # agora-fleet.env at provisioning time.
+  #
+  # We trigger on `prereleased` (not `released`) because create-release.yml
+  # publishes new releases as pre-releases. The publish-catalog job below
+  # promotes to a normal release at the end of a successful build.
+  release:
+    types: [prereleased]
 
 permissions:
   contents: write
+
+# Don't kick off two concurrent runs for the same release tag.
+concurrency:
+  group: build-image-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
 
 env:
   # Pin pi-gen to latest arm64 branch commit (Mar 17, 2026)
@@ -42,18 +57,36 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 180
+    # Skip if somehow a non-prerelease event slipped through (legacy release-published etc.).
+    # Manual builds (workflow_dispatch) always run.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
     strategy:
       fail-fast: false
       matrix:
-        board: ${{ github.event.inputs.board == 'all' && fromJSON('["zero2w","pi4","pi5"]') || fromJSON(format('["{0}"]', github.event.inputs.board)) }}
+        # On release events, always build all 3 boards.
+        # On workflow_dispatch, honor the input ('all' or single board).
+        board: ${{ (github.event_name == 'release' || github.event.inputs.board == 'all') && fromJSON('["zero2w","pi4","pi5"]') || fromJSON(format('["{0}"]', github.event.inputs.board)) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
 
       - name: Read version
         id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          version=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
+          set -euo pipefail
+          # On release events the tag (e.g. v1.11.32) is authoritative.
+          # On workflow_dispatch fall back to api/__init__.py.
+          if [ -n "${RELEASE_TAG}" ]; then
+            version="${RELEASE_TAG#v}"
+            echo "Source: release event tag (${RELEASE_TAG})"
+          else
+            version=$(python3 -c "exec(open('api/__init__.py').read()); print(__version__)")
+            echo "Source: api/__init__.py"
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building image for Agora v$version (${{ matrix.board }})"
 
@@ -161,15 +194,16 @@ jobs:
       - name: Find and rename built image
         id: find-image
         run: |
-          SRC_PATH=$(find /tmp/pi-gen/deploy -name '*.img.xz' -o -name '*.img.gz' -o -name '*.img.zip' -o -name '*.img' | head -1)
+          set -euo pipefail
+          SRC_PATH=$(find /tmp/pi-gen/deploy -name '*.img.xz' | head -1)
           if [ -z "$SRC_PATH" ]; then
-            echo "ERROR: No image found in /tmp/pi-gen/deploy/"
+            echo "::error::No .img.xz produced. pi-gen DEPLOY_COMPRESSION must be xz."
             ls -laR /tmp/pi-gen/deploy/ || true
             exit 1
           fi
           echo "Found image: $SRC_PATH"
 
-          # Rename to version-based name: agora-v0.9.0-pi-zero2w.img.xz
+          # Rename to version-based name: agora-v<ver>-<image-board>.img.xz
           VERSION="${{ steps.version.outputs.version }}"
           BOARD="${{ matrix.board }}"
           # Map board short names to image names
@@ -179,30 +213,232 @@ jobs:
             pi5)    IMAGE_BOARD="pi5" ;;
             *)      IMAGE_BOARD="$BOARD" ;;
           esac
-          EXT="${SRC_PATH#*.img}"
-          FINAL_NAME="agora-v${VERSION}-${IMAGE_BOARD}.img${EXT}"
+          FINAL_NAME="agora-v${VERSION}-${IMAGE_BOARD}.img.xz"
           FINAL_PATH="/tmp/pi-gen/deploy/${FINAL_NAME}"
           mv "$SRC_PATH" "$FINAL_PATH"
           echo "Renamed to: $FINAL_NAME"
           echo "image-path=$FINAL_PATH" >> "$GITHUB_OUTPUT"
           echo "image-board=$IMAGE_BOARD" >> "$GITHUB_OUTPUT"
 
+      - name: Compute SHA256 + manifest entry
+        id: manifest
+        env:
+          IMG: ${{ steps.find-image.outputs.image-path }}
+          IMAGE_BOARD: ${{ steps.find-image.outputs.image-board }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          COMPRESSED=$(stat -c '%s' "$IMG")
+          SHA256=$(sha256sum "$IMG" | awk '{print $1}')
+          BASENAME=$(basename "$IMG")
+          # Standard sidecar format (sha256sum -c compatible)
+          echo "${SHA256}  ${BASENAME}" > "${IMG}.sha256"
+
+          # Uncompressed size from xz metadata. `xz -l --robot` prints a
+          # tab-separated 'totals' row; field 5 is uncompressed bytes.
+          UNCOMPRESSED=$(xz -l --robot "$IMG" | awk -F '\t' '$1 == "totals" {print $5}')
+          if ! [[ "$UNCOMPRESSED" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not determine uncompressed size (got: '${UNCOMPRESSED}')"
+            xz -l --robot "$IMG"
+            exit 1
+          fi
+
+          # Generate per-variant manifest entry via Python (safe escaping).
+          mkdir -p /tmp/manifests
+          python3 - <<'PY' > "/tmp/manifests/${IMAGE_BOARD}.json"
+          import json, os
+          entry = {
+              "variant":          os.environ["IMAGE_BOARD"],
+              "version":          "v" + os.environ["VERSION"],
+              "filename":         os.environ["BASENAME"],
+              "sha256":           os.environ["SHA256"],
+              "compressedBytes":   int(os.environ["COMPRESSED"]),
+              "uncompressedBytes": int(os.environ["UNCOMPRESSED"]),
+          }
+          print(json.dumps(entry, indent=2, sort_keys=True))
+          PY
+          echo "--- manifest entry ---"
+          cat "/tmp/manifests/${IMAGE_BOARD}.json"
+        # Re-export env vars for the python heredoc above
+        # (already in `env:` block but listed again here to make explicit
+        # which variables the manifest script reads)
+
       - name: Upload image as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agora-v${{ steps.version.outputs.version }}-${{ steps.find-image.outputs.image-board }}
-          path: ${{ steps.find-image.outputs.image-path }}
-          retention-days: 30
+          name: image-${{ steps.find-image.outputs.image-board }}
+          path: |
+            ${{ steps.find-image.outputs.image-path }}
+            ${{ steps.find-image.outputs.image-path }}.sha256
+          retention-days: 14
 
-      - name: Attach image to latest release
+      - name: Upload manifest entry
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ steps.find-image.outputs.image-board }}
+          path: /tmp/manifests/${{ steps.find-image.outputs.image-board }}.json
+          retention-days: 14
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Validate the full variant set, generate catalog.json + SHA256SUMS,
+  # and upload everything (images, sidecars, catalog, sums) to the
+  # release in a single atomic step.
+  #
+  # Then promote the release: clear `prerelease`, mark `latest`. The
+  # release was created as prerelease by create-release.yml so consumers
+  # using /releases/latest/ see the previous stable release until the
+  # catalog is fully published. Graceful degradation; no broken-latest.
+  #
+  # Skipped on workflow_dispatch — manual builds produce artifacts only.
+  # ─────────────────────────────────────────────────────────────────────
+  publish-catalog:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Download all image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          path: /tmp/images
+          merge-multiple: true
+
+      - name: Download per-variant manifest entries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: /tmp/manifests
+          merge-multiple: true
+
+      - name: Generate and validate catalog.json + SHA256SUMS
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "=== inputs ==="
+          ls -la /tmp/images/ /tmp/manifests/
+
+          export BASE_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
+          export GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          python3 <<'PY'
+          import json, os, glob, sys, hashlib
+
+          tag           = os.environ["RELEASE_TAG"]
+          base_url      = os.environ["BASE_URL"]
+          generated_at  = os.environ["GENERATED_AT"]
+
+          EXPECTED_VARIANTS = {"pi-zero2w", "pi4", "pi5"}
+
+          variants = []
+          for path in sorted(glob.glob("/tmp/manifests/*.json")):
+              with open(path) as f:
+                  entry = json.load(f)
+              entry["url"] = f"{base_url}/{entry['filename']}"
+              variants.append(entry)
+
+          actual = {v["variant"] for v in variants}
+          if actual != EXPECTED_VARIANTS:
+              missing = EXPECTED_VARIANTS - actual
+              extra   = actual - EXPECTED_VARIANTS
+              print(f"::error::variant set mismatch. expected={sorted(EXPECTED_VARIANTS)} got={sorted(actual)} missing={sorted(missing)} extra={sorted(extra)}", file=sys.stderr)
+              sys.exit(1)
+
+          # Cross-check: actual image file SHA256 matches manifest claim,
+          # and the file is present on disk before we publish to release.
+          for v in variants:
+              img_path = os.path.join("/tmp/images", v["filename"])
+              if not os.path.exists(img_path):
+                  print(f"::error::image file missing: {img_path}", file=sys.stderr)
+                  sys.exit(1)
+              h = hashlib.sha256()
+              with open(img_path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              actual_sha = h.hexdigest()
+              if actual_sha != v["sha256"]:
+                  print(f"::error::sha256 mismatch for {v['filename']}: manifest={v['sha256']} actual={actual_sha}", file=sys.stderr)
+                  sys.exit(1)
+
+          # Stable canonical variant order.
+          variant_order = ["pi-zero2w", "pi4", "pi5"]
+          variants.sort(key=lambda v: variant_order.index(v["variant"]))
+
+          catalog = {
+              "schemaVersion": 1,
+              "generatedAt": generated_at,
+              "version": tag,
+              "variants": variants,
+          }
+          with open("/tmp/catalog.json", "w") as f:
+              json.dump(catalog, f, indent=2, sort_keys=True)
+              f.write("\n")
+          print("--- catalog.json ---")
+          print(json.dumps(catalog, indent=2, sort_keys=True))
+
+          with open("/tmp/SHA256SUMS", "w") as f:
+              for v in variants:
+                  f.write(f"{v['sha256']}  {v['filename']}\n")
+          PY
+
+          echo "--- SHA256SUMS ---"
+          cat /tmp/SHA256SUMS
+
+          # Independent verification using the standard tool.
+          (cd /tmp/images && sha256sum -c /tmp/SHA256SUMS)
+
+      - name: Refuse to overwrite existing release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          # Find the latest release
-          TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
-          if [ -n "$TAG" ]; then
-            echo "Uploading image to release $TAG"
-            gh release upload "$TAG" "${{ steps.find-image.outputs.image-path }}" --clobber
-          else
-            echo "No release found — image available as workflow artifact only"
+          set -euo pipefail
+          # Per-tag URLs are advertised as immutable. Fail fast if any
+          # asset we're about to upload already exists. To re-publish a
+          # release deliberately, manually delete the assets first.
+          existing=$(gh release view "${RELEASE_TAG}" --json assets -q '.assets[].name' || true)
+          conflicts=""
+          for fn in catalog.json SHA256SUMS $(ls /tmp/images/); do
+            if echo "$existing" | grep -qx "$fn"; then
+              conflicts="${conflicts}  - ${fn}\n"
+            fi
+          done
+          if [ -n "$conflicts" ]; then
+            printf "::error::Release ${RELEASE_TAG} already has assets we'd overwrite:\n%b\n" "$conflicts"
+            echo "::error::Delete them manually if you intend to re-publish: gh release delete-asset"
+            exit 1
           fi
+          echo "No existing-asset conflicts."
+
+      - name: Upload images + sidecars + catalog + SHA256SUMS to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "${RELEASE_TAG}" \
+            /tmp/images/* \
+            /tmp/catalog.json \
+            /tmp/SHA256SUMS
+
+      - name: Promote release out of pre-release (publish to /latest/)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "${RELEASE_TAG}" --prerelease=false --latest
+          echo ""
+          echo "Per-version manifest:"
+          echo "  https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/catalog.json"
+          echo ""
+          echo "Auto-resolving 'latest' pointer (consumed by tenant CMSes):"
+          echo "  https://github.com/${{ github.repository }}/releases/latest/download/catalog.json"
