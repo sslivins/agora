@@ -194,7 +194,7 @@ jobs:
           echo "📋 Generated changelog:"
           cat /tmp/release_body.md
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (as pre-release; build-image promotes)
         if: steps.check-branch.outputs.is-main == 'true'
         uses: softprops/action-gh-release@v2
         with:
@@ -202,6 +202,12 @@ jobs:
           name: Agora ${{ steps.version.outputs.tag }}
           body_path: /tmp/release_body.md
           files: build/*.deb
+          # Published as pre-release so /releases/latest/ resolves to the
+          # previous stable release until build-image.yml has uploaded
+          # all Pi images + catalog.json. The build-image workflow flips
+          # this to a normal release at the very end (publish-catalog
+          # job's "Promote release" step).
+          prerelease: true
 
   publish-apt:
     needs: build
