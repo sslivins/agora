@@ -229,15 +229,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          COMPRESSED=$(stat -c '%s' "$IMG")
-          SHA256=$(sha256sum "$IMG" | awk '{print $1}')
-          BASENAME=$(basename "$IMG")
+          export COMPRESSED=$(stat -c '%s' "$IMG")
+          export SHA256=$(sha256sum "$IMG" | awk '{print $1}')
+          export BASENAME=$(basename "$IMG")
           # Standard sidecar format (sha256sum -c compatible)
           echo "${SHA256}  ${BASENAME}" > "${IMG}.sha256"
 
           # Uncompressed size from xz metadata. `xz -l --robot` prints a
           # tab-separated 'totals' row; field 5 is uncompressed bytes.
-          UNCOMPRESSED=$(xz -l --robot "$IMG" | awk -F '\t' '$1 == "totals" {print $5}')
+          export UNCOMPRESSED=$(xz -l --robot "$IMG" | awk -F '\t' '$1 == "totals" {print $5}')
           if ! [[ "$UNCOMPRESSED" =~ ^[0-9]+$ ]]; then
             echo "::error::Could not determine uncompressed size (got: '${UNCOMPRESSED}')"
             xz -l --robot "$IMG"
