@@ -1,4 +1,8 @@
-"""Entry point for the Agora Player service."""
+"""Entry point for the Agora Player service.
+
+See ``docs/image-catalog.md`` for the release-driven base-image catalog
+publishing pipeline (consumed by agora-cms's Imager feature).
+"""
 
 import logging
 import os
