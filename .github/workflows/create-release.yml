@@ -208,6 +208,16 @@ jobs:
           # this to a normal release at the very end (publish-catalog
           # job's "Promote release" step).
           prerelease: true
+          # Use a PAT (VERSION_BUMP_TOKEN) so the `release` event fires
+          # downstream workflows. Releases created with the default
+          # GITHUB_TOKEN do NOT trigger `release: types: [prereleased]`
+          # listeners (GitHub blocks workflow recursion), which would
+          # break the chain into build-image.yml and prevent
+          # catalog.json / Pi images from being published. Falls back
+          # to GITHUB_TOKEN if the PAT is not configured (chain will
+          # not auto-trigger; build-image must then be dispatched
+          # manually).
+          token: ${{ secrets.VERSION_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
 
   publish-apt:
     needs: build
