@@ -13,27 +13,11 @@ on:
           - zero2w
           - pi4
           - pi5
-      cms_url:
-        description: 'Pre-configure CMS WebSocket URL (e.g. wss://cms.example.com/ws/device)'
-        required: false
-        type: string
-      wifi_ssid:
-        description: 'Pre-configure WiFi network name'
-        required: false
-        type: string
-      wifi_password:
-        description: 'WiFi password (required if wifi_ssid is set)'
-        required: false
-        type: string
-      disable_wifi:
-        description: 'Disable WiFi support entirely (ethernet-only image)'
-        required: false
-        default: false
-        type: boolean
   # Auto-build all boards when a stable release is published. The image is
-  # left tenant-agnostic (no CMS URL, no WiFi pre-config) — downstream CMS
-  # instances pull these via the catalog manifest and inject their own
-  # agora-fleet.env at provisioning time.
+  # fully tenant-agnostic — no CMS URL, no WiFi creds, no fleet identity
+  # baked in. The CMS imager stamps /boot/firmware/agora-fleet.env at
+  # imaging time with deployment-specific values, and
+  # agora-fleet-provision.sh (in the firmware) consumes it at first boot.
   #
   # We trigger on `prereleased` (not `released`) because create-release.yml
   # publishes new releases as pre-releases. The publish-catalog job below
@@ -105,11 +89,6 @@ jobs:
           git checkout ${{ env.PI_GEN_COMMIT }}
 
       - name: Configure pi-gen
-        env:
-          INPUT_CMS_URL: ${{ inputs.cms_url }}
-          INPUT_WIFI_SSID: ${{ inputs.wifi_ssid }}
-          INPUT_WIFI_PASS: ${{ inputs.wifi_password }}
-          INPUT_DISABLE_WIFI: ${{ inputs.disable_wifi }}
         run: |
           TIMEZONE="Etc/UTC"
 
@@ -146,26 +125,6 @@ jobs:
           ENABLE_CLOUD_INIT=0
           export AGORA_BOARD=${{ matrix.board }}
           EOF
-
-          # Append optional build-time configuration
-          # Custom AGORA_* variables must use 'export' so pi-gen passes them
-          # through to stage scripts (00-run.sh) that run as subprocesses.
-          # Values are single-quoted to handle special characters (e.g. apostrophes in SSIDs)
-          if [ -n "${INPUT_CMS_URL}" ]; then
-            ESCAPED=$(printf '%s' "${INPUT_CMS_URL}" | sed "s/'/'\\\\''/g")
-            echo "export AGORA_CMS_URL='${ESCAPED}'" >> /tmp/pi-gen/config
-          fi
-          if [ -n "${INPUT_WIFI_SSID}" ]; then
-            ESCAPED=$(printf '%s' "${INPUT_WIFI_SSID}" | sed "s/'/'\\\\''/g")
-            echo "export AGORA_WIFI_SSID='${ESCAPED}'" >> /tmp/pi-gen/config
-          fi
-          if [ -n "${INPUT_WIFI_PASS}" ]; then
-            ESCAPED=$(printf '%s' "${INPUT_WIFI_PASS}" | sed "s/'/'\\\\''/g")
-            echo "export AGORA_WIFI_PASS='${ESCAPED}'" >> /tmp/pi-gen/config
-          fi
-          if [ "${INPUT_DISABLE_WIFI}" = "true" ]; then
-            echo "export AGORA_DISABLE_WIFI=1" >> /tmp/pi-gen/config
-          fi
 
           # Remove leading whitespace from heredoc
           sed -i 's/^          //' /tmp/pi-gen/config

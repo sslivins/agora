@@ -3,10 +3,12 @@
 #
 # Build-time variables (set in pi-gen config):
 #   AGORA_BOARD        — zero2w, pi4, pi5 (default: zero2w)
-#   AGORA_CMS_URL      — Pre-configure CMS WebSocket URL (optional)
-#   AGORA_WIFI_SSID    — Pre-configure WiFi network (optional)
-#   AGORA_WIFI_PASS    — WiFi password (optional, required if SSID set)
-#   AGORA_DISABLE_WIFI — Set to 1 to disable WiFi entirely (optional)
+#
+# This stage is fully tenant-agnostic. All deployment-specific
+# configuration (CMS URL, fleet credentials, WiFi creds) is supplied
+# at first boot by /opt/agora/src/scripts/agora-fleet-provision.sh,
+# which consumes /boot/firmware/agora-fleet.env stamped by the CMS
+# imager. See scripts/agora-fleet-provision.sh for the recognized keys.
 
 on_chroot <<'CHEOF'
 
@@ -22,6 +24,8 @@ apt-get install -y agora
 touch /etc/cloud/cloud-init.disabled
 
 # ── Ensure device boots into captive portal (no provisioned flag) ──
+# The agora-fleet-provision script will write this flag at first boot
+# if a CMS URL is supplied via the boot drop-in.
 rm -f /opt/agora/persist/provisioned
 
 # ── Disable Pi OS first-boot wizard (user already configured by pi-gen) ──
@@ -86,28 +90,22 @@ esac
 mkdir -p "${ROOTFS_DIR}/opt/agora/persist"
 echo "${BOARD}" > "${ROOTFS_DIR}/opt/agora/persist/board"
 
-# ── WiFi configuration ──
-if [ "${AGORA_DISABLE_WIFI:-0}" = "1" ]; then
-  echo "Agora: WiFi disabled by build config"
-  # Write flag so provisioning service knows WiFi is disabled by policy
-  echo "1" > "${ROOTFS_DIR}/opt/agora/persist/wifi_disabled"
-  # Skip OOBE — the captive portal requires WiFi to function, so it's
-  # useless on a WiFi-disabled build.  The device will boot straight into
-  # player mode and either connect to a pre-configured CMS URL or wait
-  # for one to be set via SSH / local API.
-  echo "1" > "${ROOTFS_DIR}/opt/agora/persist/provisioned"
-  # Don't install the rfkill-unblock service — keep WiFi blocked
-else
-  # Unblock WiFi radio (Pi OS soft-blocks it via rfkill + NM state file)
-  mkdir -p "${ROOTFS_DIR}/var/lib/NetworkManager"
-  cat > "${ROOTFS_DIR}/var/lib/NetworkManager/NetworkManager.state" <<'NMSTATE'
+# ── Unblock WiFi radio at every boot ──
+# Pi OS soft-blocks wifi via rfkill + the NetworkManager state file.
+# Always install the unblock; agora-fleet-provision.sh decides at first
+# boot whether a wifi profile actually gets installed (based on CMS-supplied
+# creds and presence of wifi hardware). On wifi-less hardware this is a
+# harmless noop — `rfkill unblock wifi` does nothing when no wifi switch
+# exists.
+mkdir -p "${ROOTFS_DIR}/var/lib/NetworkManager"
+cat > "${ROOTFS_DIR}/var/lib/NetworkManager/NetworkManager.state" <<'NMSTATE'
 [main]
 NetworkingEnabled=true
 WirelessEnabled=true
 WWANEnabled=true
 NMSTATE
 
-  cat > "${ROOTFS_DIR}/etc/systemd/system/rfkill-unblock-wifi.service" <<'RFKSVC'
+cat > "${ROOTFS_DIR}/etc/systemd/system/rfkill-unblock-wifi.service" <<'RFKSVC'
 [Unit]
 Description=Unblock WiFi radio
 After=systemd-udevd.service systemd-rfkill.service
@@ -123,63 +121,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 RFKSVC
-  on_chroot <<'EOF'
+on_chroot <<'EOF'
 systemctl enable rfkill-unblock-wifi
 rm -f /var/lib/systemd/rfkill/*
 EOF
-
-  # Pre-configure WiFi credentials if provided
-  if [ -n "${AGORA_WIFI_SSID:-}" ]; then
-    echo "Agora: pre-configuring WiFi network '${AGORA_WIFI_SSID}'"
-    CON_FILE="${ROOTFS_DIR}/etc/NetworkManager/system-connections/wifi-${AGORA_WIFI_SSID}.nmconnection"
-    cat > "${CON_FILE}" <<WIFICFG
-[connection]
-id=wifi-${AGORA_WIFI_SSID}
-type=wifi
-autoconnect=true
-autoconnect-priority=10
-
-[wifi]
-ssid=${AGORA_WIFI_SSID}
-mode=infrastructure
-
-[wifi-security]
-key-mgmt=wpa-psk
-psk=${AGORA_WIFI_PASS:-}
-
-[ipv4]
-method=auto
-
-[ipv6]
-method=auto
-WIFICFG
-    chmod 600 "${CON_FILE}"
-  fi
-fi
-
-# ── CMS URL pre-configuration ──
-if [ -n "${AGORA_CMS_URL:-}" ]; then
-  echo "Agora: pre-configuring CMS URL '${AGORA_CMS_URL}'"
-  # Parse host:port from ws://host:port/path or wss://host:port/path
-  CMS_HOST=$(echo "${AGORA_CMS_URL}" | sed -E 's|^wss?://([^:/]+).*|\1|')
-  CMS_PORT=$(echo "${AGORA_CMS_URL}" | sed -E 's|^wss?://[^:]+:([0-9]+).*|\1|')
-  [ "${CMS_PORT}" = "${AGORA_CMS_URL}" ] && CMS_PORT="8080"
-
-  mkdir -p "${ROOTFS_DIR}/opt/agora/persist"
-  cat > "${ROOTFS_DIR}/opt/agora/persist/cms_config.json" <<CMSCFG
-{
-  "cms_host": "${CMS_HOST}",
-  "cms_port": ${CMS_PORT},
-  "cms_url": "${AGORA_CMS_URL}"
-}
-CMSCFG
-fi
-
-# ── Mark provisioned if both network and CMS are pre-configured ──
-# If WiFi creds or ethernet+CMS are baked in, skip OOBE on first boot
-if [ -n "${AGORA_CMS_URL:-}" ]; then
-  if [ -n "${AGORA_WIFI_SSID:-}" ] || [ "${BOARD}" = "pi4" ] || [ "${BOARD}" = "pi5" ]; then
-    echo "Agora: network + CMS pre-configured — marking as provisioned"
-    echo "1" > "${ROOTFS_DIR}/opt/agora/persist/provisioned"
-  fi
-fi
