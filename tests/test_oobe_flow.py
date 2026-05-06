@@ -189,7 +189,6 @@ class TestEthernetLinkWait:
         with patch.object(service, "is_provisioned", return_value=False), \
              patch.object(service, "get_ethernet_interface", return_value="eth0"), \
              patch.object(service, "is_ethernet_connected", side_effect=fake_is_ethernet_connected), \
-             patch.object(service, "is_wifi_disabled", return_value=True), \
              patch.object(service, "get_wifi_interface", return_value=None), \
              patch.object(service, "ProvisionDisplay", MagicMock()), \
              patch.object(service, "_wait_for_cms_adoption", AsyncMock(return_value="no_cms")), \
