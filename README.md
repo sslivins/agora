@@ -242,6 +242,17 @@ The **Create Release** workflow (Actions → Create Release → Run workflow) re
 
 Bump the version in `api/__init__.py` before running.
 
+#### Bumping the bundled chromium
+
+Pi images ship our HEVC-patched Chromium build from
+[sslivins/chromium-rpi-hevc](https://github.com/sslivins/chromium-rpi-hevc)
+(installed by `pi-gen/stage-agora/00-install-chromium-hevc/00-run.sh`)
+instead of stock Pi-OS chromium. To pick up a new chromium-rpi-hevc
+release, edit that script: bump `CHROMIUM_HEVC_TAG`,
+`CHROMIUM_HEVC_DEB_VERSION`, and recompute the four SHA256 digests.
+The script's header comment lists the exact `curl` + `sha256sum`
+commands to do this.
+
 ## Related
 
 - **[Agora CMS](https://github.com/sslivins/agora-cms)** — Central management server for scheduling and fleet control
