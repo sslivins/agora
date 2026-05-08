@@ -25,13 +25,13 @@
 #         "https://github.com/sslivins/chromium-rpi-hevc/releases/download/<TAG>/chromium-l10n_<VER>_all.deb"
 #       sha256sum /tmp/chromium-l10n.deb
 
-CHROMIUM_HEVC_TAG="v0.2.4"
+CHROMIUM_HEVC_TAG="v0.2.6"
 CHROMIUM_HEVC_DEB_VERSION="147.0.7727.116-1.deb13u1+rpt1"
 
 # SHA256 digests, pinned to detect mutated/replaced release assets.
 # Format: <sha256>  <filename>
 CHROMIUM_HEVC_DIGESTS="$(cat <<'DIGESTS'
-d8a817d3ea6d88d8c9d5eed3820869cfb2be99ff0adf0e31aa6e1e25085c6f7d  chromium_147.0.7727.116-1.deb13u1+rpt1_arm64.deb
+21827cece0a8900f4a0fad818d477c894ea56fd6aa3147754651da5a0eaff7db  chromium_147.0.7727.116-1.deb13u1+rpt1_arm64.deb
 400db4672bd42d005b519f6b29557462ae261a7ba25c37b447f545ea8f100cda  chromium-common_147.0.7727.116-1.deb13u1+rpt1_arm64.deb
 72c7ec30b0fded95a1feb77ef1b711c9040ecaf618894442cf460f1e7502f73a  chromium-sandbox_147.0.7727.116-1.deb13u1+rpt1_arm64.deb
 f16cfc35557e19715d8f62eb81dc631cb60b4e2d60129f9b76e15b968e650a85  chromium-l10n_147.0.7727.116-1.deb13u1+rpt1_all.deb
