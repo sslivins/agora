@@ -27,6 +27,7 @@ from shared.board import Board, alsa_device_string, alsa_device_string_gst, get_
 from hardware.display import PortStatus, get_display_probe  # noqa: E402
 from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
+from player.chromium_backend import ChromiumPlayer  # noqa: E402
 
 logger = logging.getLogger("agora.player")
 
@@ -157,6 +158,12 @@ class AgoraPlayer:
     _applied_desired: Optional[DesiredState] = None
     _current_url: Optional[str] = None
     _slideshow_manifest_digest: Optional[str] = None
+    # Chromium-shell demo backend. Off by default; instances opted in
+    # via AGORA_PLAYER_BACKEND=chromium populate _chromium_player.
+    # Declared at class scope so tests that bypass __init__ see safe
+    # defaults and the existing mpv code paths remain untouched.
+    _use_chromium_backend: bool = False
+    _chromium_player = None  # type: ignore[var-annotated]
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -195,6 +202,23 @@ class AgoraPlayer:
         self._board = get_board()
         self._display_probe = get_display_probe()
         self._player_backend = player_backend()
+
+        # ── Chromium player demo (opt-in, branch-only feature) ──
+        # When AGORA_PLAYER_BACKEND=chromium is set, image / video / splash
+        # / slideshow playback is routed through a persistent chromium
+        # kiosk + shell SPA instead of mpv. Streams and webpage assets
+        # keep their existing renderers (mpv-stream, cage+chromium-webpage)
+        # because the demo doesn't replace those. See player/shell/ and
+        # docs/chromium-player-demo.md.
+        self._use_chromium_backend = (
+            os.environ.get("AGORA_PLAYER_BACKEND") == "chromium"
+        )
+        self._chromium_player: Optional[ChromiumPlayer] = None
+        if self._use_chromium_backend:
+            self._chromium_player = ChromiumPlayer(
+                assets_dir=self.assets_dir,
+                on_event=self._on_chromium_event,
+            )
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self._mpv_process: Optional[subprocess.Popen] = None
@@ -411,6 +435,33 @@ class AgoraPlayer:
             ss["name"], ss["index"], len(ss["slides"]),
             slide_name, play_to_end,
         )
+
+        # Chromium backend (demo): route slide playback through the shell.
+        # For the demo, play_to_end videos are best-effort: we treat them
+        # as fixed-duration using the manifest hint (or a 30s fallback).
+        # Wiring shell 'ended' events back into _play_next_slide is a
+        # follow-up — see docs/chromium-player-demo.md.
+        if self._use_chromium_backend and self._chromium_player:
+            if is_video_slide:
+                # Slideshow videos loop within their duration; the
+                # next-slide timeout drives advance.
+                self._chromium_player.show_video(
+                    path, loop=True, muted=False,
+                )
+            else:
+                self._chromium_player.show_image(path)
+            duration_ms = int(slide.get("duration_ms") or 0)
+            if duration_ms <= 0:
+                duration_ms = 30000 if play_to_end else 10000
+            ss["timeout_id"] = GLib.timeout_add(
+                duration_ms, self._on_slide_timeout,
+            )
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=ss["name"],
+                started_at=datetime.now(timezone.utc),
+            )
+            return False
 
         if play_to_end:
             self._play_slide_to_end(slide, slide_name, path, ss)
@@ -2015,8 +2066,21 @@ class AgoraPlayer:
             is_video = splash.suffix.lower() == ".mp4"
             self._current_path = splash
             self._current_mtime = splash.stat().st_mtime
-            # Use mpv on Pi 4/5 for both video and image splash, GStreamer on Zero 2 W
-            if self._player_backend == "mpv":
+            if self._use_chromium_backend and self._chromium_player:
+                # Tear down anything mpv/gstreamer left behind, then
+                # show via the shell. Splash always goes through
+                # show_splash regardless of image/video — videos in
+                # the shell auto-play muted with autoplay-policy=
+                # no-user-gesture-required.
+                self._teardown()
+                if is_video:
+                    self._chromium_player.show_video(
+                        splash, loop=True, muted=True, transition="none",
+                    )
+                else:
+                    self._chromium_player.show_splash(splash)
+                logger.info("Showing splash via chromium shell: %s", splash.name)
+            elif self._player_backend == "mpv":
                 # Try seamless IPC switch first. Splash is always muted,
                 # regardless of whether the splash asset is an image or a
                 # video — only scheduled assets are allowed to produce audio.
@@ -2205,15 +2269,40 @@ class AgoraPlayer:
     def _pipeline_alive(self) -> bool:
         return self.pipeline is not None
 
+    def _chromium_alive(self) -> bool:
+        return bool(
+            self._use_chromium_backend
+            and self._chromium_player
+            and self._chromium_player.is_alive()
+        )
+
     def _renderer_alive(self) -> bool:
-        return self._mpv_alive() or self._sway_alive() or self._pipeline_alive()
+        return (
+            self._mpv_alive()
+            or self._sway_alive()
+            or self._pipeline_alive()
+            or self._chromium_alive()
+        )
+
+    def _on_chromium_event(self, payload: dict) -> None:
+        """Shell → daemon event callback (runs on the shell server thread).
+
+        Demo scope: log only. play_to_end accuracy is best-effort via the
+        GLib slide timeout — wiring 'ended' events into the slideshow
+        sequencer is a follow-up.
+        """
+        logger.debug("chromium shell event: %s", payload)
 
     def _is_showing_splash(self) -> bool:
         """True iff the current renderer state is the splash file."""
         splash = self._find_splash()
         if not splash or self._current_path != splash:
             return False
-        if not (self._mpv_alive() or self._pipeline_alive()):
+        if self._use_chromium_backend:
+            renderer_ok = self._chromium_alive()
+        else:
+            renderer_ok = self._mpv_alive() or self._pipeline_alive()
+        if not renderer_ok:
             return False
         # mtime invariant: if the splash file was replaced under us we
         # must rebuild so the new artwork is rendered.
@@ -2338,6 +2427,8 @@ class AgoraPlayer:
                     return False
             except OSError:
                 return False
+            if self._use_chromium_backend:
+                return self._chromium_alive()
             return self._mpv_alive() or self._pipeline_alive()
         return False
 
@@ -2462,6 +2553,31 @@ class AgoraPlayer:
             self._health_retries = 0
             is_video = path.suffix.lower() == ".mp4"
             self._loops_completed = 0
+
+            # Chromium backend (demo): route image/video through the shell.
+            # Streams stay on mpv; webpage assets stay on cage+chromium
+            # (handled by an earlier branch in this function).
+            if self._use_chromium_backend and self._chromium_player:
+                self._teardown()
+                self._current_path = path
+                try:
+                    self._current_mtime = path.stat().st_mtime
+                except OSError:
+                    self._current_mtime = None
+                if is_video:
+                    self._chromium_player.show_video(
+                        path, loop=bool(desired.loop), muted=False,
+                    )
+                else:
+                    self._chromium_player.show_image(path)
+                self._update_current(
+                    mode=PlaybackMode.PLAY,
+                    asset=desired.asset,
+                    started_at=datetime.now(timezone.utc),
+                )
+                if self._chromium_alive():
+                    self._applied_desired = desired.model_copy(deep=True)
+                return
 
             # Dispatch to mpv on Pi 4/5 (video and images), GStreamer on Zero 2 W
             if self._player_backend == "mpv":
@@ -2747,6 +2863,12 @@ class AgoraPlayer:
         # reconnects, so it's safe to run before the first mpv is spawned.
         self._start_mpv_event_listener()
 
+        # Chromium player demo: bring up shell server + kiosk early so
+        # the first apply_desired can hand off image/video without
+        # falling back to mpv.
+        if self._chromium_player:
+            self._chromium_player.start()
+
         # Apply initial state (may show splash, which can take seconds)
         self.apply_desired()
 
@@ -2769,6 +2891,8 @@ class AgoraPlayer:
             self._running = False
             self._stop_mpv_event_listener()
             self._teardown()
+            if self._chromium_player:
+                self._chromium_player.stop()
             self.loop.quit()
 
         signal.signal(signal.SIGTERM, on_shutdown)
@@ -2781,4 +2905,6 @@ class AgoraPlayer:
         finally:
             self._stop_mpv_event_listener()
             self._teardown()
+            if self._chromium_player:
+                self._chromium_player.stop()
             logger.info("Agora Player stopped")
