@@ -12,24 +12,28 @@ This module owns the format-level concerns documented in
 * :func:`verify_signature` — shells out to the ``minisign`` CLI through
   an injectable :data:`Runner` seam, trying each candidate pubkey in
   order until one verifies (or all fail).
-
-The sha256-manifest verification half lives in
-:func:`verify_bundle_manifest` and remains a stub until the
-``p2-stage-and-tryboot`` sibling lands — that's the PR where the
-tarball gets extracted into the staging directory, which is the
-prerequisite for walking the unpacked tree.
+* :func:`parse_bundle_meta` — parses the ``meta.json`` shipped at the
+  top of the extracted tarball into a typed :class:`BundleMeta`.
+* :func:`verify_bundle_manifest` — walks the extracted tarball and
+  asserts that every regular file under ``boot/`` and ``root/`` matches
+  the sha256 recorded in ``meta.sha256_manifest``.
 
 The :class:`SignatureVerifier` adapter in :mod:`os_updater.verifier`
 implements the ``Verifier`` protocol from :mod:`os_updater.service` and
 wires :func:`verify_signature` into the FSM between ``DOWNLOADING`` and
-``STAGED``.
+``STAGED``. The :class:`SlotStager` adapter in :mod:`os_updater.apply`
+extends the chain to ``TRYBOOT_PENDING`` and consumes both
+:func:`parse_bundle_meta` and :func:`verify_bundle_manifest`.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 
 # ── Exception hierarchy ────────────────────────────────────────────────────
@@ -252,23 +256,229 @@ def verify_signature(
     )
 
 
-# ── Manifest verification (stub — filled in by p2-stage-and-tryboot) ───────
+# ── Manifest parsing + verification ─────────────────────────────────────────
 
 
-def parse_bundle_meta(*args, **kwargs):  # noqa: D401 — stub
-    """Parse ``meta.json`` from an extracted bundle.
+#: Required keys in ``meta.json``. Unknown keys are silently ignored
+#: (forward-compat per docs/bundle-format.md §"Forward compatibility").
+_REQUIRED_META_KEYS: tuple[str, ...] = (
+    "version",
+    "min_from_version",
+    "schema_version",
+    "sha256_manifest",
+    "created_at",
+    "builder",
+)
 
-    Implemented by sibling todo ``p2-stage-and-tryboot`` — that's the
-    PR where the tarball gets extracted into the staging directory
-    (the verifier in this PR only handles the *signed-blob* half).
+#: Buffer size for streaming sha256 of bundle files. 1 MiB strikes a
+#: balance between memory pressure and per-call hashlib overhead.
+_HASH_CHUNK_BYTES: int = 1 << 20
+
+
+@dataclass(frozen=True)
+class BundleMeta:
+    """Parsed ``meta.json`` from an extracted bundle.
+
+    ``sha256_manifest`` is a mapping of *bundle-relative* posix paths
+    (e.g. ``"boot/cmdline.txt"``, ``"root/etc/os-release"``) to the
+    lowercase hex sha256 of each file's bytes.  ``meta.json`` is NOT in
+    its own manifest (self-referential); its integrity is covered by
+    the detached minisign signature on the outer ``bundle.tar.zst``.
     """
-    raise NotImplementedError("see sibling todo p2-stage-and-tryboot")
+
+    version: str
+    min_from_version: str
+    schema_version: int
+    sha256_manifest: Mapping[str, str]
+    created_at: str
+    builder: str
 
 
-def verify_bundle_manifest(*args, **kwargs):  # noqa: D401 — stub
-    """Verify each extracted file's sha256 against ``meta.json``.
+def parse_bundle_meta(meta_path: Path) -> BundleMeta:
+    """Parse ``meta.json`` into a typed :class:`BundleMeta`.
 
-    Implemented by sibling todo ``p2-stage-and-tryboot`` for the same
-    reason as :func:`parse_bundle_meta`.
+    Raises :class:`BundleIntegrityError` (which the service maps to
+    ``failed:bundle_invalid``) on any of:
+
+    * ``meta_path`` missing.
+    * JSON parse failure.
+    * Top-level value not a JSON object.
+    * Any of :data:`_REQUIRED_META_KEYS` missing.
+    * Field type mismatch (``version``/``min_from_version``/``created_at``/
+      ``builder`` must be ``str``; ``schema_version`` must be ``int``;
+      ``sha256_manifest`` must be ``dict[str, str]``).
+    * ``sha256_manifest`` contains a value that isn't a 64-char lowercase
+      hex string (basic shape check; full content comparison happens in
+      :func:`verify_bundle_manifest`).
+
+    Unknown keys are accepted and silently ignored — bundles produced
+    by a newer builder can ship extra metadata without bricking older
+    devices.
     """
-    raise NotImplementedError("see sibling todo p2-stage-and-tryboot")
+    meta_path = Path(meta_path)
+    try:
+        raw = meta_path.read_bytes()
+    except FileNotFoundError as exc:
+        raise BundleIntegrityError(
+            f"meta.json missing from extracted bundle at {meta_path}"
+        ) from exc
+    except OSError as exc:
+        raise BundleIntegrityError(
+            f"failed reading meta.json at {meta_path}: {exc}"
+        ) from exc
+
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BundleIntegrityError(
+            f"meta.json at {meta_path} is not valid JSON: {exc}"
+        ) from exc
+
+    if not isinstance(decoded, dict):
+        raise BundleIntegrityError(
+            f"meta.json at {meta_path} must be a JSON object, got {type(decoded).__name__}"
+        )
+
+    missing = [k for k in _REQUIRED_META_KEYS if k not in decoded]
+    if missing:
+        raise BundleIntegrityError(
+            f"meta.json at {meta_path} missing required keys: {missing!r}"
+        )
+
+    def _require(key: str, expected_type: type, type_label: str):
+        value = decoded[key]
+        if not isinstance(value, expected_type) or (
+            expected_type is int and isinstance(value, bool)
+        ):
+            raise BundleIntegrityError(
+                f"meta.json field {key!r} must be {type_label}, got {type(value).__name__}"
+            )
+        return value
+
+    version = _require("version", str, "string")
+    min_from_version = _require("min_from_version", str, "string")
+    schema_version = _require("schema_version", int, "int")
+    created_at = _require("created_at", str, "string")
+    builder = _require("builder", str, "string")
+    manifest_raw = _require("sha256_manifest", dict, "object")
+
+    sha256_manifest: dict[str, str] = {}
+    for relpath, digest in manifest_raw.items():
+        if not isinstance(relpath, str):
+            raise BundleIntegrityError(
+                f"meta.json sha256_manifest contains non-string key: {relpath!r}"
+            )
+        if not isinstance(digest, str):
+            raise BundleIntegrityError(
+                f"meta.json sha256_manifest entry {relpath!r} must be a hex string, "
+                f"got {type(digest).__name__}"
+            )
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise BundleIntegrityError(
+                f"meta.json sha256_manifest entry {relpath!r} is not a 64-char "
+                f"lowercase hex sha256: {digest!r}"
+            )
+        sha256_manifest[relpath] = digest
+
+    return BundleMeta(
+        version=version,
+        min_from_version=min_from_version,
+        schema_version=schema_version,
+        sha256_manifest=sha256_manifest,
+        created_at=created_at,
+        builder=builder,
+    )
+
+
+def _sha256_hex(path: Path, chunk_bytes: int = _HASH_CHUNK_BYTES) -> str:
+    """Return the lowercase-hex sha256 of ``path``'s bytes, streamed.
+
+    Reads in :data:`_HASH_CHUNK_BYTES` chunks so a 200 MB kernel image
+    doesn't load entirely into RAM on the Pi 5.
+    """
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            buf = fh.read(chunk_bytes)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+def verify_bundle_manifest(
+    extracted_root: Path,
+    meta: BundleMeta,
+    *,
+    sha256_fn: Callable[[Path], str] | None = None,
+) -> None:
+    """Hash every regular file under ``extracted_root`` and compare to ``meta``.
+
+    Walks ``extracted_root/boot`` and ``extracted_root/root`` (the two
+    directories the manifest covers per docs/bundle-format.md §"Bundle
+    layout") and, for each regular file, computes its sha256 and
+    asserts the entry in :attr:`BundleMeta.sha256_manifest` matches.
+
+    Symbolic links, directories, FIFOs, sockets, and device nodes are
+    skipped per docs/bundle-format.md §"Manifest scope: regular files
+    only".  ``meta.json`` itself is excluded from the manifest (covered
+    by the outer minisign signature) and is therefore not expected to
+    appear in the walk's results.
+
+    Raises :class:`BundleIntegrityError` (mapped to ``failed:bundle_invalid``)
+    on any of:
+
+    * ``extracted_root`` doesn't exist or isn't a directory.
+    * A path listed in the manifest is missing on disk.
+    * A regular file exists on disk but is absent from the manifest
+      (extra file — could indicate tampering).
+    * A file's computed sha256 doesn't match the manifest entry.
+
+    Parameters
+    ----------
+    sha256_fn:
+        Injection seam for tests — defaults to :func:`_sha256_hex`.
+        Receives a :class:`Path` and returns lowercase hex.
+    """
+    sha256_fn = sha256_fn or _sha256_hex
+    root = Path(extracted_root)
+    if not root.is_dir():
+        raise BundleIntegrityError(
+            f"extracted-bundle root missing or not a directory: {root}"
+        )
+
+    expected: dict[str, str] = dict(meta.sha256_manifest)
+    seen: set[str] = set()
+
+    for subdir in ("boot", "root"):
+        subdir_path = root / subdir
+        if not subdir_path.is_dir():
+            raise BundleIntegrityError(
+                f"extracted bundle missing required top-level dir: {subdir!r}"
+            )
+
+        for entry in sorted(subdir_path.rglob("*")):
+            if entry.is_symlink() or not entry.is_file():
+                continue
+
+            relpath = entry.relative_to(root).as_posix()
+            seen.add(relpath)
+
+            digest_expected = expected.get(relpath)
+            if digest_expected is None:
+                raise BundleIntegrityError(
+                    f"extra file on disk not listed in sha256_manifest: {relpath!r}"
+                )
+
+            digest_actual = sha256_fn(entry)
+            if digest_actual != digest_expected:
+                raise BundleIntegrityError(
+                    f"sha256 mismatch for {relpath!r}: "
+                    f"expected={digest_expected} actual={digest_actual}"
+                )
+
+    missing_on_disk = sorted(set(expected) - seen)
+    if missing_on_disk:
+        raise BundleIntegrityError(
+            f"files listed in sha256_manifest are missing on disk: {missing_on_disk!r}"
+        )
