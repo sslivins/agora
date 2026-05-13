@@ -255,13 +255,15 @@ fi
 
 # ── Enable and restart services ──
 systemctl daemon-reload
-systemctl enable agora-player agora-api agora-cms-client agora-provision agora-fleet-provision
+systemctl enable agora-watchdog agora-player agora-api agora-cms-client agora-provision agora-fleet-provision
 
 # ── Ensure dnsmasq does not start by default (managed by provision service) ──
 systemctl disable dnsmasq 2>/dev/null || true
 systemctl stop dnsmasq 2>/dev/null || true
 
 if [ "$1" = "configure" ]; then
+    # Watchdog first so it's armed before the heavier services start.
+    systemctl restart agora-watchdog || true
     systemctl restart agora-provision || true
     systemctl restart agora-player || true
     systemctl restart agora-api || true

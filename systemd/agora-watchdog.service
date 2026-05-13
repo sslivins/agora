@@ -1,0 +1,47 @@
+[Unit]
+Description=Agora hardware watchdog pinger
+Documentation=https://www.kernel.org/doc/Documentation/watchdog/watchdog-api.rst
+# Start as early as possible so the watchdog is armed before any of
+# the heavier agora-* services begin their startup work. If something
+# hangs the kernel during that startup, /dev/watchdog0 will fire a
+# hard reset instead of us discovering the brick when the device
+# fails to phone home.
+DefaultDependencies=yes
+Before=agora-api.service
+Before=agora-player.service
+Before=agora-cms-client.service
+Before=agora-provision.service
+Before=agora-fleet-provision.service
+# This is the failsafe of last resort; never block on networking.
+ConditionPathExists=/dev/watchdog0
+
+[Service]
+Type=simple
+# Runs as root (no User= directive) because /dev/watchdog0 requires
+# CAP_SYS_ADMIN to open and ioctl(WDIOC_SETTIMEOUT). Standard Pi 5
+# udev rules ship it as root:root 0600.
+ExecStart=/usr/bin/python3 -m agora_watchdog
+WorkingDirectory=/opt/agora/src
+Environment=PYTHONPATH=/opt/agora/src
+Environment=AGORA_BASE=/opt/agora
+
+# Aggressive restart: if the pinger dies for any reason, get it back
+# fast — the kernel watchdog is still counting down regardless of
+# whether our service is alive. Magic-close means each clean exit
+# disables the watchdog momentarily, so the 1s gap is the maximum
+# unprotected window between restart attempts.
+Restart=always
+RestartSec=1
+
+# Use SIGTERM so the python signal handler runs and writes the
+# magic-close byte ('V') before the fd closes. Without that, modern
+# kernels (NOWAYOUT) keep counting down and reset the device 12s after
+# `systemctl stop`.
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
