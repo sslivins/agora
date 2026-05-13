@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/agora-os-updater - thin shell wrapper around `python3 -m os_updater`.
+#
+# Installed by packaging/build-deb.sh so operators can run
+# `agora-os-updater stage <bundle> --target-version <ver> --confirm` directly
+# without having to know the PYTHONPATH dance. Mirrors agora-slot-mgr.
+#
+# Note: this is the *operator-facing* CLI. The systemd daemon
+# (agora-os-updater.service) invokes `python3 -m os_updater` directly with its
+# own EnvironmentFile, so this wrapper does not affect the daemon path.
+set -euo pipefail
+exec env \
+  PYTHONPATH=/opt/agora/src \
+  AGORA_BASE=/opt/agora \
+  python3 -m os_updater "$@"
