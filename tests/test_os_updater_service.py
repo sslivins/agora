@@ -74,6 +74,38 @@ class _BoomDownloader:
         raise RuntimeError("network is on fire")
 
 
+class _BoomSignatureVerifier:
+    """Raises :class:`BundleSignatureError` like a real verifier on a bad sig.
+
+    Exercises the typed-exception → ``signature_invalid`` short-code
+    mapping in ``OSUpdaterService._classify_failure``. Mirrors the
+    pattern used by :class:`_BoomDownloader` for unrelated failures.
+    """
+
+    async def run(self, payload, staging_dir):
+        # Local import keeps the test file's top-of-module imports
+        # focused on the service surface.
+        from os_updater.bundle import BundleSignatureError
+
+        raise BundleSignatureError("primary and recovery both rejected the sig")
+
+
+class _BoomIntegrityVerifier:
+    """Raises :class:`BundleIntegrityError` to exercise ``bundle_invalid``.
+
+    The integrity check actually runs from the stager (it needs an
+    extracted tree, which the verifier doesn't have), but the
+    classifier mapping lives on the service. Injecting this stub at
+    the verifier seam is the cheapest way to verify the mapping
+    without standing up the whole stager pipeline.
+    """
+
+    async def run(self, payload, staging_dir):
+        from os_updater.bundle import BundleIntegrityError
+
+        raise BundleIntegrityError("sha256 manifest mismatch")
+
+
 def _ok_dispatch(**overrides):
     base = {
         "type": "os_update_dispatch",
@@ -378,3 +410,63 @@ class TestHandleDispatchHappyPath:
         assert failed_events[0].reason == "error_RuntimeError"
         # Detail payload carries the exception message.
         assert "network is on fire" in failed_events[0].payload["detail"]
+
+    def test_signature_failure_maps_to_signature_invalid(self, tmp_path):
+        """BundleSignatureError → ``failed:signature_invalid`` (D54, p2-signature-verify).
+
+        Acceptance hook (plan §"Phase 2 — Acceptance"): "Tamper test:
+        hand-modify a single bundle byte; verify the device emits
+        failed:signature_invalid". The classifier is what produces the
+        stable wire string.
+        """
+        sink = _ListSink()
+        s = _build_service(
+            tmp_path,
+            current_version="1.0.0",
+            sink=sink,
+            verifier=_BoomSignatureVerifier(),
+        )
+
+        with pytest.raises(UpdaterError):
+            asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-sig")))
+
+        assert s.state.fsm is UpdaterFSMState.FAILED
+        assert s.state.last_failure_reason == "signature_invalid"
+
+        failed_events = [
+            e for e in sink.events if e.event_type is LifecycleEventType.FAILED
+        ]
+        assert len(failed_events) == 1
+        assert failed_events[0].reason == "signature_invalid"
+        assert "primary and recovery" in failed_events[0].payload["detail"]
+
+    def test_integrity_failure_maps_to_bundle_invalid(self, tmp_path):
+        """BundleIntegrityError → ``failed:bundle_invalid``.
+
+        Even though integrity verification will actually run inside
+        the stager once ``p2-stage-and-tryboot`` lands, the
+        classifier mapping is owned by the service. This test pins
+        the wire string now so a future stager that raises this type
+        gets the right short code with zero additional service-side
+        changes.
+        """
+        sink = _ListSink()
+        s = _build_service(
+            tmp_path,
+            current_version="1.0.0",
+            sink=sink,
+            verifier=_BoomIntegrityVerifier(),
+        )
+
+        with pytest.raises(UpdaterError):
+            asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-int")))
+
+        assert s.state.fsm is UpdaterFSMState.FAILED
+        assert s.state.last_failure_reason == "bundle_invalid"
+
+        failed_events = [
+            e for e in sink.events if e.event_type is LifecycleEventType.FAILED
+        ]
+        assert len(failed_events) == 1
+        assert failed_events[0].reason == "bundle_invalid"
+        assert "sha256 manifest mismatch" in failed_events[0].payload["detail"]
