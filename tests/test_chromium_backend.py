@@ -243,3 +243,55 @@ def test_start_without_fastapi_does_not_crash(monkeypatch, cp):
     # ready event is set in the ImportError branch.
     cp.start()
     cp.stop()
+
+
+# ── Routing (regression for /ws being shadowed by StaticFiles) ──────
+
+
+@pytest.fixture
+def routing_cp(tmp_path):
+    """ChromiumPlayer with BOTH assets_dir AND shell_dir under tmp_path,
+    so route-table tests don't trample the real player/shell/ files."""
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    shell = tmp_path / "shell"
+    shell.mkdir()
+    (shell / "index.html").write_text("<html>shell-root</html>", encoding="utf-8")
+    return ChromiumPlayer(assets_dir=assets, shell_dir=shell, spawn_chromium=False)
+
+
+def test_ws_route_is_not_shadowed_by_static_mount(routing_cp):
+    """Regression: /ws must dispatch to the WebSocket handler, not the
+    StaticFiles mount on "/". Previously route order put the catch-all
+    static mount first, which made every /ws upgrade hit StaticFiles
+    and fail with `assert scope["type"] == "http"`."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    client = TestClient(routing_cp._build_app())
+    with client.websocket_connect("/ws") as ws:
+        # If we got here, the WS handshake completed — i.e. /ws was
+        # routed to the websocket endpoint, not into StaticFiles.
+        assert ws is not None
+
+
+def test_assets_mount_is_not_shadowed_by_shell_mount(routing_cp):
+    """/assets/<file> must be served from assets_dir, not the shell dir."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    (routing_cp.assets_dir / "marker.txt").write_text("from-assets", encoding="utf-8")
+    client = TestClient(routing_cp._build_app())
+    resp = client.get("/assets/marker.txt")
+    assert resp.status_code == 200
+    assert resp.text == "from-assets"
+
+
+def test_root_serves_shell_index(routing_cp):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    client = TestClient(routing_cp._build_app())
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "shell-root" in resp.text

@@ -28,6 +28,18 @@ from typing import Callable, Optional
 
 logger = logging.getLogger("agora.player.chromium")
 
+# `from __future__ import annotations` makes all annotations strings, and
+# FastAPI resolves `WebSocket` annotations on closure-defined handlers via
+# `get_type_hints()`, which looks them up in the module's globals (NOT the
+# function's local scope). Without this top-level import the WS handler in
+# `_build_app` is misinterpreted as expecting a `websocket` query param,
+# and every connect closes with code 1008. The try/except keeps the module
+# importable on hosts that don't have fastapi installed (unit tests).
+try:
+    from fastapi import WebSocket as WebSocket  # noqa: F401
+except ImportError:
+    pass
+
 DEFAULT_BIND_HOST = "127.0.0.1"
 DEFAULT_BIND_PORT = 8780
 DEFAULT_TRANSITION_MS = 600
@@ -210,49 +222,26 @@ class ChromiumPlayer:
         except RuntimeError:
             logger.debug("ChromiumPlayer: event loop closed; dropping %s", command)
 
-    def _run_server_thread(self, ready: threading.Event) -> None:
-        """Thread target: build asyncio loop + uvicorn server + run."""
-        # Lazy import: keeps the rest of the player importable on
-        # environments without fastapi (e.g. unit tests that don't need
-        # the chromium backend).
-        try:
-            import uvicorn
-            from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-            from fastapi.responses import FileResponse
-            from fastapi.staticfiles import StaticFiles
-        except ImportError as e:
-            logger.error("ChromiumPlayer: fastapi/uvicorn not available: %s", e)
-            ready.set()
-            return
+    def _build_app(self):
+        """Construct the FastAPI app with WS + static routes in the right order.
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
-        self._stop_event = asyncio.Event()
-        # Bind the WS state to this loop now that one exists.
-        self._ws_state.bind(loop)
+        Route registration order matters: the WebSocket route at /ws MUST be
+        registered BEFORE the catch-all StaticFiles mount on "/", otherwise
+        Starlette dispatches the WS upgrade into StaticFiles which then
+        asserts scope["type"] == "http" and raises AssertionError on every
+        connection attempt. Likewise /assets must be mounted before the "/"
+        catch-all. Extracted as a method so tests can exercise routing
+        without spinning up uvicorn.
+        """
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi.responses import FileResponse
+        from fastapi.staticfiles import StaticFiles
 
         app = FastAPI(title="Agora Player Shell")
 
         @app.get("/")
         async def root() -> FileResponse:
             return FileResponse(self.shell_dir / "index.html")
-
-        # Shell static (player.js, player.css, etc.) served at /shell/.
-        # / itself is the bootstrap above so the relative URLs in index.html
-        # resolve naturally.
-        if self.shell_dir.is_dir():
-            app.mount(
-                "/", StaticFiles(directory=str(self.shell_dir), html=True),
-                name="shell",
-            )
-
-        # Asset library at /assets.
-        if self.assets_dir.is_dir():
-            app.mount(
-                "/assets", StaticFiles(directory=str(self.assets_dir)),
-                name="assets",
-            )
 
         @app.websocket("/ws")
         async def ws_endpoint(websocket: WebSocket) -> None:
@@ -277,6 +266,42 @@ class ChromiumPlayer:
                 logger.exception("shell ws unexpected error")
             finally:
                 await self._ws_state.detach(websocket)
+
+        if self.assets_dir.is_dir():
+            app.mount(
+                "/assets", StaticFiles(directory=str(self.assets_dir)),
+                name="assets",
+            )
+
+        if self.shell_dir.is_dir():
+            app.mount(
+                "/", StaticFiles(directory=str(self.shell_dir), html=True),
+                name="shell",
+            )
+
+        return app
+
+    def _run_server_thread(self, ready: threading.Event) -> None:
+        """Thread target: build asyncio loop + uvicorn server + run."""
+        # Lazy import uvicorn here, and fastapi inside _build_app, so the
+        # rest of the player stays importable on environments without
+        # those packages installed (e.g. unit tests that mock the backend).
+        try:
+            import uvicorn
+            import fastapi  # noqa: F401  (probe so we fail before _build_app)
+        except ImportError as e:
+            logger.error("ChromiumPlayer: fastapi/uvicorn not available: %s", e)
+            ready.set()
+            return
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._stop_event = asyncio.Event()
+        # Bind the WS state to this loop now that one exists.
+        self._ws_state.bind(loop)
+
+        app = self._build_app()
 
         config = uvicorn.Config(
             app,
