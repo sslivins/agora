@@ -77,6 +77,13 @@ cp "${REPO_ROOT}/systemd/agora-cms-client.service" "${BUILD_DIR}/etc/systemd/sys
 cp "${REPO_ROOT}/systemd/agora-provision.service" "${BUILD_DIR}/etc/systemd/system/"
 cp "${REPO_ROOT}/systemd/agora-fleet-provision.service" "${BUILD_DIR}/etc/systemd/system/"
 
+# ── CLI wrappers (thin shells that exec `python3 -m <pkg>` with the right PYTHONPATH) ──
+mkdir -p "${BUILD_DIR}/usr/local/sbin"
+for wrapper in "${REPO_ROOT}/packaging/cli-wrappers"/*; do
+    [[ -f "$wrapper" ]] || continue
+    install -m 755 "$wrapper" "${BUILD_DIR}/usr/local/sbin/$(basename "$wrapper")"
+done
+
 # ── Plymouth theme ──
 if [[ -f "${REPO_ROOT}/config/boot-splash.png" ]]; then
     cp "${REPO_ROOT}/config/boot-splash.png" \
