@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/agora-slot-mgr - thin shell wrapper around `python3 -m slot_mgr`.
+#
+# Installed by packaging/build-deb.sh so operators can run `agora-slot-mgr <verb>`
+# directly without having to know the PYTHONPATH dance.
+set -euo pipefail
+exec env \
+  PYTHONPATH=/opt/agora/src \
+  AGORA_BASE=/opt/agora \
+  python3 -m slot_mgr "$@"
