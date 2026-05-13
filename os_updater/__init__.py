@@ -56,9 +56,12 @@ from os_updater.bundle import (
     DEFAULT_RECOVERY_PUBKEY,
     BundleError,
     BundleIntegrityError,
+    BundleMeta,
     BundleSignatureError,
     Runner,
     discover_pubkeys,
+    parse_bundle_meta,
+    verify_bundle_manifest,
     verify_signature,
 )
 from os_updater.migrate import (
@@ -78,12 +81,19 @@ from os_updater.migrate import (
     write_schema_version,
 )
 from os_updater.verifier import SignatureVerifier
+from os_updater.apply import (
+    RsyncError,
+    SlotStager,
+    StagingError,
+    TrybootError,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "BundleError",
     "BundleIntegrityError",
+    "BundleMeta",
     "BundleSignatureError",
     "DEFAULT_MIGRATIONS_ROOT",
     "DEFAULT_OUTBOX_DIR",
@@ -106,10 +116,14 @@ __all__ = [
     "MigrationStep",
     "OSUpdaterService",
     "OutboxEventSink",
+    "RsyncError",
     "Runner",
     "SCHEMA_VERSION",
     "SchemaVersionError",
     "SignatureVerifier",
+    "SlotStager",
+    "StagingError",
+    "TrybootError",
     "UpdaterBusyError",
     "UpdaterError",
     "UpdaterFSMState",
@@ -122,11 +136,13 @@ __all__ = [
     "is_busy",
     "load_state",
     "next_event_id",
+    "parse_bundle_meta",
     "parse_dispatch_payload",
     "read_schema_version",
     "run_pending_migrations",
     "save_state",
     "transition",
+    "verify_bundle_manifest",
     "verify_signature",
     "write_schema_version",
 ]

@@ -675,6 +675,7 @@ class OSUpdaterService:
         # Local import avoids a top-of-file cycle with os_updater.bundle
         # (which imports nothing from this module today, but keep the
         # boundary one-way to stay tolerant of future drift).
+        from os_updater.apply import RsyncError, StagingError, TrybootError
         from os_updater.bundle import BundleIntegrityError, BundleSignatureError
         from os_updater.migrate import (
             MigrationDiscoveryError,
@@ -688,6 +689,14 @@ class OSUpdaterService:
             return "signature_invalid"
         if isinstance(exc, BundleIntegrityError):
             return "bundle_invalid"
+        # Order matters: RsyncError and TrybootError subclass
+        # StagingError, so the subclass arms must come first.
+        if isinstance(exc, RsyncError):
+            return "stage_rsync_failed"
+        if isinstance(exc, TrybootError):
+            return "tryboot_failed"
+        if isinstance(exc, StagingError):
+            return "stage_failed"
         # Order matters: MigrationFenceDenied / MigrationScriptError /
         # SchemaVersionError / MigrationDiscoveryError all subclass
         # MigrationError, so the specific arms must come first. The
