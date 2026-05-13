@@ -1,9 +1,12 @@
 #!/bin/bash
 set -e
 
-# Stop services before removal/upgrade
+# Stop services before removal/upgrade. Watchdog stops last so the
+# hardware failsafe is armed across the rest of the shutdown — and
+# its magic-close on SIGTERM disables the kernel watchdog cleanly.
 if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
     systemctl stop agora-cms-client || true
     systemctl stop agora-api || true
     systemctl stop agora-player || true
+    systemctl stop agora-watchdog || true
 fi

@@ -71,11 +71,14 @@ if [[ -f "${REPO_ROOT}/config/boot-splash.png" ]]; then
 fi
 
 # ── Systemd units ──
-cp "${REPO_ROOT}/systemd/agora-api.service" "${BUILD_DIR}/etc/systemd/system/"
-cp "${REPO_ROOT}/systemd/agora-player.service" "${BUILD_DIR}/etc/systemd/system/"
-cp "${REPO_ROOT}/systemd/agora-cms-client.service" "${BUILD_DIR}/etc/systemd/system/"
-cp "${REPO_ROOT}/systemd/agora-provision.service" "${BUILD_DIR}/etc/systemd/system/"
-cp "${REPO_ROOT}/systemd/agora-fleet-provision.service" "${BUILD_DIR}/etc/systemd/system/"
+# Auto-discover every *.service file under systemd/. Using a glob avoids the
+# class of bug where a new unit (like agora-watchdog.service for the watchdog
+# pinger) gets added to the repo but forgotten in this list — matches the
+# auto-discovery pattern used for source dirs and CLI wrappers above.
+for unit in "${REPO_ROOT}/systemd/"*.service; do
+    [[ -f "$unit" ]] || continue
+    install -m 644 "$unit" "${BUILD_DIR}/etc/systemd/system/$(basename "$unit")"
+done
 
 # ── CLI wrappers (thin shells that exec `python3 -m <pkg>` with the right PYTHONPATH) ──
 mkdir -p "${BUILD_DIR}/usr/local/sbin"
