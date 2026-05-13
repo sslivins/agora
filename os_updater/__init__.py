@@ -50,11 +50,29 @@ from os_updater.service import (
     UpdaterError,
     VersionFloorError,
 )
+from os_updater.bundle import (
+    DEFAULT_PRIMARY_PUBKEY,
+    DEFAULT_PUBKEY_SEARCH_DIR,
+    DEFAULT_RECOVERY_PUBKEY,
+    BundleError,
+    BundleIntegrityError,
+    BundleSignatureError,
+    Runner,
+    discover_pubkeys,
+    verify_signature,
+)
+from os_updater.verifier import SignatureVerifier
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "BundleError",
+    "BundleIntegrityError",
+    "BundleSignatureError",
     "DEFAULT_OUTBOX_DIR",
+    "DEFAULT_PRIMARY_PUBKEY",
+    "DEFAULT_PUBKEY_SEARCH_DIR",
+    "DEFAULT_RECOVERY_PUBKEY",
     "DEFAULT_STAGING_ROOT",
     "DEFAULT_STATE_PATH",
     "DispatchPayload",
@@ -63,13 +81,16 @@ __all__ = [
     "LifecycleEventType",
     "OSUpdaterService",
     "OutboxEventSink",
+    "Runner",
     "SCHEMA_VERSION",
+    "SignatureVerifier",
     "UpdaterBusyError",
     "UpdaterError",
     "UpdaterFSMState",
     "UpdaterState",
     "VersionFloorError",
     "__version__",
+    "discover_pubkeys",
     "emit_event",
     "is_busy",
     "load_state",
@@ -77,4 +98,5 @@ __all__ = [
     "parse_dispatch_payload",
     "save_state",
     "transition",
+    "verify_signature",
 ]

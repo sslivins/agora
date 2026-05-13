@@ -615,10 +615,24 @@ class OSUpdaterService:
 
     @staticmethod
     def _classify_failure(exc: BaseException) -> str:
-        """Map an exception type to a ``failed:<reason>`` short code."""
+        """Map an exception type to a ``failed:<reason>`` short code.
+
+        Typed bundle exceptions get pinned short codes so the CMS sees
+        the stable wire strings documented in ``docs/bundle-format.md``
+        and plan.md (``signature_invalid``, ``bundle_invalid``).
+        Unknown exception types still get a generic ``error_<TypeName>``
+        bucket so nothing slips through silently.
+        """
+
+        # Local import avoids a top-of-file cycle with os_updater.bundle
+        # (which imports nothing from this module today, but keep the
+        # boundary one-way to stay tolerant of future drift).
+        from os_updater.bundle import BundleIntegrityError, BundleSignatureError
+
+        if isinstance(exc, BundleSignatureError):
+            return "signature_invalid"
+        if isinstance(exc, BundleIntegrityError):
+            return "bundle_invalid"
 
         name = type(exc).__name__
-        # Sibling todos will define their own exception types; until then,
-        # use a generic ``error_<TypeName>`` so the CMS still has something
-        # to group on.
         return f"error_{name}"
