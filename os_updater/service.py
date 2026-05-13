@@ -66,6 +66,7 @@ from os_updater.events import (
     OutboxEventSink,
     emit_event,
 )
+from os_updater.migrate import ForwardMigrator
 from os_updater.state import (
     DEFAULT_STATE_PATH,
     UpdaterFSMState,
@@ -233,12 +234,6 @@ class _DefaultStager:
         raise NotImplementedError("stager not wired; see p2-stage-and-tryboot")
 
 
-@dataclass
-class _DefaultMigrator:
-    async def run(self) -> None:
-        raise NotImplementedError("migrator not wired; see p2-forward-migration")
-
-
 def _stub_current_version() -> str:
     raise NotImplementedError(
         "current_version_provider not wired; service.py requires injection"
@@ -291,7 +286,7 @@ class OSUpdaterService:
         self.downloader: Downloader = downloader or _DefaultDownloader()
         self.verifier: Verifier = verifier or _DefaultVerifier()
         self.stager: Stager = stager or _DefaultStager()
-        self.migrator: Migrator = migrator or _DefaultMigrator()
+        self.migrator: Migrator = migrator or ForwardMigrator()
         self.state_path = state_path
         self.staging_root = staging_root
         self.state: UpdaterState = load_state(self.state_path)
@@ -458,6 +453,59 @@ class OSUpdaterService:
                 state_path=self.state_path,
             )
             raise UpdaterError(reason) from exc
+
+    async def continue_after_promote(self) -> None:
+        """Run forward migrations after a successful tryboot promote.
+
+        Invoked by ``agora-slot-mgr`` (or its agent equivalent) after the
+        FSM has been advanced to ``PROMOTED_PENDING_MIGRATION``. Drives
+        ``MIGRATING -> IDLE`` on success, ``MIGRATING -> FAILED`` on any
+        migrator exception.  The fence check inside the migrator is what
+        gates "promote actually completed"; on fence-denied we land in
+        ``FAILED`` with reason ``migration_fence_denied`` and the caller
+        is expected to retry on the next dispatch (per plan #22 / Phase 1
+        forward-migration fence).
+
+        Raises :class:`UpdaterError` if called outside
+        ``PROMOTED_PENDING_MIGRATION``; the FSM is left untouched in
+        that case so the caller can decide how to recover.
+        """
+
+        if self.state.fsm is not UpdaterFSMState.PROMOTED_PENDING_MIGRATION:
+            raise UpdaterError(
+                f"continue_after_promote called in state {self.state.fsm.value!r}; "
+                "expected promoted_pending_migration"
+            )
+
+        transition(self.state, UpdaterFSMState.MIGRATING)
+        save_state(self.state, path=self.state_path)
+
+        try:
+            await self.migrator.run()
+        except Exception as exc:
+            log.exception(
+                "forward migration failed in state %s", self.state.fsm.value
+            )
+            reason = self._classify_failure(exc)
+            transition(self.state, UpdaterFSMState.FAILED, reason=reason)
+            emit_event(
+                self.state,
+                LifecycleEventType.FAILED,
+                self.event_sink,
+                reason=reason,
+                payload={"detail": str(exc)},
+                state_path=self.state_path,
+            )
+            raise UpdaterError(reason) from exc
+
+        transition(self.state, UpdaterFSMState.IDLE)
+        save_state(self.state, path=self.state_path)
+        emit_event(
+            self.state,
+            LifecycleEventType.MIGRATION_COMPLETE,
+            self.event_sink,
+            state_path=self.state_path,
+        )
 
     async def run(self) -> None:
         """Main async run loop.
@@ -628,11 +676,33 @@ class OSUpdaterService:
         # (which imports nothing from this module today, but keep the
         # boundary one-way to stay tolerant of future drift).
         from os_updater.bundle import BundleIntegrityError, BundleSignatureError
+        from os_updater.migrate import (
+            MigrationDiscoveryError,
+            MigrationError,
+            MigrationFenceDenied,
+            MigrationScriptError,
+            SchemaVersionError,
+        )
 
         if isinstance(exc, BundleSignatureError):
             return "signature_invalid"
         if isinstance(exc, BundleIntegrityError):
             return "bundle_invalid"
+        # Order matters: MigrationFenceDenied / MigrationScriptError /
+        # SchemaVersionError / MigrationDiscoveryError all subclass
+        # MigrationError, so the specific arms must come first. The
+        # generic MigrationError arm catches anything new without
+        # falling through to the unknown-error bucket.
+        if isinstance(exc, MigrationFenceDenied):
+            return "migration_fence_denied"
+        if isinstance(exc, MigrationScriptError):
+            return "migration_script_failed"
+        if isinstance(exc, SchemaVersionError):
+            return "migration_schema_version_invalid"
+        if isinstance(exc, MigrationDiscoveryError):
+            return "migration_discovery_failed"
+        if isinstance(exc, MigrationError):
+            return "migration_failed"
 
         name = type(exc).__name__
         return f"error_{name}"

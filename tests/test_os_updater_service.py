@@ -470,3 +470,171 @@ class TestHandleDispatchHappyPath:
         assert len(failed_events) == 1
         assert failed_events[0].reason == "bundle_invalid"
         assert "sha256 manifest mismatch" in failed_events[0].payload["detail"]
+
+
+# ── continue_after_promote ─────────────────────────────────────────────────
+
+
+class _BoomMigrator:
+    """Migrator stub whose :meth:`run` raises a configurable exception.
+
+    Used to drive the failure arms of
+    :meth:`OSUpdaterService.continue_after_promote` — each migration-
+    specific subclass exercises a distinct ``_classify_failure`` arm
+    (plan #22 wire-code coverage).
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    async def run(self) -> None:
+        self.calls += 1
+        raise self._exc
+
+
+class _RecordingMigrator:
+    """Migrator stub that records call count without raising."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self) -> None:
+        self.calls += 1
+
+
+def _force_state(service, fsm: UpdaterFSMState) -> None:
+    """Place the service's FSM into ``fsm`` and persist it.
+
+    ``LEGAL_TRANSITIONS`` rejects direct jumps from ``IDLE`` into
+    ``PROMOTED_PENDING_MIGRATION`` (the legal route is through the
+    tryboot pipeline), but for unit-testing the post-promote handoff
+    we need to start there. Direct mutation + save matches the
+    summary's documented approach.
+    """
+
+    service.state.fsm = fsm
+    save_state(service.state, path=service.state_path)
+
+
+class TestContinueAfterPromote:
+    """Acceptance for the post-promote forward-migration entry point.
+
+    Plan §"Phase 2": ``continue_after_promote`` is invoked by
+    ``agora-slot-mgr`` after a successful promote. Drives ``MIGRATING
+    -> IDLE`` on success and ``MIGRATING -> FAILED`` with a
+    migration-specific wire code on failure (plan #22 + Phase 1
+    forward-migration fence).
+    """
+
+    def test_happy_path_migrates_and_returns_to_idle(self, tmp_path):
+        migrator = _RecordingMigrator()
+        sink = _ListSink()
+        s = _build_service(tmp_path, migrator=migrator, sink=sink)
+        _force_state(s, UpdaterFSMState.PROMOTED_PENDING_MIGRATION)
+
+        _run(s.continue_after_promote())
+
+        assert migrator.calls == 1
+        assert s.state.fsm is UpdaterFSMState.IDLE
+
+        reloaded = load_state(path=s.state_path)
+        assert reloaded.fsm is UpdaterFSMState.IDLE
+
+        complete = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.MIGRATION_COMPLETE
+        ]
+        assert len(complete) == 1
+        failed = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.FAILED
+        ]
+        assert failed == []
+
+    def test_fence_denied_maps_to_migration_fence_denied(self, tmp_path):
+        from migration_fence import FenceStatus
+        from os_updater.migrate import MigrationFenceDenied
+
+        denied = FenceStatus(
+            allowed=False,
+            reason="sentinel absent",
+            allowed_slot=None,
+            running_slot=1,
+            sentinel_present=False,
+        )
+        migrator = _BoomMigrator(MigrationFenceDenied(denied))
+        sink = _ListSink()
+        s = _build_service(tmp_path, migrator=migrator, sink=sink)
+        _force_state(s, UpdaterFSMState.PROMOTED_PENDING_MIGRATION)
+
+        with pytest.raises(UpdaterError, match="migration_fence_denied"):
+            _run(s.continue_after_promote())
+
+        assert s.state.fsm is UpdaterFSMState.FAILED
+        assert s.state.last_failure_reason == "migration_fence_denied"
+
+        failed = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.FAILED
+        ]
+        assert len(failed) == 1
+        assert failed[0].reason == "migration_fence_denied"
+        assert "sentinel absent" in failed[0].payload["detail"]
+
+    def test_script_failure_maps_to_migration_script_failed(self, tmp_path):
+        from os_updater.migrate import MigrationScriptError, MigrationStep
+
+        step = MigrationStep(
+            version=2, name="002_demo", path=tmp_path / "002_demo.sh"
+        )
+        migrator = _BoomMigrator(
+            MigrationScriptError(
+                step, returncode=7, stdout="boom\n", stderr="bad thing\n"
+            )
+        )
+        sink = _ListSink()
+        s = _build_service(tmp_path, migrator=migrator, sink=sink)
+        _force_state(s, UpdaterFSMState.PROMOTED_PENDING_MIGRATION)
+
+        with pytest.raises(UpdaterError, match="migration_script_failed"):
+            _run(s.continue_after_promote())
+
+        assert s.state.fsm is UpdaterFSMState.FAILED
+        assert s.state.last_failure_reason == "migration_script_failed"
+
+        failed = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.FAILED
+        ]
+        assert len(failed) == 1
+        assert failed[0].reason == "migration_script_failed"
+
+    def test_generic_migration_error_maps_to_migration_failed(self, tmp_path):
+        from os_updater.migrate import MigrationError
+
+        migrator = _BoomMigrator(MigrationError("something else broke"))
+        sink = _ListSink()
+        s = _build_service(tmp_path, migrator=migrator, sink=sink)
+        _force_state(s, UpdaterFSMState.PROMOTED_PENDING_MIGRATION)
+
+        with pytest.raises(UpdaterError, match="migration_failed"):
+            _run(s.continue_after_promote())
+
+        assert s.state.fsm is UpdaterFSMState.FAILED
+        assert s.state.last_failure_reason == "migration_failed"
+
+    def test_wrong_state_raises_without_touching_fsm(self, tmp_path):
+        migrator = _RecordingMigrator()
+        sink = _ListSink()
+        s = _build_service(tmp_path, migrator=migrator, sink=sink)
+        assert s.state.fsm is UpdaterFSMState.IDLE
+
+        with pytest.raises(
+            UpdaterError, match="expected promoted_pending_migration"
+        ):
+            _run(s.continue_after_promote())
+
+        assert s.state.fsm is UpdaterFSMState.IDLE
+        assert migrator.calls == 0
+        assert sink.events == []
