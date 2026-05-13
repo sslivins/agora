@@ -33,11 +33,16 @@ import pytest
 from os_updater.apply import (
     DEFAULT_BOOT_MOUNT_SLOT_A,
     DEFAULT_BOOT_MOUNT_SLOT_B,
+    FLEET_STATE_COPY_IF_PRESENT,
+    FLEET_STATE_REQUIRED,
+    FleetStateMissingError,
+    FleetStateWriteError,
     RsyncError,
     SlotStager,
     StagingError,
     TrybootError,
     boot_mount_for_slot,
+    copy_fleet_state,
     decompress_and_extract,
     other_slot,
     rsync_tree,
@@ -374,6 +379,39 @@ class _FakeSlotStatus:
         self.running_slot = running_slot
 
 
+def _seed_fake_slot_a(slot_a_root: Path) -> None:
+    """Populate ``slot_a_root`` with every :data:`FLEET_STATE_REQUIRED`
+    fixture plus one ``copy_if_present`` optional file.
+
+    Mirrors a real provisioned device's slot A so fleet-state copy
+    sees a satisfied required set. Tests that want to exercise
+    "missing required" / "missing optional" paths call ``unlink``
+    on individual files after this seeds.
+    """
+    slot_a_root.mkdir(parents=True, exist_ok=True)
+
+    files = {
+        "etc/agora/environment": b"AGORA_FLEET_ID=test-fleet\n",
+        "opt/agora/persist/cms_config.json": b'{"cms_url":"https://cms.example"}',
+        "opt/agora/persist/provisioned": b"1\n",
+        "etc/machine-id": b"00112233445566778899aabbccddeeff\n",
+        # Two ssh host keys so the glob matches >= 1 (and exercises multi-match).
+        # Content is opaque test bytes (apply is a byte-for-byte cp; the contents
+        # are never inspected). Avoid real SSH-key headers so secret-scanners
+        # don't flag the fixture.
+        "etc/ssh/ssh_host_rsa_key": b"fake-rsa-key-bytes-for-test\n",
+        "etc/ssh/ssh_host_ed25519_key": b"fake-ed25519-key-bytes-for-test\n",
+        # One optional file, matching the wifi-*.nmconnection glob.
+        "etc/NetworkManager/system-connections/wifi-home.nmconnection": (
+            b"[connection]\nid=home\n"
+        ),
+    }
+    for rel, content in files.items():
+        path = slot_a_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
 def _make_stager(
     tmp_path: Path,
     *,
@@ -381,8 +419,17 @@ def _make_stager(
     running_slot=1,
     trigger_tryboot_exc: Exception | None = None,
     trigger_tryboot_calls: list[int] | None = None,
+    seed_fleet_state: bool = True,
 ) -> SlotStager:
-    """Build a SlotStager pointed at ``tmp_path`` with injected seams."""
+    """Build a SlotStager pointed at ``tmp_path`` with injected seams.
+
+    By default seeds a fake slot-A rootfs under ``tmp_path/slot-a-root``
+    populated with every :data:`FLEET_STATE_REQUIRED` fixture so the
+    full happy-path pipeline runs end-to-end. Pass
+    ``seed_fleet_state=False`` to leave slot A empty for "missing
+    required" tests; pass a custom seeded ``slot_a_root`` to construct
+    SlotStager directly otherwise.
+    """
     if runner is None:
         runner = _FakeRunner()
 
@@ -404,6 +451,12 @@ def _make_stager(
     slot_b_boot.mkdir()
     inactive_root.mkdir()
 
+    slot_a_root = tmp_path / "slot-a-root"
+    if seed_fleet_state:
+        _seed_fake_slot_a(slot_a_root)
+    else:
+        slot_a_root.mkdir()
+
     return SlotStager(
         runner=runner,
         boot_mount_slot_a=slot_a_boot,
@@ -411,6 +464,7 @@ def _make_stager(
         inactive_root_mount=inactive_root,
         slot_state_fn=fake_slot_state,
         trigger_tryboot_fn=fake_trigger_tryboot,
+        slot_a_root=slot_a_root,
     )
 
 
@@ -445,14 +499,25 @@ class TestSlotStagerHappyPath:
 
         # Tryboot fired with the inactive slot.
         assert tryboot_calls == [2]
-        # zstd, tar, rsync, rsync — 4 subprocess calls.
+        # zstd, tar, rsync, rsync, then cp -a once per fleet-state file.
         heads = [c[0] for c in runner.calls]
-        assert heads == ["zstd", "tar", "rsync", "rsync"]
+        assert heads[:4] == ["zstd", "tar", "rsync", "rsync"]
+        assert heads[4:] and all(h == "cp" for h in heads[4:]), (
+            f"expected only cp calls after the rsyncs, got {heads}"
+        )
+        # 4 required literals + 2 ssh host keys + 1 optional wifi nmconnection
+        # from _seed_fake_slot_a == 7 cp invocations.
+        assert len(heads[4:]) == 7
         # First rsync writes the slot-B boot mount.
         rsync_calls = [c for c in runner.calls if c[0] == "rsync"]
         assert str(stager.boot_mount_slot_b) in rsync_calls[0][-1]
         # Second rsync writes inactive-root.
         assert str(stager.inactive_root_mount) in rsync_calls[1][-1]
+        # Every cp's destination must be inside the inactive_root_mount —
+        # otherwise we're writing identity files into the running slot.
+        cp_calls = [c for c in runner.calls if c[0] == "cp"]
+        for cp in cp_calls:
+            assert str(stager.inactive_root_mount) in cp[-1]
 
     def test_full_pipeline_running_slot_2(self, tmp_path):
         """Running slot 2 ⇒ tryboot must target slot 1 ⇒ rsync hits
@@ -627,3 +692,156 @@ class TestSlotStagerErrors:
         stager = _make_stager(tmp_path, running_slot=1)
         with pytest.raises(BundleIntegrityError, match="missing required top-level"):
             stager._stage_sync(_make_payload(), staging_dir)
+
+
+# ── copy_fleet_state (D60) ─────────────────────────────────────────────────
+
+
+class TestCopyFleetState:
+    """Apply-time fleet-state allowlist copy from running rootfs (slot A)
+    into the freshly-unpacked inactive slot.
+
+    These tests exercise the function in isolation; the SlotStager
+    integration is covered by :class:`TestSlotStagerFleetStateIntegration`
+    below.
+    """
+
+    def test_happy_path_copies_required_and_optional(self, tmp_path):
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        runner = _FakeRunner()
+
+        copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        cps = [c for c in runner.calls if c[0] == "cp"]
+        # 4 required literals + 2 ssh host keys + 1 optional wifi conn = 7
+        assert len(cps) == 7, f"expected 7 cp invocations, got {len(cps)}: {cps}"
+        # Every cp call uses cp -a (preserve mode/owner/timestamps).
+        for cp in cps:
+            assert cp[1] == "-a", f"expected cp -a, got {cp}"
+        # Destinations must all live under slot_b.
+        for cp in cps:
+            assert cp[-1].startswith(str(slot_b))
+
+    def test_missing_required_raises_fleet_state_missing_error(self, tmp_path):
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        # Yank one of the required literal files.
+        (slot_a / "etc/agora/environment").unlink()
+        runner = _FakeRunner()
+
+        with pytest.raises(FleetStateMissingError) as exc_info:
+            copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        assert exc_info.value.path == "etc/agora/environment"
+        # On abort, no cp must have been executed for the missing entry's
+        # subsequent siblings — fail-fast semantics.
+        cps = [c for c in runner.calls if c[0] == "cp"]
+        # `etc/agora/environment` is the first item in FLEET_STATE_REQUIRED,
+        # so zero cp calls should fire before the abort.
+        assert cps == []
+
+    def test_missing_required_glob_raises_fleet_state_missing_error(self, tmp_path):
+        """Glob entries (``etc/ssh/ssh_host_*``) with zero matches are
+        also a hard failure — a real device must have ssh host keys."""
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        # Strip every ssh host key so the glob returns empty.
+        import shutil
+        shutil.rmtree(slot_a / "etc/ssh")
+        runner = _FakeRunner()
+
+        with pytest.raises(FleetStateMissingError) as exc_info:
+            copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        assert "ssh_host" in exc_info.value.path
+
+    def test_missing_optional_is_silently_skipped(self, tmp_path, caplog):
+        """Optional entries (``api_key``, ``wifi-*.nmconnection``) with
+        zero matches must NOT abort. Device boots slot B and re-mints
+        the missing state on next CMS handshake."""
+        import logging
+
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        # Drop the only optional file we seeded.
+        (slot_a / "etc/NetworkManager/system-connections/wifi-home.nmconnection").unlink()
+        runner = _FakeRunner()
+
+        with caplog.at_level(logging.INFO, logger="os_updater.apply"):
+            copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        cps = [c for c in runner.calls if c[0] == "cp"]
+        # Required set still copied: 4 literals + 2 ssh keys = 6.
+        assert len(cps) == 6
+        # A skip event must be logged for diagnostic purposes.
+        assert any("fleet_state_skipped" in r.message for r in caplog.records)
+
+    def test_cp_nonzero_exit_raises_fleet_state_write_error(self, tmp_path):
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        runner = _FakeRunner(
+            results_by_head={"cp": 1},
+            stderr_by_head={"cp": "permission denied"},
+        )
+
+        with pytest.raises(FleetStateWriteError) as exc_info:
+            copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        # First entry in FLEET_STATE_REQUIRED is etc/agora/environment.
+        assert exc_info.value.path == "etc/agora/environment"
+
+    def test_cp_timeout_raises_fleet_state_write_error(self, tmp_path):
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        runner = _FakeRunner(raise_timeout_for={"cp"})
+
+        with pytest.raises(FleetStateWriteError) as exc_info:
+            copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        assert exc_info.value.path == "etc/agora/environment"
+
+
+# ── SlotStager × fleet-state integration (D60) ─────────────────────────────
+
+
+class TestSlotStagerFleetStateIntegration:
+    """The SlotStager pipeline is the production caller — these tests
+    pin the wire-up: missing required fleet-state aborts the apply
+    BEFORE trigger_tryboot is invoked, so a half-applied slot B never
+    becomes the active slot."""
+
+    def test_missing_required_aborts_before_trigger_tryboot(self, tmp_path):
+        staging_dir = _seed_staging(tmp_path)
+        tryboot_calls: list[int] = []
+        # seed_fleet_state=False ⇒ slot A is empty ⇒ FLEET_STATE_REQUIRED
+        # check fails on the first entry.
+        stager = _make_stager(
+            tmp_path,
+            running_slot=1,
+            trigger_tryboot_calls=tryboot_calls,
+            seed_fleet_state=False,
+        )
+
+        with pytest.raises(FleetStateMissingError) as exc_info:
+            stager._stage_sync(_make_payload(), staging_dir)
+
+        # Critical invariant: tryboot must NOT have fired.
+        assert tryboot_calls == [], (
+            "trigger_tryboot must not run when fleet-state copy aborts; "
+            "promoting a slot with no machine-id/cms_config would brick the device"
+        )
+        # Surface the missing path for the operator-facing telemetry.
+        assert exc_info.value.path in FLEET_STATE_REQUIRED
