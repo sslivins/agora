@@ -462,6 +462,28 @@ class TestServiceFailureClassification:
             == "tryboot_failed"
         )
 
+    def test_fleet_state_missing_maps_to_short_code(self):
+        from os_updater.apply import FleetStateMissingError
+        from os_updater.service import OSUpdaterService
+
+        assert (
+            OSUpdaterService._classify_failure(
+                FleetStateMissingError("missing", path="etc/agora/environment")
+            )
+            == "fleet_state_missing"
+        )
+
+    def test_fleet_state_write_failure_maps_to_short_code(self):
+        from os_updater.apply import FleetStateWriteError
+        from os_updater.service import OSUpdaterService
+
+        assert (
+            OSUpdaterService._classify_failure(
+                FleetStateWriteError("cp rc=1", path="etc/machine-id")
+            )
+            == "slot_b_write_failed"
+        )
+
     def test_staging_error_base_maps_to_stage_failed(self):
         """Bare ``StagingError`` (not a subclass) is the catch-all for
         stage-time failures that aren't rsync or tryboot — e.g.
@@ -476,18 +498,35 @@ class TestServiceFailureClassification:
         )
 
     def test_subclass_arms_take_precedence_over_base(self):
-        """``RsyncError`` and ``TrybootError`` both subclass
-        ``StagingError``. If the arm order ever drifted so the base
-        arm fired first, all three would collapse to ``stage_failed``
-        and the CMS would lose the wire-code distinction. Pin it.
+        """``RsyncError``, ``TrybootError``, ``FleetStateMissingError``,
+        and ``FleetStateWriteError`` all subclass ``StagingError``. If
+        the arm order ever drifted so the base arm fired first, all of
+        them would collapse to ``stage_failed`` and the CMS would lose
+        the wire-code distinction. Pin every subclass.
         """
-        from os_updater.apply import RsyncError, StagingError, TrybootError
+        from os_updater.apply import (
+            FleetStateMissingError,
+            FleetStateWriteError,
+            RsyncError,
+            StagingError,
+            TrybootError,
+        )
         from os_updater.service import OSUpdaterService
 
         assert issubclass(RsyncError, StagingError)
         assert issubclass(TrybootError, StagingError)
+        assert issubclass(FleetStateMissingError, StagingError)
+        assert issubclass(FleetStateWriteError, StagingError)
         assert OSUpdaterService._classify_failure(RsyncError("a")) == "stage_rsync_failed"
         assert OSUpdaterService._classify_failure(TrybootError("b")) == "tryboot_failed"
+        assert (
+            OSUpdaterService._classify_failure(FleetStateMissingError("c", path="p"))
+            == "fleet_state_missing"
+        )
+        assert (
+            OSUpdaterService._classify_failure(FleetStateWriteError("d", path="p"))
+            == "slot_b_write_failed"
+        )
 
 
 # ── parse_bundle_meta ──────────────────────────────────────────────────────

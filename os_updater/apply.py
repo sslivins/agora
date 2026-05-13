@@ -17,6 +17,13 @@ flow":
    partitions.
 8. ``rsync -aHAX --delete --numeric-ids`` the extracted ``boot/`` and
    ``root/`` trees onto the inactive slot's partitions.
+8b. Copy per-device fleet-state files from the running rootfs (slot
+    A) into the freshly-unpacked inactive slot (slot B). OS bundles
+    ship generic — no machine-id, no SSH host keys, no fleet creds
+    (see D63 in plan.md) — so identity must be carried across via
+    :func:`copy_fleet_state`. Required files missing on slot A abort
+    the apply; optional files are skipped silently. Implements D60
+    of plan.md §"Phase 2".
 9. Trigger tryboot via :func:`slot_mgr.trigger_tryboot` (which
    rewrites ``[tryboot] boot_partition`` in autoboot.txt, records
    ``last_tryboot_target``, and reboots).
@@ -42,6 +49,10 @@ Error taxonomy (the service maps each to a distinct wire code):
 * :class:`TrybootError` — :func:`slot_mgr.trigger_tryboot` raised
   (e.g. pinned device, autoboot rewrite failed, reboot subprocess
   failed). Maps to ``failed:tryboot_failed``.
+* :class:`FleetStateMissingError` — a required fleet-state file was
+  not present on slot A. Maps to ``failed:fleet_state_missing``.
+* :class:`FleetStateWriteError` — ``cp -a`` to slot B failed. Maps
+  to ``failed:slot_b_write_failed``.
 * :class:`BundleIntegrityError` (from :mod:`bundle`) — re-raised
   unchanged when decompression / extraction / version-mismatch /
   manifest verification fails. Maps to ``failed:bundle_invalid``.
@@ -117,6 +128,48 @@ DEFAULT_DECOMPRESS_TIMEOUT_S = 600.0
 DEFAULT_EXTRACT_TIMEOUT_S = 900.0
 DEFAULT_RSYNC_TIMEOUT_S = 1800.0
 
+#: Per-``cp -a`` invocation timeout for the fleet-state copy step.
+#: Each file is small (machine-id is 32 bytes, ssh host keys a few KB,
+#: cms_config.json single-digit KB, wifi-*.nmconnection a few KB);
+#: 30 s is comfortably 1000× the worst real-world case.
+DEFAULT_FLEET_STATE_CP_TIMEOUT_S = 30.0
+
+#: Root of the currently-running rootfs (slot A) from which
+#: :func:`copy_fleet_state` reads per-device identity files. Path is
+#: ``/`` in production; tests inject ``tmp_path`` to bypass.
+DEFAULT_SLOT_A_ROOT = Path("/")
+
+#: Files that **must** be present on slot A and copied into slot B
+#: before tryboot. Each entry is a path **relative** to the rootfs
+#: root (no leading slash) so it composes with both ``slot_a_root``
+#: and ``slot_b_root``. Patterns containing ``*`` are globs; for a
+#: required glob entry, ``>=1`` match is required. A required entry
+#: missing on slot A is a hard abort (``failed:fleet_state_missing``).
+#:
+#: Refusing to apply on absence is the safe default: a device missing
+#: any of these is either unprovisioned or in a broken state and the
+#: OTA shouldn't paper over that. See D60 in plan.md §"Phase 2".
+FLEET_STATE_REQUIRED: tuple[str, ...] = (
+    "etc/agora/environment",
+    "opt/agora/persist/cms_config.json",
+    "opt/agora/persist/provisioned",
+    "etc/machine-id",
+    "etc/ssh/ssh_host_*",
+)
+
+#: Files that **may** be present on slot A and are copied into slot B
+#: if found, but whose absence is not an error. Globs with zero
+#: matches are fine. Same path-relative semantics as
+#: :data:`FLEET_STATE_REQUIRED`.
+#:
+#: ``api_key`` is absent before the device has completed its first
+#: CMS handshake; ``agora-api`` re-mints it on first contact.
+#: ``wifi-*.nmconnection`` is empty for ethernet-only deployments.
+FLEET_STATE_COPY_IF_PRESENT: tuple[str, ...] = (
+    "opt/agora/persist/api_key",
+    "etc/NetworkManager/system-connections/wifi-*.nmconnection",
+)
+
 
 # ── Exceptions ─────────────────────────────────────────────────────────────
 
@@ -141,6 +194,38 @@ class TrybootError(StagingError):
 
     Service maps to ``failed:tryboot_failed``.
     """
+
+
+class FleetStateMissingError(StagingError):
+    """A required fleet-state file/glob was not present on slot A.
+
+    Carries ``path`` — the relative path (or glob pattern) that
+    couldn't be satisfied — so callers and tests can pin the
+    diagnostic without grepping the message string.
+
+    Service maps to ``failed:fleet_state_missing``. See D60 in
+    plan.md §"Phase 2".
+    """
+
+    def __init__(self, message: str, *, path: str) -> None:
+        super().__init__(message)
+        self.path = path
+
+
+class FleetStateWriteError(StagingError):
+    """``cp -a`` from slot A into slot B failed mid-fleet-state-copy.
+
+    Carries ``path`` — the relative path of the source file whose
+    copy returned non-zero (or timed out / hit a missing-binary
+    error).
+
+    Service maps to ``failed:slot_b_write_failed``. See D60 in
+    plan.md §"Phase 2".
+    """
+
+    def __init__(self, message: str, *, path: str) -> None:
+        super().__init__(message)
+        self.path = path
 
 
 # ── Pure helpers (no I/O) ──────────────────────────────────────────────────
@@ -349,6 +434,150 @@ def rsync_tree(
         )
 
 
+def copy_fleet_state(
+    slot_a_root: Path,
+    slot_b_root: Path,
+    *,
+    runner: Runner = _default_runner,
+    required: tuple[str, ...] = FLEET_STATE_REQUIRED,
+    copy_if_present: tuple[str, ...] = FLEET_STATE_COPY_IF_PRESENT,
+    cp_timeout_s: float = DEFAULT_FLEET_STATE_CP_TIMEOUT_S,
+) -> None:
+    """Copy per-device identity files from slot A into slot B.
+
+    Implements step 8b of the apply flow (D60 in plan.md §"Phase 2").
+    Each entry in ``required`` and ``copy_if_present`` is a path
+    **relative** to the rootfs root (no leading slash). Patterns
+    containing ``*`` are treated as globs evaluated against
+    ``slot_a_root``; literal patterns are required to exist as
+    regular files / symlinks.
+
+    Semantics:
+
+    * **Required literal** — file must exist on slot A. Raises
+      :class:`FleetStateMissingError` (with ``path`` set to the
+      relative pattern) otherwise.
+    * **Required glob** — at least one match required. Zero matches
+      raises :class:`FleetStateMissingError`.
+    * **Copy-if-present literal/glob** — zero matches is fine and
+      logged at INFO as ``fleet_state_skipped``.
+
+    Each copy is executed as ``cp -a`` per file: the ``-a`` flag
+    preserves uid/gid/mode/atime/mtime/xattrs/symlinks (matching
+    rsync's ``-a`` semantics for the per-file case but without
+    rsync's source-list ergonomics that don't fit a glob+literal
+    mix). Parent directories on slot B are created with mode 0755 if
+    missing.
+
+    Any non-zero ``cp`` exit, missing-binary error, or timeout
+    raises :class:`FleetStateWriteError`. Per the module-level "no
+    cleanup on failure" policy, neither slot B nor the staging
+    directory is touched on failure — the device boots from slot A
+    on next reboot and the operator can forensic the partial copy.
+    """
+    slot_a_root = Path(slot_a_root)
+    slot_b_root = Path(slot_b_root)
+
+    for pattern in required:
+        sources = _resolve_fleet_state_sources(slot_a_root, pattern)
+        if not sources:
+            raise FleetStateMissingError(
+                f"required fleet-state entry not present on slot A: "
+                f"{pattern!r} (resolved under {slot_a_root})",
+                path=pattern,
+            )
+        for src in sources:
+            _cp_one(
+                src,
+                slot_a_root,
+                slot_b_root,
+                pattern,
+                runner=runner,
+                cp_timeout_s=cp_timeout_s,
+            )
+
+    for pattern in copy_if_present:
+        sources = _resolve_fleet_state_sources(slot_a_root, pattern)
+        if not sources:
+            logger.info(
+                "fleet_state_skipped: %r (no match under %s)",
+                pattern,
+                slot_a_root,
+            )
+            continue
+        for src in sources:
+            _cp_one(
+                src,
+                slot_a_root,
+                slot_b_root,
+                pattern,
+                runner=runner,
+                cp_timeout_s=cp_timeout_s,
+            )
+
+
+def _resolve_fleet_state_sources(slot_a_root: Path, pattern: str) -> list[Path]:
+    """Return the list of slot-A source paths matched by ``pattern``.
+
+    Glob patterns (containing ``*``) are evaluated against
+    ``slot_a_root`` via :meth:`Path.glob`; literal patterns return
+    ``[slot_a_root / pattern]`` if the path exists, else ``[]``.
+    Symlinks count as existing — ``cp -a`` will preserve them.
+    """
+    if "*" in pattern:
+        return sorted(slot_a_root.glob(pattern))
+    candidate = slot_a_root / pattern
+    if candidate.exists() or candidate.is_symlink():
+        return [candidate]
+    return []
+
+
+def _cp_one(
+    src: Path,
+    slot_a_root: Path,
+    slot_b_root: Path,
+    pattern: str,
+    *,
+    runner: Runner,
+    cp_timeout_s: float,
+) -> None:
+    """Run ``cp -a <src> <dst>`` for a single fleet-state file.
+
+    Computes ``dst`` by re-rooting ``src`` from ``slot_a_root`` onto
+    ``slot_b_root`` (preserving the in-rootfs path). Creates the
+    parent directory on slot B if missing. Raises
+    :class:`FleetStateWriteError` on any subprocess failure.
+    """
+    rel = src.relative_to(slot_a_root)
+    dst = slot_b_root / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # ``rel.as_posix()`` keeps the telemetry-bound path forward-slash
+    # regardless of host platform — devices are Linux but tests run
+    # on Windows.
+    rel_posix = rel.as_posix()
+
+    logger.info("fleet_state_copy: %s -> %s", src, dst)
+    try:
+        result = runner(["cp", "-a", str(src), str(dst)], timeout=cp_timeout_s)
+    except FileNotFoundError as exc:
+        raise FleetStateWriteError(
+            f"cp binary not found on PATH while copying {src} -> {dst}: {exc}",
+            path=rel_posix,
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FleetStateWriteError(
+            f"cp timed out after {cp_timeout_s}s: {src} -> {dst}",
+            path=rel_posix,
+        ) from exc
+    if result.returncode != 0:
+        raise FleetStateWriteError(
+            f"cp failed (rc={result.returncode}) writing {dst}: "
+            f"stderr={_tail(result.stderr)!r}",
+            path=rel_posix,
+        )
+
+
 # ── slot_mgr injection seams ───────────────────────────────────────────────
 
 
@@ -416,6 +645,10 @@ class SlotStager:
     rsync_timeout_s: float = DEFAULT_RSYNC_TIMEOUT_S
     slot_state_fn: Optional[Callable[[], Any]] = None
     trigger_tryboot_fn: Optional[Callable[[int], Any]] = None
+    slot_a_root: Path = field(default_factory=lambda: DEFAULT_SLOT_A_ROOT)
+    fleet_state_required: tuple[str, ...] = FLEET_STATE_REQUIRED
+    fleet_state_copy_if_present: tuple[str, ...] = FLEET_STATE_COPY_IF_PRESENT
+    fleet_state_cp_timeout_s: float = DEFAULT_FLEET_STATE_CP_TIMEOUT_S
 
     async def stage(self, payload: DispatchPayload, staging_dir: Path) -> None:
         """Run the full stage-and-tryboot pipeline (steps 6–10 of the doc).
@@ -521,6 +754,20 @@ class SlotStager:
             root_target,
             runner=self.runner,
             rsync_timeout_s=self.rsync_timeout_s,
+        )
+
+        # 8b. Copy per-device fleet-state files from slot A into the
+        # freshly-unpacked inactive slot. OS bundles ship generic;
+        # identity (machine-id, ssh host keys, cms_config, etc.) lives
+        # only on slot A and must be carried across. Implements D60
+        # of plan.md §"Phase 2".
+        copy_fleet_state(
+            self.slot_a_root,
+            root_target,
+            runner=self.runner,
+            required=self.fleet_state_required,
+            copy_if_present=self.fleet_state_copy_if_present,
+            cp_timeout_s=self.fleet_state_cp_timeout_s,
         )
 
         # 9. Trigger tryboot. slot_mgr handles autoboot.txt rewrite +
