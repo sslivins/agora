@@ -1,0 +1,34 @@
+[Unit]
+Description=Agora OS Updater (A/B atomic OS update daemon)
+# Plan: §"Phase 2 — agora-os-updater service". This daemon subscribes to
+# the CMS over WPS for os_update_dispatch messages, downloads + verifies
+# bundles, and orchestrates the slot switch via agora-slot-mgr.
+After=network-online.target agora-cms-client.service
+Wants=network-online.target
+# Soft requires only: the updater can boot and idle even if cms-client is
+# wedged, and we don't want a cms-client crash loop to disable updates.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m os_updater
+WorkingDirectory=/opt/agora/src
+Environment=PYTHONPATH=/opt/agora/src
+Environment=AGORA_BASE=/opt/agora
+# Fleet provisioning env (AGORA_DEVICE_API_KEY, AGORA_CMS_URL,
+# AGORA_DEVICE_NAME) lives in the same drop-in as agora-cms-client.
+# Optional ('-' prefix) so the unit still starts on a fresh, un-provisioned
+# install — it just won't be able to connect to WPS until provisioning
+# completes.
+EnvironmentFile=-/etc/agora/environment
+
+Restart=always
+RestartSec=10
+
+# Wait for network to settle before the connect-token POST.
+ExecStartPre=/bin/sleep 5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
