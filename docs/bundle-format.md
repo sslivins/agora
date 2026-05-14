@@ -191,10 +191,10 @@ This is the contract `agora-os-updater` honors. Each step's failure produces a s
 3. **Download** the `.tar.zst` to `/data/.update/staging/<release_id>/bundle.tar.zst` with resumable HTTP (`Range:` requests on retry). On unrecoverable HTTP error, emit `failed:download` and clean the staging dir.
 4. **Download** the `.minisig` (small, single shot). Same failure path as step 3.
 5. **Verify signature** over the on-disk `.tar.zst` bytes using the multi-key directory lookup above. Failure: emit `failed:signature_invalid`, delete staging dir immediately. Do NOT decompress on signature failure — the tarball might be malicious.
-6. **Decompress + extract** into `/data/.update/staging/<release_id>/unpacked/`. Stream-decompress with the bundled zstd; pipe through GNU tar with `--no-same-owner --no-same-permissions=root` (the device-side rsync stage will fix ownership). Failure: `failed:bundle_invalid`.
+6. **Extract `meta.json`** from the bundle to `/data/.update/staging/<release_id>/unpacked/meta.json` (stream-decompress with the bundled zstd, then tar-extract just the single `meta.json` member). Failure: `failed:bundle_invalid`.
 7. **Read `meta.json`.** Reject if `version` mismatches the dispatch's `target_version` (defense in depth — the CMS should never dispatch a mismatched bundle, but we don't trust the network). Failure: `failed:bundle_invalid`.
-8. **Verify manifest.** Walk `boot/` and `root/`; for every regular file confirm it appears in `sha256_manifest` AND the on-disk content sha256 matches. Reject on missing entries, extra files, or hash mismatch. Failure: `failed:bundle_invalid`, delete staging.
-9. **Stage to inactive slot.** Rsync `boot/` → `/boot/firmware-<inactive>/`, `root/` → `/mnt/inactive-root/`. (Implemented in p2-stage-and-tryboot.)
+8. **Stream `boot/` and `root/` subtrees directly into the inactive slot.** Two passes of `zstd -dc | tar -x --strip-components=1 -C <target>`, once with `<target>` = the inactive slot's mounted boot partition and once with `<target>` = its root partition. Tar is invoked **without** `--no-same-owner` / `--no-same-permissions` so that, running as root, it restores numeric uid/gid and setuid/setgid/sticky bits from the archive. (The original 2-step design extracted to staging and then rsync'd into the slot, with those defensive flags compensating for the running uid; the streaming refactor eliminated the rsync stage, so those flags are not safe here — see agora#187.) Failure: `failed:bundle_invalid`.
+9. **Verify manifest** against the bytes that landed on the inactive slot. Walk `boot/` and `root/`; for every regular file confirm it appears in `sha256_manifest` AND the on-disk content sha256 matches. Reject on missing entries, extra files, or hash mismatch. Failure: `failed:bundle_invalid`, delete staging.
 10. **Hand off to slot-mgr.** Invoke `agora-slot-mgr trigger-tryboot` to flip the next-boot pointer. This is the last device-side step before reboot; after reboot, Phase 1's slot-confirm logic takes over.
 11. **`/data` migrations run POST-PROMOTE ONLY** (see [bundle-migration.md](./bundle-migration.md)). They are NOT part of the staging step — they fire after slot-confirm flips `agora-firstboot.service`'s migration-allowed sentinel.
 
@@ -207,21 +207,20 @@ This is the contract `agora-os-updater` honors. Each step's failure produces a s
   <release_id>/
     bundle.tar.zst        # the downloaded asset
     bundle.tar.zst.minisig
-    unpacked/             # populated by step 6 above
-      boot/
-      root/
-      meta.json
+    unpacked/             # populated by step 6 above (meta.json only;
+      meta.json           # boot/ and root/ stream straight into the
+                          # inactive slot in step 8, never to staging)
 ```
 
 Each dispatch's `release_id` namespaces its own subdirectory. Cleanup happens at:
 
 - **Step 5 failure** (signature) — delete `<release_id>/` immediately. Belt-and-braces: untrusted bytes never sit on disk for more than seconds.
-- **Step 6–8 failure** (decompress / manifest) — delete `<release_id>/` immediately.
+- **Step 6–9 failure** (extract / version / manifest) — delete `<release_id>/` immediately; if step 8 had begun writing to the inactive slot, leave the slot for forensics — slot-confirm will refuse to promote it and the next successful apply overwrites it.
 - **Step 10 success** — keep `<release_id>/` until reboot. After reboot, slot-confirm's success path deletes it; slot-confirm's rollback path leaves it for forensics (the rollback diagnostics in Phase 1 already collect it).
 - **`agora-os-updater.service` start** — sweep `/data/.update/staging/*/` and delete any directory whose `mtime` is more than 24h old OR whose `meta.json` is missing/unparseable (TTL + sanity). This handles the case where the device rebooted unexpectedly mid-stage. (Decision #20.)
 
 ## Future-compat notes
 
-- **Delta updates.** A future bundle format could replace `root/` with a casync `castr/` + index file. The minisign + `meta.json` envelope stays identical; only steps 6–9 of the verify flow change. The `builder` and `version` fields are forward-compatible.
+- **Delta updates.** A future bundle format could replace `root/` with a casync `castr/` + index file. The minisign + `meta.json` envelope stays identical; only steps 6–9 of the verify flow change (the extract pipeline gains an index-resolution step, but the streaming-into-inactive-slot shape is unchanged). The `builder` and `version` fields are forward-compatible.
 - **A separate manifest file.** If `meta.json` grows large enough to be annoying to embed (e.g. >100k sha256 entries), splitting into `meta.json` + `manifest.json` is a one-version flag day. The signature scheme doesn't care; the device-side parser does, hence flagging here.
 - **Cosign / sigstore.** Out of scope for v1. Minisign was chosen for being self-contained and not requiring a transparency log we'd then have to operate.
