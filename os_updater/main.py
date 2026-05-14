@@ -49,25 +49,58 @@ from os_updater.state import DEFAULT_STATE_PATH
 log = logging.getLogger("agora.os_updater")
 
 
-#: Path to the baked-in current-version file. Phase 0 writes the OS image
-#: version into ``/etc/agora/version`` (plan §"Phase 0 — Deliverables"
-#: re: ``/etc/agora/version``). One-line plain text, semver-shaped.
+#: Path to the baked-in current-version file. agora-os writes this at
+#: image-build time (assemble.sh) and at OTA-bundle-build time
+#: (build-bundle.sh). It's a multi-line key=value file:
+#:
+#:     # comment
+#:     agora_os_version=0.0.4-test
+#:     agora_app_floor=1.11.0
+#:
+#: We consume only ``agora_os_version`` here (per Decision #2 the
+#: ``agora_app_floor`` is the agora-app channel's contract, not the OS
+#: updater's). Naive .strip() of the whole file would return the entire
+#: multi-line blob as the "version" string and torpedo every floor check.
 DEFAULT_CURRENT_VERSION_FILE = Path("/etc/agora/version")
 
 
 def _read_current_version(path: Path) -> str:
-    """Read ``/etc/agora/version`` and strip whitespace.
+    """Parse ``/etc/agora/version`` and return ``agora_os_version``.
 
-    Raises if the file is missing or empty — better to fail loud at daemon
-    startup than to ship an empty string into the floor check and either
-    accept every dispatch (string comparison) or reject every dispatch
-    (semver parse).
+    File format: ``# comment`` lines and blank lines are skipped; every
+    other line must be ``key=value``. The ``agora_os_version`` value is
+    returned (whitespace-stripped). Other keys (e.g. ``agora_app_floor``)
+    are tolerated so this parser doesn't have to be lockstepped with every
+    future field added by agora-os.
+
+    Raises ``RuntimeError`` if the file is missing the
+    ``agora_os_version`` key, contains a malformed line, or has an empty
+    value for ``agora_os_version`` — better to fail loud at daemon startup
+    than to ship an empty string into the floor check.
     """
 
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        raise RuntimeError(f"{path} is empty; cannot determine current version")
-    return raw
+    raw = path.read_text(encoding="utf-8")
+    version: str | None = None
+    for lineno, line in enumerate(raw.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, sep, value = stripped.partition("=")
+        if not sep:
+            raise RuntimeError(
+                f"{path}:{lineno}: malformed line (expected key=value): {line!r}"
+            )
+        if key.strip() == "agora_os_version":
+            version = value.strip()
+    if version is None:
+        raise RuntimeError(
+            f"{path} did not contain an 'agora_os_version=...' line"
+        )
+    if not version:
+        raise RuntimeError(
+            f"{path}: 'agora_os_version' has an empty value; cannot determine current version"
+        )
+    return version
 
 
 def _build_parser() -> argparse.ArgumentParser:
