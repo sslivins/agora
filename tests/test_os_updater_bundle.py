@@ -756,6 +756,12 @@ def _meta_for_files(files: dict[str, bytes]) -> "object":
 
 
 class TestVerifyBundleManifest:
+    @staticmethod
+    def _roots(unpacked: Path) -> dict[str, Path]:
+        """Map the new ``partition_roots`` signature onto the tree the
+        helper builds (``unpacked/boot`` + ``unpacked/root``)."""
+        return {"boot": unpacked / "boot", "root": unpacked / "root"}
+
     def test_happy_path_real_hashes(self, tmp_path):
         """End-to-end with the real ``_sha256_hex`` — proves the streaming
         hash function and the walk both work."""
@@ -767,38 +773,59 @@ class TestVerifyBundleManifest:
         }
         root = _build_extracted_bundle(tmp_path, files)
         meta = _meta_for_files(files)
-        verify_bundle_manifest(root, meta)  # raises on failure
+        verify_bundle_manifest(self._roots(root), meta)  # raises on failure
 
     def test_missing_extracted_root_raises(self, tmp_path):
         from os_updater.bundle import verify_bundle_manifest
 
         files = {"boot/cmdline.txt": b"x"}
         meta = _meta_for_files(files)
-        with pytest.raises(BundleIntegrityError, match="extracted-bundle root"):
-            verify_bundle_manifest(tmp_path / "does-not-exist", meta)
+        missing = tmp_path / "does-not-exist"
+        with pytest.raises(BundleIntegrityError, match="partition root for"):
+            verify_bundle_manifest(
+                {"boot": missing / "boot", "root": missing / "root"}, meta
+            )
 
     def test_extracted_root_is_file_not_dir_raises(self, tmp_path):
         from os_updater.bundle import verify_bundle_manifest
 
         target = tmp_path / "not-a-dir"
         target.write_bytes(b"file content")
+        root_dir = tmp_path / "rdir"
+        root_dir.mkdir()
         meta = _meta_for_files({"boot/cmdline.txt": b"x"})
         with pytest.raises(BundleIntegrityError, match="not a directory"):
-            verify_bundle_manifest(target, meta)
+            verify_bundle_manifest({"boot": target, "root": root_dir}, meta)
 
-    def test_missing_required_subdir_raises(self, tmp_path):
+    def test_manifest_references_unknown_partition_raises(self, tmp_path):
+        """Manifest names ``root/...`` but only ``{boot: ...}`` was passed in."""
         from os_updater.bundle import verify_bundle_manifest
 
-        root = tmp_path / "unpacked"
-        root.mkdir()
-        (root / "boot").mkdir()
-        # No root/ subdir.
-        meta = _meta_for_files({"boot/cmdline.txt": b"x"})
-        # boot/cmdline.txt isn't on disk either, so we expect either the
-        # missing-subdir message or the missing-file message — but the
-        # subdir guard runs first.
-        with pytest.raises(BundleIntegrityError, match="missing required top-level dir"):
-            verify_bundle_manifest(root, meta)
+        boot_dir = tmp_path / "boot-only"
+        boot_dir.mkdir()
+        (boot_dir / "cmdline.txt").write_bytes(b"x")
+        meta = _meta_for_files(
+            {"boot/cmdline.txt": b"x", "root/etc/os-release": b"y"}
+        )
+        with pytest.raises(BundleIntegrityError, match="references unknown partition"):
+            verify_bundle_manifest({"boot": boot_dir}, meta)
+
+    def test_manifest_entry_without_partition_prefix_raises(self, tmp_path):
+        """Manifest relpath like ``cmdline.txt`` (no ``/``) is malformed."""
+        from os_updater.bundle import verify_bundle_manifest, BundleMeta
+
+        boot_dir = tmp_path / "boot-only"
+        boot_dir.mkdir()
+        meta = BundleMeta(
+            version="1.0.0",
+            min_from_version="1.0.0",
+            schema_version=2,
+            sha256_manifest={"cmdline.txt": "f" * 64},
+            created_at="2026-04-22T00:00:00Z",
+            builder="test",
+        )
+        with pytest.raises(BundleIntegrityError, match="no partition prefix"):
+            verify_bundle_manifest({"boot": boot_dir}, meta)
 
     def test_missing_file_on_disk_raises(self, tmp_path):
         """Manifest names a file the extracted tree doesn't contain."""
@@ -811,7 +838,7 @@ class TestVerifyBundleManifest:
             {**files_on_disk, "boot/ssh-keys.tar": b"z"}  # extra in manifest
         )
         with pytest.raises(BundleIntegrityError, match="missing on disk"):
-            verify_bundle_manifest(root, meta)
+            verify_bundle_manifest(self._roots(root), meta)
 
     def test_extra_file_on_disk_raises(self, tmp_path):
         """File exists on disk but isn't named in the manifest."""
@@ -827,7 +854,7 @@ class TestVerifyBundleManifest:
             {"boot/cmdline.txt": b"x", "root/foo": b"y"}  # manifest doesn't list sneaky
         )
         with pytest.raises(BundleIntegrityError, match="not listed in sha256_manifest"):
-            verify_bundle_manifest(root, meta)
+            verify_bundle_manifest(self._roots(root), meta)
 
     def test_hash_mismatch_raises(self, tmp_path):
         """File exists but its bytes were tampered after manifest was built."""
@@ -839,7 +866,7 @@ class TestVerifyBundleManifest:
         # Now corrupt the file on disk without updating meta.
         (root / "boot/cmdline.txt").write_bytes(b"tampered content")
         with pytest.raises(BundleIntegrityError, match="sha256 mismatch"):
-            verify_bundle_manifest(root, meta)
+            verify_bundle_manifest(self._roots(root), meta)
 
     def test_symlinks_are_skipped(self, tmp_path):
         """Symlinks aren't expected in bundle manifest; walker skips them.
@@ -859,7 +886,7 @@ class TestVerifyBundleManifest:
         except (OSError, NotImplementedError):
             pytest.skip("platform doesn't allow symlink creation in this context")
         # Should not raise — symlink is skipped, not flagged as extra.
-        verify_bundle_manifest(root, meta)
+        verify_bundle_manifest(self._roots(root), meta)
 
     def test_directories_are_skipped(self, tmp_path):
         """Empty subdirs in the tree aren't files; walker shouldn't flag them."""
@@ -871,7 +898,7 @@ class TestVerifyBundleManifest:
         (root / "root/empty-dir").mkdir()
         (root / "boot/another-empty").mkdir()
         meta = _meta_for_files(files)
-        verify_bundle_manifest(root, meta)  # raises if empty dirs leaked
+        verify_bundle_manifest(self._roots(root), meta)  # raises if empty dirs leaked
 
     def test_injected_sha256_fn_is_used(self, tmp_path):
         """Verify the ``sha256_fn`` seam: tests stub it so multi-GB bundle
@@ -900,6 +927,6 @@ class TestVerifyBundleManifest:
             calls.append(path)
             return "f" * 64
 
-        verify_bundle_manifest(root, fake_meta, sha256_fn=fake_sha256)
+        verify_bundle_manifest(self._roots(root), fake_meta, sha256_fn=fake_sha256)
         # Exactly 2 regular files → 2 calls.
         assert len(calls) == 2
