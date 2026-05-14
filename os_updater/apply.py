@@ -643,14 +643,22 @@ def stream_extract_subtree(
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     zstd_argv = ["zstd", "-dc", f"--long={zstd_long}", "-f", str(bundle_path)]
+    # GNU tar's defaults are correct here when this code runs as root
+    # (which the stager always does, via sudo): --same-owner restores
+    # numeric uid/gid from the archive, and --same-permissions restores
+    # full mode bits including setuid/setgid/sticky. The previous
+    # two-step staging flow rsync'd from staging into the slot and
+    # could afford --no-same-owner / --no-same-permissions; the
+    # streaming flow extracts directly into the inactive slot's
+    # rootfs, so those flags would silently strip setuid bits
+    # (sudo, su, mount, passwd, ping, ...) and reset every file's
+    # ownership to the running uid. See sslivins/agora#187.
     tar_argv = [
         "tar",
         "-x",
         "--strip-components=1",
         "-C",
         str(dst_dir),
-        "--no-same-owner",
-        "--no-same-permissions",
         subpath,
     ]
 

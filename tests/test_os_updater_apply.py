@@ -512,6 +512,47 @@ class TestStreamExtractSubtree:
         assert str(dst) in tar_argv
         assert tar_argv[-1] == "root"
 
+    def test_tar_argv_preserves_perms_and_ownership(self, tmp_path):
+        """Regression guard for sslivins/agora#187.
+
+        The streaming extract runs as root and writes directly into
+        the inactive slot's rootfs. It MUST NOT pass
+        ``--no-same-owner`` or ``--no-same-permissions``: those flags
+        strip setuid/setgid bits and reset every extracted file's
+        uid/gid to the running user, which on the device meant slot
+        B came up with non-functional ``sudo``, ``su``, ``passwd``,
+        etc. and ``/home/agora`` owned by root.
+
+        GNU tar's defaults already do the right thing when invoked as
+        root (the stager always is), so the correct fix was simply
+        to remove the flags. This test pins that decision."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.write_bytes(b"x")
+        dst = tmp_path / "dst"
+        captured: list[Sequence[str]] = []
+
+        def capturing_pipeline(zstd_argv, tar_argv, *, tar_stdout_path=None, timeout_s):
+            captured.append(list(tar_argv))
+            return (0, "", 0, "")
+
+        stream_extract_subtree(
+            bundle, "root", dst, pipeline_runner=capturing_pipeline
+        )
+
+        tar_argv = captured[0]
+        assert "--no-same-owner" not in tar_argv, (
+            "tar must NOT be invoked with --no-same-owner: it would "
+            "reset every extracted file's uid/gid to the running user, "
+            "breaking the inactive-slot rootfs (see agora#187)"
+        )
+        assert "--no-same-permissions" not in tar_argv, (
+            "tar must NOT be invoked with --no-same-permissions: it "
+            "applies umask and strips setuid/setgid/sticky bits, "
+            "leaving sudo/su/passwd/etc. non-functional on the "
+            "inactive slot (see agora#187)"
+        )
+
+
     def test_zstd_failure_raises_bundle_integrity_error(self, tmp_path):
         bundle = tmp_path / "bundle.tar.zst"
         bundle.write_bytes(b"corrupted")
