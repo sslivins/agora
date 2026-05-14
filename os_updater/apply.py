@@ -1,51 +1,61 @@
 """Slot staging + tryboot trigger — the ``Stager`` collaborator.
 
 Implements steps 6–10 of ``docs/bundle-format.md`` §"On-device apply
-flow":
+flow", streaming-decompress edition (PR #3, plan.md §"OTA v0.0.6-test"
+follow-up):
 
-1. Decompress + extract ``bundle.tar.zst`` into a working subdir of
-   the staging directory.
-2. Sanity-check the top-level entries (``boot/``, ``root/``,
-   ``meta.json``).
-3. Parse ``meta.json`` via :func:`bundle.parse_bundle_meta`.
-4. Defense-in-depth: compare ``meta.version`` to
-   ``payload.target_version``.
-5. Verify the sha256 manifest via :func:`bundle.verify_bundle_manifest`.
-6. Determine which slot is currently running via
-   :func:`slot_mgr.slot_state` and flip the other one.
-7. Resolve the target mountpoints for that slot's boot + root
-   partitions.
-8. ``rsync -aHAX --delete --numeric-ids`` the extracted ``boot/`` and
-   ``root/`` trees onto the inactive slot's partitions.
-8b. Copy per-device fleet-state files from the running rootfs (slot
-    A) into the freshly-unpacked inactive slot (slot B). OS bundles
-    ship generic — no machine-id, no SSH host keys, no fleet creds
-    (see D63 in plan.md) — so identity must be carried across via
-    :func:`copy_fleet_state`. Required files missing on slot A abort
-    the apply; optional files are skipped silently. Implements D60
-    of plan.md §"Phase 2".
-9. Trigger tryboot via :func:`slot_mgr.trigger_tryboot` (which
-   rewrites ``[tryboot] boot_partition`` in autoboot.txt, records
-   ``last_tryboot_target``, and reboots).
+1. ``zstd -dc | tar -xOf - meta.json`` → stream meta.json to disk
+   without touching the bundle's other contents. Cheapest possible
+   ``target_version`` reject.
+2. Parse ``meta.json`` via :func:`bundle.parse_bundle_meta`.
+3. Defense-in-depth: compare ``meta.version`` to
+   ``payload.target_version`` BEFORE we write a single byte to slot B.
+4. Determine running + inactive slots via :func:`slot_mgr.slot_state`.
+5. Resolve target mountpoints for the inactive slot's boot + root
+   partitions (mounted by the daemon-launcher systemd unit).
+6. ``zstd -dc | tar -x --strip-components=1 -C <boot_target> boot``
+   — stream the boot subtree straight onto the inactive boot
+   partition. ``--strip-components=1`` rewrites ``boot/foo`` to
+   ``<boot_target>/foo`` AND naturally filters anything that isn't
+   under ``boot/``, so a top-level allowlist check is no longer
+   needed.
+7. Same as 6 for ``root`` onto the inactive root partition.
+8. Verify the sha256 manifest via :func:`bundle.verify_bundle_manifest`
+   against the bytes that actually landed on the partitions.
+9. Copy per-device fleet-state files from the running rootfs (slot
+   A) into slot B (machine-id, SSH host keys, CMS creds, etc. — see
+   D60/D63 in plan.md). Done AFTER verify so the manifest check
+   doesn't see files we added.
+10a. Substitute ``etc/fstab`` for the inactive slot from the bundled
+     ``etc/fstab.template`` (``{{BOOT_PARTLABEL}}`` placeholder).
+     Critical: the device bricks at boot if its fstab points at the
+     wrong boot partition.
+10b. Rewrite ``cmdline.txt`` defensively (force ``root=PARTLABEL=root-{A,B}``
+     and ``rw`` flag), insulating us from per-slot cmdline drift in
+     the bundle.
+10c. Trigger tryboot via :func:`slot_mgr.trigger_tryboot` (rewrites
+     ``[tryboot] boot_partition``, records ``last_tryboot_target``,
+     and reboots).
 
 Exposed as :class:`SlotStager`, implementing the ``Stager`` Protocol
 from :mod:`os_updater.service`. The service awaits :meth:`stage`
 between transitioning the FSM to ``TRYBOOT_PENDING`` and to
 ``TRYBOOT_RUNNING``.
 
-Decompression is split into two subprocess calls (``zstd -d`` then
-``tar -xf``) rather than a piped one-step so that a failure of either
-half is unambiguously attributable to its source. The intermediate
-``bundle.tar`` is unlinked on success. The plan budgets 2 GB of free
-space on ``/data`` for staging; a v1.x bundle is ~1 GB compressed +
-~3 GB extracted + ~1 GB intermediate tar, well within budget.
+Streaming-decompress saves ~8 GB peak on ``/data`` versus the old
+two-step (decompress to ``bundle.tar`` on /data, then extract). Each
+pass re-reads the ~1 GB compressed bundle from SD; Pi 5 zstd is
+~50-100 MB/s, so all three passes total ~3 min — same ballpark as
+the old flow. Trade-off: lower disk-headroom requirements at the
+cost of three reads instead of one.
 
 Error taxonomy (the service maps each to a distinct wire code):
 
 * :class:`StagingError` — generic staging failure. Maps to
   ``failed:stage_failed``.
-* :class:`RsyncError` — an ``rsync`` subprocess returned non-zero.
-  Maps to ``failed:stage_rsync_failed``.
+* :class:`RsyncError` — legacy; no longer raised by the streaming
+  path but kept exported for callers / tests that still use
+  :func:`rsync_tree` directly. Maps to ``failed:stage_rsync_failed``.
 * :class:`TrybootError` — :func:`slot_mgr.trigger_tryboot` raised
   (e.g. pinned device, autoboot rewrite failed, reboot subprocess
   failed). Maps to ``failed:tryboot_failed``.
@@ -53,26 +63,30 @@ Error taxonomy (the service maps each to a distinct wire code):
   not present on slot A. Maps to ``failed:fleet_state_missing``.
 * :class:`FleetStateWriteError` — ``cp -a`` to slot B failed. Maps
   to ``failed:slot_b_write_failed``.
+* :class:`FstabError` — bundled fstab template missing /
+  unsubstitutable / unwritable. Maps to ``failed:fstab_failed``.
+* :class:`CmdlineError` — cmdline.txt missing or unwritable on the
+  inactive boot partition. Maps to ``failed:cmdline_failed``.
 * :class:`BundleIntegrityError` (from :mod:`bundle`) — re-raised
   unchanged when decompression / extraction / version-mismatch /
   manifest verification fails. Maps to ``failed:bundle_invalid``.
 
-The staging directory is **not** cleaned up on failure — forensics
-trump disk reclaim, especially for ``bundle_invalid`` cases where the
-contents are diagnostic. The service-level cleanup that runs on
-``agora-os-updater.service`` start (24h TTL sweep, per Phase 2
-deliverable §"Partial-download cleanup") catches everything
-eventually.
+Staging contents (meta.json) are **not** cleaned up on failure —
+forensics trump disk reclaim, especially for ``bundle_invalid`` cases.
+The service-level cleanup that runs on ``agora-os-updater.service``
+start (24h TTL sweep, per Phase 2 deliverable §"Partial-download
+cleanup") catches everything eventually.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from os_updater.bundle import (
     BundleIntegrityError,
@@ -94,13 +108,6 @@ logger = logging.getLogger(__name__)
 #: :data:`os_updater.verifier.DEFAULT_BUNDLE_FILENAME`.
 DEFAULT_BUNDLE_FILENAME = "bundle.tar.zst"
 
-#: Subdirectory under ``staging_dir`` for the extracted tree.
-DEFAULT_UNPACKED_SUBDIR = "unpacked"
-
-#: Intermediate tarball produced by ``zstd -d`` before ``tar -xf``
-#: extracts it. Deleted on success.
-DEFAULT_INTERMEDIATE_TAR_NAME = "bundle.tar"
-
 #: Slot A's boot partition mountpoint. Phase 0 fstab.
 DEFAULT_BOOT_MOUNT_SLOT_A = Path("/boot/firmware")
 
@@ -121,11 +128,12 @@ DEFAULT_INACTIVE_ROOT_MOUNT = Path("/mnt/inactive-root")
 #: 128 MB window.
 DEFAULT_ZSTD_LONG = 27
 
-#: Per-step subprocess timeouts. Generous defaults for the slowest
-#: 32 GB SD cards in the field — actual times on a v1 bundle are
-#: ~30 s decompress, ~60 s extract, ~3–5 min rsync per side.
-DEFAULT_DECOMPRESS_TIMEOUT_S = 600.0
-DEFAULT_EXTRACT_TIMEOUT_S = 900.0
+#: Per-step subprocess timeout. Generous default for the slowest 32 GB
+#: SD cards in the field — actual times on a v1 bundle are ~3 min per
+#: ``zstd | tar`` streaming pass on a Pi 5. The streaming pipeline does
+#: three passes (meta-only, boot/, root/) that re-read the .tar.zst from
+#: disk each time; this timeout applies to each pass individually.
+DEFAULT_STREAM_TIMEOUT_S = 900.0
 DEFAULT_RSYNC_TIMEOUT_S = 1800.0
 
 #: Per-``cp -a`` invocation timeout for the fleet-state copy step.
@@ -169,6 +177,27 @@ FLEET_STATE_COPY_IF_PRESENT: tuple[str, ...] = (
     "opt/agora/persist/api_key",
     "etc/NetworkManager/system-connections/wifi-*.nmconnection",
 )
+
+#: Relative path inside the inactive slot's root where the bundle ships
+#: an fstab template with ``{{BOOT_PARTLABEL}}`` placeholder. Replaced
+#: at apply-time with the inactive slot's boot PARTLABEL (``boot-A`` /
+#: ``boot-B``) so the freshly-written slot mounts its OWN boot partition,
+#: not the slot that built the bundle. See PR #14 on agora-os and the
+#: §"OTA v0.0.7" note in plan.md.
+DEFAULT_FSTAB_TEMPLATE_REL = "etc/fstab.template"
+
+#: Relative path inside the inactive slot's root where the rendered
+#: fstab is written. ``substitute_fstab`` writes here; nothing else
+#: ships at this path (the bundle producer's ``rm -f bundle/root/etc/fstab``
+#: keeps the manifest from listing it).
+DEFAULT_FSTAB_REL = "etc/fstab"
+
+#: Relative path inside the inactive slot's boot partition for the
+#: kernel command line. ``rewrite_cmdline`` strips any ``root=`` token
+#: and writes back ``root=PARTLABEL=root-A|B rw <rest>`` so the kernel
+#: lands on the target slot's rootfs. Defends against the agora-os
+#: cmdline-B.txt template missing ``rw`` (#cmdline-B-rw-typo).
+DEFAULT_CMDLINE_REL = "cmdline.txt"
 
 
 # ── Exceptions ─────────────────────────────────────────────────────────────
@@ -228,6 +257,27 @@ class FleetStateWriteError(StagingError):
         self.path = path
 
 
+class FstabError(StagingError):
+    """``substitute_fstab`` could not render ``etc/fstab`` on the inactive slot.
+
+    Common causes: bundle didn't ship ``etc/fstab.template``, the
+    template was missing the ``{{BOOT_PARTLABEL}}`` placeholder, or
+    write to slot B failed.
+
+    Service maps to ``failed:fstab_substitute_failed``.
+    """
+
+
+class CmdlineError(StagingError):
+    """``rewrite_cmdline`` could not rewrite ``cmdline.txt`` on the inactive slot.
+
+    Common causes: bundle didn't ship a ``cmdline.txt`` on its boot/
+    partition, or write to the FAT32 boot partition failed.
+
+    Service maps to ``failed:cmdline_rewrite_failed``.
+    """
+
+
 # ── Pure helpers (no I/O) ──────────────────────────────────────────────────
 
 
@@ -269,109 +319,347 @@ def _tail(text: Optional[str], limit: int = 2000) -> str:
     return "…" + text[-limit:]
 
 
-def decompress_and_extract(
-    bundle_path: Path,
-    unpacked_dir: Path,
+#: Type alias for the pipeline-runner seam — exists so tests can inject
+#: a fake without touching ``subprocess.Popen``. Signature mirrors
+#: :func:`_default_pipeline_runner`. Returns
+#: ``(zstd_rc, zstd_stderr, tar_rc, tar_stderr)``.
+PipelineRunner = Callable[
+    [Sequence[str], Sequence[str]],
+    tuple[int, str, int, str],
+]
+
+
+def _default_pipeline_runner(
+    zstd_argv: Sequence[str],
+    tar_argv: Sequence[str],
     *,
-    runner: Runner = _default_runner,
-    intermediate_tar_name: str = DEFAULT_INTERMEDIATE_TAR_NAME,
+    tar_stdout_path: Optional[Path] = None,
+    timeout_s: float,
+) -> tuple[int, str, int, str]:
+    """Run ``zstd_argv | tar_argv`` as a streaming pipeline.
+
+    The streaming-decompress story (see plan.md §"OTA v0.0.7"): we need
+    to pipe ``zstd -dc <bundle> | tar -xf - -C <dst> <subpath>`` directly
+    onto the target partition without ever landing the 3.5 GB intermediate
+    tar on ``/data``. Three passes per apply (meta-only, boot/, root/)
+    each re-read the .tar.zst from disk; this helper runs one pass.
+
+    If ``tar_stdout_path`` is set, ``tar``'s stdout is redirected to that
+    file (used by ``tar -O`` for meta-only extract — the manifest member
+    is written to stdout instead of disk).
+
+    Always returns ``(zstd_rc, zstd_stderr, tar_rc, tar_stderr)`` so the
+    caller decides how to classify failure (zstd-side ⇒ corrupted bytes
+    ⇒ ``BundleIntegrityError``; tar-side likewise).
+
+    Raises :class:`FileNotFoundError` if either binary is missing on
+    PATH (callers map to ``BundleIntegrityError``). Raises
+    :class:`subprocess.TimeoutExpired` on per-pass timeout (callers
+    likewise).
+    """
+    stdout_fp = None
+    zstd_proc: Optional[subprocess.Popen] = None
+    tar_proc: Optional[subprocess.Popen] = None
+    try:
+        zstd_proc = subprocess.Popen(
+            list(zstd_argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            if tar_stdout_path is not None:
+                stdout_fp = open(tar_stdout_path, "wb")
+                tar_stdout: Any = stdout_fp
+            else:
+                tar_stdout = subprocess.DEVNULL
+            tar_proc = subprocess.Popen(
+                list(tar_argv),
+                stdin=zstd_proc.stdout,
+                stdout=tar_stdout,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            # tar binary missing — tear down the zstd we already started.
+            zstd_proc.kill()
+            try:
+                zstd_proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+
+        # Close our handle to zstd's stdout so tar sees EOF when zstd exits.
+        assert zstd_proc.stdout is not None
+        zstd_proc.stdout.close()
+
+        try:
+            _tar_stdout, tar_stderr = tar_proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            tar_proc.kill()
+            zstd_proc.kill()
+            try:
+                tar_proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                zstd_proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+
+        # tar exited (success or fail) — drain zstd's stderr & wait.
+        try:
+            _zstd_stdout, zstd_stderr = zstd_proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            zstd_proc.kill()
+            _zstd_stdout, zstd_stderr = zstd_proc.communicate()
+
+        return (
+            zstd_proc.returncode if zstd_proc.returncode is not None else -1,
+            zstd_stderr or "",
+            tar_proc.returncode if tar_proc.returncode is not None else -1,
+            tar_stderr or "",
+        )
+    finally:
+        if stdout_fp is not None:
+            try:
+                stdout_fp.close()
+            except OSError:
+                pass
+
+
+def stream_extract_subtree(
+    bundle_path: Path,
+    subpath: str,
+    dst_dir: Path,
+    *,
+    pipeline_runner: Callable[..., tuple[int, str, int, str]] = _default_pipeline_runner,
     zstd_long: int = DEFAULT_ZSTD_LONG,
-    decompress_timeout_s: float = DEFAULT_DECOMPRESS_TIMEOUT_S,
-    extract_timeout_s: float = DEFAULT_EXTRACT_TIMEOUT_S,
+    timeout_s: float = DEFAULT_STREAM_TIMEOUT_S,
 ) -> None:
-    """Decompress ``bundle.tar.zst`` then extract the tarball into ``unpacked_dir``.
+    """Stream-extract ``<subpath>/`` from ``bundle.tar.zst`` directly into ``dst_dir``.
 
-    Two-step pipeline (matches docs/bundle-format.md §"Decompression":
-    ``zstd -d --long=N -f`` then ``tar -xf``). Cleaner failure
-    attribution than a piped one-step at the cost of ~1 GB of
-    temporary disk usage. ``unpacked_dir`` is created if missing.
+    Eliminates the old two-step land-on-/data flow (decompress to
+    ``bundle.tar`` then ``tar -xf``) that consumed ~8 GB peak. Uses
+    ``--strip-components=1`` so ``boot/foo`` lands at ``<dst_dir>/foo``.
+    Anything outside ``<subpath>/`` in the archive is naturally filtered
+    by the trailing argument to ``tar``.
 
-    Subprocess failure at either step raises
-    :class:`BundleIntegrityError` — both kinds of failure mean the
-    bytes the device received don't decompose into a usable tree,
-    which is the right wire code (``failed:bundle_invalid``).
+    ``dst_dir`` is created if missing. Raises
+    :class:`BundleIntegrityError` on any zstd or tar failure (corrupted
+    bytes, missing binary, timeout). Bundle bytes → unusable, same wire-code
+    rationale as for the meta-only extractor.
     """
     bundle_path = Path(bundle_path)
-    unpacked_dir = Path(unpacked_dir)
-    unpacked_dir.mkdir(parents=True, exist_ok=True)
-    intermediate = unpacked_dir.parent / intermediate_tar_name
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    zstd_argv = ["zstd", "-dc", f"--long={zstd_long}", "-f", str(bundle_path)]
+    tar_argv = [
+        "tar",
+        "-x",
+        "--strip-components=1",
+        "-C",
+        str(dst_dir),
+        "--no-same-owner",
+        "--no-same-permissions",
+        subpath,
+    ]
 
     logger.info(
-        "decompressing bundle: src=%s intermediate=%s long=%d",
+        "stream extract: bundle=%s subpath=%s dst=%s long=%d",
         bundle_path,
-        intermediate,
+        subpath,
+        dst_dir,
         zstd_long,
     )
     try:
-        result = runner(
-            [
-                "zstd",
-                "-d",
-                f"--long={zstd_long}",
-                "-f",
-                str(bundle_path),
-                "-o",
-                str(intermediate),
-            ],
-            timeout=decompress_timeout_s,
+        zstd_rc, zstd_stderr, tar_rc, tar_stderr = pipeline_runner(
+            zstd_argv, tar_argv, timeout_s=timeout_s
         )
     except FileNotFoundError as exc:
+        # We don't know which binary was missing from the OSError alone;
+        # the message usually names it. Surface it raw.
         raise BundleIntegrityError(
-            f"zstd binary not found on PATH: {exc}"
+            f"zstd or tar binary not found on PATH: {exc}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise BundleIntegrityError(
-            f"zstd decompress timed out after {decompress_timeout_s}s: {bundle_path}"
+            f"stream extract timed out after {timeout_s}s: bundle={bundle_path} "
+            f"subpath={subpath}"
         ) from exc
-    if result.returncode != 0:
+
+    if zstd_rc != 0:
         raise BundleIntegrityError(
-            f"zstd decompress failed (rc={result.returncode}): "
-            f"stderr={_tail(result.stderr)!r}"
+            f"zstd decompress failed (rc={zstd_rc}): stderr={_tail(zstd_stderr)!r}"
         )
+    if tar_rc != 0:
+        raise BundleIntegrityError(
+            f"tar extract failed (rc={tar_rc}): subpath={subpath} "
+            f"stderr={_tail(tar_stderr)!r}"
+        )
+
+
+def extract_meta_only(
+    bundle_path: Path,
+    dst_meta_path: Path,
+    *,
+    pipeline_runner: Callable[..., tuple[int, str, int, str]] = _default_pipeline_runner,
+    zstd_long: int = DEFAULT_ZSTD_LONG,
+    timeout_s: float = DEFAULT_STREAM_TIMEOUT_S,
+    meta_member: str = "meta.json",
+) -> None:
+    """Stream-extract just ``meta.json`` from ``bundle.tar.zst`` to ``dst_meta_path``.
+
+    Cheapest-possible early-rejection pass: we re-read the .tar.zst from
+    disk and stop the tar stream as soon as the named member is emitted.
+    ``tar -O <member>`` writes the member to stdout; we redirect stdout
+    to a file via the pipeline runner.
+
+    ``dst_meta_path``'s parent is created if missing. Raises
+    :class:`BundleIntegrityError` on any zstd or tar failure.
+    """
+    bundle_path = Path(bundle_path)
+    dst_meta_path = Path(dst_meta_path)
+    dst_meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    zstd_argv = ["zstd", "-dc", f"--long={zstd_long}", "-f", str(bundle_path)]
+    tar_argv = ["tar", "-xOf", "-", meta_member]
 
     logger.info(
-        "extracting bundle tar: src=%s dest=%s",
-        intermediate,
-        unpacked_dir,
+        "stream extract meta: bundle=%s member=%s dst=%s",
+        bundle_path,
+        meta_member,
+        dst_meta_path,
     )
     try:
-        result = runner(
-            [
-                "tar",
-                "-xf",
-                str(intermediate),
-                "-C",
-                str(unpacked_dir),
-                "--no-same-owner",
-                "--no-same-permissions",
-            ],
-            timeout=extract_timeout_s,
+        zstd_rc, zstd_stderr, tar_rc, tar_stderr = pipeline_runner(
+            zstd_argv,
+            tar_argv,
+            tar_stdout_path=dst_meta_path,
+            timeout_s=timeout_s,
         )
     except FileNotFoundError as exc:
         raise BundleIntegrityError(
-            f"tar binary not found on PATH: {exc}"
+            f"zstd or tar binary not found on PATH: {exc}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise BundleIntegrityError(
-            f"tar extract timed out after {extract_timeout_s}s: {intermediate}"
+            f"meta-only extract timed out after {timeout_s}s: bundle={bundle_path}"
         ) from exc
-    if result.returncode != 0:
+
+    if zstd_rc != 0:
         raise BundleIntegrityError(
-            f"tar extract failed (rc={result.returncode}): "
-            f"stderr={_tail(result.stderr)!r}"
+            f"zstd decompress failed (rc={zstd_rc}): stderr={_tail(zstd_stderr)!r}"
+        )
+    if tar_rc != 0:
+        raise BundleIntegrityError(
+            f"tar meta extract failed (rc={tar_rc}): member={meta_member} "
+            f"stderr={_tail(tar_stderr)!r}"
+        )
+
+
+def substitute_fstab(root_target: Path, inactive_slot: int) -> None:
+    """Write ``<root_target>/etc/fstab`` from ``etc/fstab.template``.
+
+    Bundles ship ``etc/fstab.template`` (rendered by
+    agora-os/image-build/customize-rootfs.sh) with a ``{{BOOT_PARTLABEL}}``
+    placeholder; build-bundle.sh deletes ``etc/fstab`` so the placeholder
+    can't accidentally hit a device. Apply-time substitutes the
+    inactive-slot's boot partlabel and writes the final fstab.
+
+    Raises :class:`FstabError` if the template is missing, the
+    placeholder is absent, or the write fails.
+    """
+    root_target = Path(root_target)
+    template_path = root_target / DEFAULT_FSTAB_TEMPLATE_REL
+    fstab_path = root_target / DEFAULT_FSTAB_REL
+
+    if not template_path.is_file():
+        raise FstabError(
+            f"fstab template missing at {template_path} "
+            f"(bundle did not ship etc/fstab.template; rebuild with agora-os "
+            f"PR #14 or later)"
         )
 
     try:
-        intermediate.unlink()
-    except FileNotFoundError:
-        pass  # tar's job is done, missing intermediate is fine
+        template = template_path.read_text()
     except OSError as exc:
-        logger.warning(
-            "could not remove intermediate tar at %s: %s "
-            "(staging continues; 24h sweeper will clean it up)",
-            intermediate,
-            exc,
+        raise FstabError(f"could not read fstab template {template_path}: {exc}") from exc
+
+    if "{{BOOT_PARTLABEL}}" not in template:
+        raise FstabError(
+            f"fstab template at {template_path} missing {{{{BOOT_PARTLABEL}}}} "
+            f"placeholder; cannot determine slot's boot partlabel"
         )
+
+    boot_partlabel = "boot-A" if inactive_slot == 1 else "boot-B"
+    fstab = template.replace("{{BOOT_PARTLABEL}}", boot_partlabel)
+
+    logger.info(
+        "substitute_fstab: slot=%d boot_partlabel=%s template=%s -> %s",
+        inactive_slot,
+        boot_partlabel,
+        template_path,
+        fstab_path,
+    )
+    try:
+        fstab_path.parent.mkdir(parents=True, exist_ok=True)
+        fstab_path.write_text(fstab)
+    except OSError as exc:
+        raise FstabError(f"could not write fstab to {fstab_path}: {exc}") from exc
+
+
+def rewrite_cmdline(
+    boot_target: Path,
+    target_slot: int,
+    *,
+    cmdline_rel: str = DEFAULT_CMDLINE_REL,
+) -> None:
+    """Rewrite ``<boot_target>/cmdline.txt`` for the target slot.
+
+    Bundles ship per-slot ``cmdline.txt`` files (cmdline-A.txt / cmdline-B.txt
+    in build-bundle.sh) that reference ``root=PARTLABEL=root-{A,B}``. Apply-time
+    we canonicalize the cmdline to be safe even if the bundle's per-slot files
+    have drift between A and B (e.g., the well-known cmdline-B.txt ``rw``-flag
+    typo): strip any existing ``root=`` token, set our own, and ensure ``rw``
+    is present. The result is written back atomically over the existing file.
+
+    Raises :class:`CmdlineError` if the file is missing or the write fails.
+    """
+    boot_target = Path(boot_target)
+    cmdline_path = boot_target / cmdline_rel
+
+    if not cmdline_path.is_file():
+        raise CmdlineError(
+            f"cmdline file missing at {cmdline_path} (bundle did not ship "
+            f"boot/{cmdline_rel}; rebuild with agora-os PR #14 or later)"
+        )
+
+    try:
+        content = cmdline_path.read_text()
+    except OSError as exc:
+        raise CmdlineError(f"could not read {cmdline_path}: {exc}") from exc
+
+    target_partlabel = "root-A" if target_slot == 1 else "root-B"
+
+    canonical = re.sub(r"\s*\broot=\S+", "", content).strip()
+    tokens = canonical.split()
+    if "rw" not in tokens:
+        tokens.append("rw")
+    rewritten = f"root=PARTLABEL={target_partlabel} " + " ".join(tokens) + "\n"
+
+    logger.info(
+        "rewrite_cmdline: slot=%d partlabel=%s path=%s",
+        target_slot,
+        target_partlabel,
+        cmdline_path,
+    )
+    try:
+        cmdline_path.write_text(rewritten)
+    except OSError as exc:
+        raise CmdlineError(f"could not write {cmdline_path}: {exc}") from exc
 
 
 def rsync_tree(
@@ -631,8 +919,6 @@ class SlotStager:
 
     runner: Runner = field(default=_default_runner)
     bundle_filename: str = DEFAULT_BUNDLE_FILENAME
-    unpacked_subdir: str = DEFAULT_UNPACKED_SUBDIR
-    intermediate_tar_name: str = DEFAULT_INTERMEDIATE_TAR_NAME
     boot_subdir: str = "boot"
     root_subdir: str = "root"
     meta_filename: str = "meta.json"
@@ -640,18 +926,23 @@ class SlotStager:
     boot_mount_slot_b: Path = field(default_factory=lambda: DEFAULT_BOOT_MOUNT_SLOT_B)
     inactive_root_mount: Path = field(default_factory=lambda: DEFAULT_INACTIVE_ROOT_MOUNT)
     zstd_long: int = DEFAULT_ZSTD_LONG
-    decompress_timeout_s: float = DEFAULT_DECOMPRESS_TIMEOUT_S
-    extract_timeout_s: float = DEFAULT_EXTRACT_TIMEOUT_S
+    stream_timeout_s: float = DEFAULT_STREAM_TIMEOUT_S
     rsync_timeout_s: float = DEFAULT_RSYNC_TIMEOUT_S
+    pipeline_runner: Callable[..., tuple[int, str, int, str]] = field(
+        default=_default_pipeline_runner
+    )
     slot_state_fn: Optional[Callable[[], Any]] = None
     trigger_tryboot_fn: Optional[Callable[[int], Any]] = None
     slot_a_root: Path = field(default_factory=lambda: DEFAULT_SLOT_A_ROOT)
     fleet_state_required: tuple[str, ...] = FLEET_STATE_REQUIRED
     fleet_state_copy_if_present: tuple[str, ...] = FLEET_STATE_COPY_IF_PRESENT
     fleet_state_cp_timeout_s: float = DEFAULT_FLEET_STATE_CP_TIMEOUT_S
+    fstab_template_rel: str = DEFAULT_FSTAB_TEMPLATE_REL
+    fstab_rel: str = DEFAULT_FSTAB_REL
+    cmdline_rel: str = DEFAULT_CMDLINE_REL
 
     async def stage(self, payload: DispatchPayload, staging_dir: Path) -> None:
-        """Run the full stage-and-tryboot pipeline (steps 6–10 of the doc).
+        """Run the full stage-and-tryboot pipeline (10-step streaming orchestration).
 
         Async entrypoint matching the :class:`Stager` protocol. The
         synchronous body lives in :meth:`_stage_sync` for ease of
@@ -662,33 +953,29 @@ class SlotStager:
     def _stage_sync(self, payload: DispatchPayload, staging_dir: Path) -> None:
         staging_dir = Path(staging_dir)
         bundle_path = staging_dir / self.bundle_filename
-        unpacked_dir = staging_dir / self.unpacked_subdir
+        meta_path = staging_dir / self.meta_filename
 
         logger.info(
-            "staging bundle: release=%s target_version=%s "
-            "bundle=%s unpacked=%s",
+            "staging bundle (streaming): release=%s target_version=%s "
+            "bundle=%s staging=%s",
             payload.release_id,
             payload.target_version,
             bundle_path,
-            unpacked_dir,
+            staging_dir,
         )
 
-        # 1–2. Decompress + extract. Failures raise BundleIntegrityError.
-        decompress_and_extract(
+        # 1. Meta-only extract — cheapest target_version reject before
+        # we touch the inactive partitions. ~30s zstd pass with tar -O.
+        extract_meta_only(
             bundle_path,
-            unpacked_dir,
-            runner=self.runner,
-            intermediate_tar_name=self.intermediate_tar_name,
+            meta_path,
+            pipeline_runner=self.pipeline_runner,
             zstd_long=self.zstd_long,
-            decompress_timeout_s=self.decompress_timeout_s,
-            extract_timeout_s=self.extract_timeout_s,
+            timeout_s=self.stream_timeout_s,
+            meta_member=self.meta_filename,
         )
 
-        # 2b. Top-level entries must be exactly {boot/, root/, meta.json}.
-        self._check_top_level_entries(unpacked_dir)
-
-        # 3. Parse meta.json (raises BundleIntegrityError on any issue).
-        meta_path = unpacked_dir / self.meta_filename
+        # 2. Parse meta.json (raises BundleIntegrityError on any issue).
         meta = parse_bundle_meta(meta_path)
         logger.info(
             "bundle meta parsed: release=%s meta.version=%s "
@@ -699,22 +986,15 @@ class SlotStager:
             len(meta.sha256_manifest),
         )
 
-        # 4. Defense-in-depth target_version match.
+        # 3. Defense-in-depth target_version match — abort BEFORE we've
+        # written anything to slot B.
         if meta.version != payload.target_version:
             raise BundleIntegrityError(
                 f"bundle meta.version={meta.version!r} does not match "
                 f"dispatch payload target_version={payload.target_version!r}"
             )
 
-        # 5. Manifest sha256 verification.
-        verify_bundle_manifest(unpacked_dir, meta)
-        logger.info(
-            "bundle manifest verified: release=%s files=%d",
-            payload.release_id,
-            len(meta.sha256_manifest),
-        )
-
-        # 6. Determine running + inactive slots via slot_mgr.
+        # 4. Determine running + inactive slots via slot_mgr.
         running = self._read_running_slot()
         inactive = other_slot(running)
         logger.info(
@@ -724,7 +1004,9 @@ class SlotStager:
             payload.release_id,
         )
 
-        # 7. Resolve target mountpoints for the inactive slot.
+        # 5. Resolve target mountpoints for the inactive slot. These must
+        # exist as mountpoints — daemon-launcher systemd unit mounts both
+        # /boot/firmware-b (or -a) and /mnt/inactive-root before us.
         boot_target = boot_mount_for_slot(
             inactive,
             slot_a_mount=self.boot_mount_slot_a,
@@ -742,25 +1024,43 @@ class SlotStager:
                 f"(expected mounted by systemd unit before daemon start)"
             )
 
-        # 8. rsync boot/ then root/.
-        rsync_tree(
-            unpacked_dir / self.boot_subdir,
+        # 6. Stream boot/ subtree straight onto the inactive boot partition.
+        # --strip-components=1 turns "boot/foo" into "<boot_target>/foo" and
+        # naturally filters anything not under boot/.
+        stream_extract_subtree(
+            bundle_path,
+            self.boot_subdir,
             boot_target,
-            runner=self.runner,
-            rsync_timeout_s=self.rsync_timeout_s,
-        )
-        rsync_tree(
-            unpacked_dir / self.root_subdir,
-            root_target,
-            runner=self.runner,
-            rsync_timeout_s=self.rsync_timeout_s,
+            pipeline_runner=self.pipeline_runner,
+            zstd_long=self.zstd_long,
+            timeout_s=self.stream_timeout_s,
         )
 
-        # 8b. Copy per-device fleet-state files from slot A into the
-        # freshly-unpacked inactive slot. OS bundles ship generic;
-        # identity (machine-id, ssh host keys, cms_config, etc.) lives
-        # only on slot A and must be carried across. Implements D60
-        # of plan.md §"Phase 2".
+        # 7. Stream root/ subtree straight onto the inactive root partition.
+        stream_extract_subtree(
+            bundle_path,
+            self.root_subdir,
+            root_target,
+            pipeline_runner=self.pipeline_runner,
+            zstd_long=self.zstd_long,
+            timeout_s=self.stream_timeout_s,
+        )
+
+        # 8. Manifest sha256 verification — hash the bytes that actually
+        # landed on the partitions.
+        verify_bundle_manifest(
+            {self.boot_subdir: boot_target, self.root_subdir: root_target},
+            meta,
+        )
+        logger.info(
+            "bundle manifest verified: release=%s files=%d",
+            payload.release_id,
+            len(meta.sha256_manifest),
+        )
+
+        # 9. Copy per-device fleet-state files from slot A into slot B.
+        # Done AFTER manifest verify so the manifest check doesn't see
+        # files added by us. Implements D60 of plan.md §"Phase 2".
         copy_fleet_state(
             self.slot_a_root,
             root_target,
@@ -770,7 +1070,19 @@ class SlotStager:
             cp_timeout_s=self.fleet_state_cp_timeout_s,
         )
 
-        # 9. Trigger tryboot. slot_mgr handles autoboot.txt rewrite +
+        # 10a. Substitute fstab template — bundles ship etc/fstab.template
+        # with a {{BOOT_PARTLABEL}} placeholder; the device's etc/fstab
+        # was deleted by build-bundle.sh. We render it for the inactive
+        # slot here. Per plan.md §"v0.0.4-test bug list", this is critical
+        # to avoid bricking the device on tryboot.
+        substitute_fstab(root_target, inactive)
+
+        # 10b. Rewrite cmdline.txt for the target slot — bundles ship per-
+        # slot cmdline files but we canonicalize defensively (drop stray
+        # root= tokens, force rw).
+        rewrite_cmdline(boot_target, inactive, cmdline_rel=self.cmdline_rel)
+
+        # 10c. Trigger tryboot. slot_mgr handles autoboot.txt rewrite +
         # state persistence + sudo reboot '0 tryboot'.
         trigger_fn = self.trigger_tryboot_fn or _default_trigger_tryboot
         logger.info(
@@ -802,24 +1114,3 @@ class SlotStager:
                 f"(running_slot={running!r}); refusing to stage"
             )
         return running
-
-    def _check_top_level_entries(self, unpacked_dir: Path) -> None:
-        expected = {self.boot_subdir, self.root_subdir, self.meta_filename}
-        try:
-            found = {entry.name for entry in unpacked_dir.iterdir()}
-        except FileNotFoundError as exc:
-            raise BundleIntegrityError(
-                f"unpacked dir disappeared after extract: {unpacked_dir}"
-            ) from exc
-        extra = found - expected
-        if extra:
-            raise BundleIntegrityError(
-                f"extracted bundle has unexpected top-level entries: "
-                f"{sorted(extra)!r} (expected exactly {sorted(expected)!r})"
-            )
-        missing = expected - found
-        if missing:
-            raise BundleIntegrityError(
-                f"extracted bundle missing required top-level entries: "
-                f"{sorted(missing)!r}"
-            )

@@ -407,29 +407,41 @@ def _sha256_hex(path: Path, chunk_bytes: int = _HASH_CHUNK_BYTES) -> str:
 
 
 def verify_bundle_manifest(
-    extracted_root: Path,
+    partition_roots: Mapping[str, Path],
     meta: BundleMeta,
     *,
     sha256_fn: Callable[[Path], str] | None = None,
 ) -> None:
-    """Hash every regular file under ``extracted_root`` and compare to ``meta``.
+    """Hash every regular file under each partition root and compare to ``meta``.
 
-    Walks ``extracted_root/boot`` and ``extracted_root/root`` (the two
-    directories the manifest covers per docs/bundle-format.md §"Bundle
-    layout") and, for each regular file, computes its sha256 and
-    asserts the entry in :attr:`BundleMeta.sha256_manifest` matches.
+    ``partition_roots`` maps the first path segment of each manifest
+    entry (``"boot"``, ``"root"``) to the directory the corresponding
+    subtree was streamed into. For the streaming-apply flow this is
+    typically::
+
+        {"boot": Path("/boot/firmware-b"), "root": Path("/mnt/inactive-root")}
+
+    Each manifest relpath is split on its first ``/`` — the head names a
+    partition, the tail is the path under that partition root. For each
+    regular file present on disk under any of the partition roots, the
+    walker also requires the relpath to appear in the manifest (extras
+    are rejected as possible tampering).
 
     Symbolic links, directories, FIFOs, sockets, and device nodes are
     skipped per docs/bundle-format.md §"Manifest scope: regular files
-    only".  ``meta.json`` itself is excluded from the manifest (covered
+    only". ``meta.json`` itself is excluded from the manifest (covered
     by the outer minisign signature) and is therefore not expected to
     appear in the walk's results.
 
     Raises :class:`BundleIntegrityError` (mapped to ``failed:bundle_invalid``)
     on any of:
 
-    * ``extracted_root`` doesn't exist or isn't a directory.
-    * A path listed in the manifest is missing on disk.
+    * A partition root in ``partition_roots`` doesn't exist or isn't a
+      directory.
+    * A manifest relpath references a partition key that wasn't supplied
+      in ``partition_roots``.
+    * A path listed in the manifest is missing on disk under its
+      partition root.
     * A regular file exists on disk but is absent from the manifest
       (extra file — could indicate tampering).
     * A file's computed sha256 doesn't match the manifest entry.
@@ -441,44 +453,49 @@ def verify_bundle_manifest(
         Receives a :class:`Path` and returns lowercase hex.
     """
     sha256_fn = sha256_fn or _sha256_hex
-    root = Path(extracted_root)
-    if not root.is_dir():
-        raise BundleIntegrityError(
-            f"extracted-bundle root missing or not a directory: {root}"
-        )
+
+    roots: dict[str, Path] = {key: Path(value) for key, value in partition_roots.items()}
+    for key, root in roots.items():
+        if not root.is_dir():
+            raise BundleIntegrityError(
+                f"partition root for {key!r} missing or not a directory: {root}"
+            )
 
     expected: dict[str, str] = dict(meta.sha256_manifest)
     seen: set[str] = set()
 
-    for subdir in ("boot", "root"):
-        subdir_path = root / subdir
-        if not subdir_path.is_dir():
+    for relpath, digest_expected in sorted(expected.items()):
+        head, sep, tail = relpath.partition("/")
+        if not sep:
             raise BundleIntegrityError(
-                f"extracted bundle missing required top-level dir: {subdir!r}"
+                f"manifest entry {relpath!r} has no partition prefix"
+            )
+        root = roots.get(head)
+        if root is None:
+            raise BundleIntegrityError(
+                f"manifest entry {relpath!r} references unknown partition {head!r}"
             )
 
-        for entry in sorted(subdir_path.rglob("*")):
+        entry = root / tail
+        if entry.is_symlink() or not entry.is_file():
+            raise BundleIntegrityError(
+                f"files listed in sha256_manifest are missing on disk: [{relpath!r}]"
+            )
+
+        digest_actual = sha256_fn(entry)
+        if digest_actual != digest_expected:
+            raise BundleIntegrityError(
+                f"sha256 mismatch for {relpath!r}: "
+                f"expected={digest_expected} actual={digest_actual}"
+            )
+        seen.add(relpath)
+
+    for key, root in roots.items():
+        for entry in sorted(root.rglob("*")):
             if entry.is_symlink() or not entry.is_file():
                 continue
-
-            relpath = entry.relative_to(root).as_posix()
-            seen.add(relpath)
-
-            digest_expected = expected.get(relpath)
-            if digest_expected is None:
+            relpath = f"{key}/{entry.relative_to(root).as_posix()}"
+            if relpath not in expected:
                 raise BundleIntegrityError(
                     f"extra file on disk not listed in sha256_manifest: {relpath!r}"
                 )
-
-            digest_actual = sha256_fn(entry)
-            if digest_actual != digest_expected:
-                raise BundleIntegrityError(
-                    f"sha256 mismatch for {relpath!r}: "
-                    f"expected={digest_expected} actual={digest_actual}"
-                )
-
-    missing_on_disk = sorted(set(expected) - seen)
-    if missing_on_disk:
-        raise BundleIntegrityError(
-            f"files listed in sha256_manifest are missing on disk: {missing_on_disk!r}"
-        )

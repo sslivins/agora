@@ -2,21 +2,23 @@
 
 Acceptance hooks (plan.md §"Phase 2 — Acceptance"):
 
-* Decompress + extract + manifest verify → fan-in via
+* Streaming decompress + extract + manifest verify → fan-in via
   :class:`TestSlotStagerHappyPath`.
-* Bundle integrity tampers (extra entries, version mismatch, manifest
+* Bundle integrity tampers (version mismatch, missing-on-disk, manifest
   failure) → :class:`TestSlotStagerErrors`.
-* rsync failure surfaces as ``RsyncError`` → :class:`TestRsyncTree`,
-  :class:`TestSlotStagerErrors`.
 * Pinned-device path: ``trigger_tryboot`` raising →
   :class:`TestSlotStagerErrors.test_pinned_device_raises_tryboot_error`.
+* fstab template substitution + cmdline rewrite (the two v0.0.6-test
+  bricked-the-Pi bugs) → :class:`TestSubstituteFstab`,
+  :class:`TestRewriteCmdline`.
 * Concurrency interlock / pre-flight isn't this file's scope; the
   service tests own that.
 
 These tests never invoke real ``zstd``, ``tar``, ``rsync``, or
-``slot_mgr.trigger_tryboot`` — they pass fake :data:`Runner` and
-``trigger_tryboot_fn`` callables to keep the suite fast and
-CI-portable.
+``slot_mgr.trigger_tryboot`` — they pass a fake ``pipeline_runner``
+(for the streaming zstd|tar pipeline), a fake ``runner`` (for ``cp -a``
+fleet-state copies), and a ``trigger_tryboot_fn`` callable to keep the
+suite fast and CI-portable.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 import pytest
 
@@ -35,23 +37,28 @@ from os_updater.apply import (
     DEFAULT_BOOT_MOUNT_SLOT_B,
     FLEET_STATE_COPY_IF_PRESENT,
     FLEET_STATE_REQUIRED,
+    CmdlineError,
     FleetStateMissingError,
     FleetStateWriteError,
+    FstabError,
     RsyncError,
     SlotStager,
     StagingError,
     TrybootError,
     boot_mount_for_slot,
     copy_fleet_state,
-    decompress_and_extract,
+    extract_meta_only,
     other_slot,
+    rewrite_cmdline,
     rsync_tree,
+    stream_extract_subtree,
+    substitute_fstab,
 )
 from os_updater.bundle import BundleIntegrityError
 from os_updater.dispatch import DispatchPayload
 
 
-# ── Fake runner ────────────────────────────────────────────────────────────
+# ── Fake runner (cp / rsync) ───────────────────────────────────────────────
 
 
 @dataclass
@@ -59,12 +66,11 @@ class _FakeRunner:
     """Records every invocation; returns canned results per *command-head*.
 
     ``results_by_head`` maps the first arg of the command (e.g.
-    ``"zstd"``, ``"tar"``, ``"rsync"``) to a return code. Unmapped
-    heads default to 0.
+    ``"rsync"``, ``"cp"``) to a return code. Unmapped heads default
+    to 0.
 
-    For decompress + extract tests we want to assert calls happened
-    in a specific order, so :attr:`calls` is preserved in arrival
-    order with the full argv list.
+    For ordering-sensitive assertions, :attr:`calls` is preserved in
+    arrival order with the full argv list.
     """
 
     results_by_head: dict[str, int] = field(default_factory=dict)
@@ -86,6 +92,97 @@ class _FakeRunner:
         return subprocess.CompletedProcess(
             args=argv, returncode=rc, stdout="", stderr=stderr
         )
+
+
+# ── Fake pipeline runner (zstd | tar) ──────────────────────────────────────
+
+
+@dataclass
+class _FakePipelineRunner:
+    """Stand-in for :func:`os_updater.apply._default_pipeline_runner`.
+
+    Models the streaming ``zstd -dc <bundle> | tar -x ... -C <dst> <subpath>``
+    pipeline. Doesn't invoke any real subprocesses — instead writes a
+    set of pre-canned files into the ``-C`` target directory, mimicking
+    what a real ``tar -x --strip-components=1 -C <dst> <subpath>`` would
+    have produced after stripping the leading ``<subpath>/``.
+
+    Two call shapes are supported, matching the production code:
+
+    * **Meta-only** (``extract_meta_only``): ``tar_stdout_path`` is set,
+      and the canned :attr:`meta_bytes` is written to that path.
+    * **Subtree extract** (``stream_extract_subtree``): the last arg of
+      ``tar_argv`` is the subpath (e.g. ``"boot"`` / ``"root"``); the
+      ``-C`` flag's value is the destination dir. Files from
+      :attr:`files_by_subpath[subpath]` are written into ``<dst>/<rel>``.
+
+    Failure injection:
+
+    * :attr:`fail_rc_by_subpath` maps a subpath (or ``"__meta__"``) to a
+      4-tuple ``(zstd_rc, zstd_stderr, tar_rc, tar_stderr)`` returned
+      verbatim. Apply-side error-classification uses ``zstd_rc != 0``
+      vs ``tar_rc != 0`` to distinguish "zstd decompress failed" from
+      "tar extract failed".
+    * :attr:`raise_file_not_found` — first call raises
+      ``FileNotFoundError`` (binary missing).
+    * :attr:`raise_timeout` — first call raises
+      ``subprocess.TimeoutExpired`` (pipeline hung).
+    """
+
+    files_by_subpath: dict[str, dict[str, bytes]] = field(default_factory=dict)
+    meta_bytes: bytes = b""
+    fail_rc_by_subpath: dict[str, tuple[int, str, int, str]] = field(
+        default_factory=dict
+    )
+    raise_file_not_found: bool = False
+    raise_timeout: bool = False
+    # list of (subpath_or_meta_marker, tar_stdout_path_or_None, dst_dir_or_None)
+    calls: list[tuple[str, Optional[str], Optional[str]]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        zstd_argv,
+        tar_argv,
+        *,
+        tar_stdout_path=None,
+        timeout_s,
+    ):
+        if self.raise_file_not_found:
+            raise FileNotFoundError("zstd")
+        if self.raise_timeout:
+            raise subprocess.TimeoutExpired(
+                cmd=list(zstd_argv), timeout=timeout_s
+            )
+
+        tar_list = list(tar_argv)
+
+        # Meta-only path: tar -xOf - meta.json with stdout redirected.
+        if tar_stdout_path is not None:
+            self.calls.append(("__meta__", str(tar_stdout_path), None))
+            if "__meta__" in self.fail_rc_by_subpath:
+                return self.fail_rc_by_subpath["__meta__"]
+            Path(tar_stdout_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(tar_stdout_path).write_bytes(self.meta_bytes)
+            return (0, "", 0, "")
+
+        # Subtree extract: last positional arg is the subpath; -C flag
+        # points at the dst dir.
+        subpath = tar_list[-1]
+        dst_idx = tar_list.index("-C")
+        dst = Path(tar_list[dst_idx + 1])
+
+        self.calls.append((subpath, None, str(dst)))
+        if subpath in self.fail_rc_by_subpath:
+            return self.fail_rc_by_subpath[subpath]
+
+        # Mimic ``tar --strip-components=1``: keys are already
+        # rooted-after-strip (no leading ``boot/`` / ``root/``).
+        for rel, content in self.files_by_subpath.get(subpath, {}).items():
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+        return (0, "", 0, "")
 
 
 def _make_payload(target_version: str = "1.1.0") -> DispatchPayload:
@@ -135,119 +232,271 @@ class TestBootMountForSlot:
             boot_mount_for_slot(bad)
 
 
-# ── decompress_and_extract ─────────────────────────────────────────────────
+# ── stream_extract_subtree ─────────────────────────────────────────────────
 
 
-class TestDecompressAndExtract:
-    def test_happy_path_calls_zstd_then_tar(self, tmp_path):
+class TestStreamExtractSubtree:
+    def test_happy_path_writes_files_into_dst(self, tmp_path):
         bundle = tmp_path / "bundle.tar.zst"
         bundle.write_bytes(b"fake compressed bytes")
-        unpacked = tmp_path / "unpacked"
-        runner = _FakeRunner()
+        dst = tmp_path / "dst"
+        pipeline = _FakePipelineRunner(
+            files_by_subpath={
+                "boot": {
+                    "cmdline.txt": b"console=tty1 root=PARTLABEL=root-A rw\n",
+                    "config.txt": b"# pi config\n",
+                },
+            },
+        )
 
-        # Pre-place the intermediate tar so cleanup at end finds something
-        # to delete (matches what real zstd would have written).
-        intermediate = tmp_path / "bundle.tar"
-        intermediate.write_bytes(b"fake tar bytes")
+        stream_extract_subtree(bundle, "boot", dst, pipeline_runner=pipeline)
 
-        decompress_and_extract(bundle, unpacked, runner=runner)
-        assert unpacked.is_dir()
-        assert len(runner.calls) == 2
-        assert runner.calls[0][0] == "zstd"
-        assert runner.calls[0][1] == "-d"
-        assert runner.calls[1][0] == "tar"
-        assert runner.calls[1][1] == "-xf"
+        assert (dst / "cmdline.txt").read_bytes() == (
+            b"console=tty1 root=PARTLABEL=root-A rw\n"
+        )
+        assert (dst / "config.txt").read_bytes() == b"# pi config\n"
+        # Pipeline was invoked exactly once for the boot subtree.
+        assert len(pipeline.calls) == 1
+        subpath, stdout_path, _ = pipeline.calls[0]
+        assert subpath == "boot"
+        assert stdout_path is None
 
-    def test_intermediate_tar_is_unlinked_on_success(self, tmp_path):
+    def test_passes_long_flag_and_bundle_path_to_pipeline(self, tmp_path):
+        """``--long=NN`` must match the builder side to decompress
+        long-range bundles. Captured by inspecting the argv via a
+        thin pipeline-runner wrapper."""
         bundle = tmp_path / "bundle.tar.zst"
         bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        intermediate = tmp_path / "bundle.tar"
-        intermediate.write_bytes(b"y")
+        dst = tmp_path / "dst"
+        seen: list[tuple[Sequence[str], Sequence[str]]] = []
 
-        decompress_and_extract(bundle, unpacked, runner=_FakeRunner())
-        assert not intermediate.exists(), "intermediate tar should be removed on success"
+        def capturing_pipeline(zstd_argv, tar_argv, *, tar_stdout_path=None, timeout_s):
+            seen.append((list(zstd_argv), list(tar_argv)))
+            return (0, "", 0, "")
 
-    def test_missing_intermediate_at_cleanup_is_silent(self, tmp_path):
-        """If something else already removed the intermediate (e.g.
-        a previous run's leftovers got swept), cleanup must not raise."""
-        bundle = tmp_path / "bundle.tar.zst"
-        bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        # Don't pre-create the intermediate; runner is a no-op anyway.
-        decompress_and_extract(bundle, unpacked, runner=_FakeRunner())
+        stream_extract_subtree(
+            bundle, "root", dst, pipeline_runner=capturing_pipeline, zstd_long=27
+        )
 
-    def test_long_flag_is_passed_to_zstd(self, tmp_path):
-        """``zstd -d --long=27`` is required to match the builder side
-        per docs/bundle-format.md §"Compression"."""
-        bundle = tmp_path / "bundle.tar.zst"
-        bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        runner = _FakeRunner()
-        decompress_and_extract(bundle, unpacked, runner=runner, zstd_long=27)
-        zstd_argv = runner.calls[0]
+        zstd_argv, tar_argv = seen[0]
+        assert "zstd" in zstd_argv[0]
         assert "--long=27" in zstd_argv
+        assert str(bundle) in zstd_argv
+        assert "tar" in tar_argv[0]
+        assert "--strip-components=1" in tar_argv
+        assert "-C" in tar_argv
+        assert str(dst) in tar_argv
+        assert tar_argv[-1] == "root"
 
     def test_zstd_failure_raises_bundle_integrity_error(self, tmp_path):
         bundle = tmp_path / "bundle.tar.zst"
         bundle.write_bytes(b"corrupted")
-        unpacked = tmp_path / "unpacked"
-        runner = _FakeRunner(
-            results_by_head={"zstd": 1},
-            stderr_by_head={"zstd": "Decoding error"},
+        dst = tmp_path / "dst"
+        pipeline = _FakePipelineRunner(
+            fail_rc_by_subpath={"boot": (1, "Decoding error", 0, "")},
         )
         with pytest.raises(BundleIntegrityError, match="zstd decompress failed"):
-            decompress_and_extract(bundle, unpacked, runner=runner)
-        # Tar shouldn't even be invoked.
-        assert len(runner.calls) == 1
-
-    def test_zstd_binary_missing_raises_bundle_integrity_error(self, tmp_path):
-        bundle = tmp_path / "bundle.tar.zst"
-        bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        runner = _FakeRunner(raise_file_not_found_for={"zstd"})
-        with pytest.raises(BundleIntegrityError, match="zstd binary not found"):
-            decompress_and_extract(bundle, unpacked, runner=runner)
-
-    def test_zstd_timeout_raises_bundle_integrity_error(self, tmp_path):
-        bundle = tmp_path / "bundle.tar.zst"
-        bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        runner = _FakeRunner(raise_timeout_for={"zstd"})
-        with pytest.raises(BundleIntegrityError, match="zstd decompress timed out"):
-            decompress_and_extract(bundle, unpacked, runner=runner)
+            stream_extract_subtree(bundle, "boot", dst, pipeline_runner=pipeline)
 
     def test_tar_failure_raises_bundle_integrity_error(self, tmp_path):
         bundle = tmp_path / "bundle.tar.zst"
         bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        intermediate = tmp_path / "bundle.tar"
-        intermediate.write_bytes(b"y")
-        runner = _FakeRunner(
-            results_by_head={"tar": 2},
-            stderr_by_head={"tar": "Cannot read"},
+        dst = tmp_path / "dst"
+        pipeline = _FakePipelineRunner(
+            fail_rc_by_subpath={"root": (0, "", 2, "Cannot read")},
         )
         with pytest.raises(BundleIntegrityError, match="tar extract failed"):
-            decompress_and_extract(bundle, unpacked, runner=runner)
+            stream_extract_subtree(bundle, "root", dst, pipeline_runner=pipeline)
 
-    def test_tar_binary_missing_raises_bundle_integrity_error(self, tmp_path):
+    def test_binary_missing_raises_bundle_integrity_error(self, tmp_path):
         bundle = tmp_path / "bundle.tar.zst"
         bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        runner = _FakeRunner(raise_file_not_found_for={"tar"})
-        with pytest.raises(BundleIntegrityError, match="tar binary not found"):
-            decompress_and_extract(bundle, unpacked, runner=runner)
+        dst = tmp_path / "dst"
+        pipeline = _FakePipelineRunner(raise_file_not_found=True)
+        with pytest.raises(BundleIntegrityError, match="not found"):
+            stream_extract_subtree(bundle, "boot", dst, pipeline_runner=pipeline)
 
-    def test_tar_timeout_raises_bundle_integrity_error(self, tmp_path):
+    def test_timeout_raises_bundle_integrity_error(self, tmp_path):
         bundle = tmp_path / "bundle.tar.zst"
         bundle.write_bytes(b"x")
-        unpacked = tmp_path / "unpacked"
-        runner = _FakeRunner(raise_timeout_for={"tar"})
-        with pytest.raises(BundleIntegrityError, match="tar extract timed out"):
-            decompress_and_extract(bundle, unpacked, runner=runner)
+        dst = tmp_path / "dst"
+        pipeline = _FakePipelineRunner(raise_timeout=True)
+        with pytest.raises(BundleIntegrityError, match="timed out"):
+            stream_extract_subtree(bundle, "boot", dst, pipeline_runner=pipeline)
 
 
-# ── rsync_tree ─────────────────────────────────────────────────────────────
+# ── extract_meta_only ──────────────────────────────────────────────────────
+
+
+class TestExtractMetaOnly:
+    def test_happy_path_writes_meta_to_dst(self, tmp_path):
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.write_bytes(b"x")
+        meta_path = tmp_path / "staging" / "meta.json"
+        canned = json.dumps({"version": "1.1.0"}).encode()
+        pipeline = _FakePipelineRunner(meta_bytes=canned)
+
+        extract_meta_only(bundle, meta_path, pipeline_runner=pipeline)
+
+        assert meta_path.read_bytes() == canned
+        # Pipeline was invoked once with tar_stdout_path set.
+        assert len(pipeline.calls) == 1
+        subpath, stdout_path, _ = pipeline.calls[0]
+        assert subpath == "__meta__"
+        assert stdout_path == str(meta_path)
+
+    def test_tar_failure_raises_bundle_integrity_error(self, tmp_path):
+        """``tar -xOf - meta.json`` exits non-zero if ``meta.json`` is
+        absent from the archive. Apply must surface this as a bundle
+        integrity error."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.write_bytes(b"x")
+        meta_path = tmp_path / "staging" / "meta.json"
+        pipeline = _FakePipelineRunner(
+            fail_rc_by_subpath={
+                "__meta__": (0, "", 2, "meta.json: Not found in archive"),
+            },
+        )
+        with pytest.raises(BundleIntegrityError, match="tar"):
+            extract_meta_only(bundle, meta_path, pipeline_runner=pipeline)
+
+    def test_timeout_raises_bundle_integrity_error(self, tmp_path):
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.write_bytes(b"x")
+        meta_path = tmp_path / "staging" / "meta.json"
+        pipeline = _FakePipelineRunner(raise_timeout=True)
+        with pytest.raises(BundleIntegrityError, match="timed out"):
+            extract_meta_only(bundle, meta_path, pipeline_runner=pipeline)
+
+
+# ── substitute_fstab ───────────────────────────────────────────────────────
+
+
+_FSTAB_TEMPLATE = (
+    b"PARTLABEL={{BOOT_PARTLABEL}}  /boot/firmware  vfat  defaults  0  2\n"
+    b"PARTLABEL=data  /data  ext4  defaults  0  2\n"
+)
+
+
+class TestSubstituteFstab:
+    def test_slot_1_substitutes_boot_a(self, tmp_path):
+        root = tmp_path / "root"
+        (root / "etc").mkdir(parents=True)
+        (root / "etc" / "fstab.template").write_bytes(_FSTAB_TEMPLATE)
+
+        substitute_fstab(root, 1)
+
+        out = (root / "etc" / "fstab").read_bytes()
+        assert b"PARTLABEL=boot-A" in out
+        assert b"{{BOOT_PARTLABEL}}" not in out
+
+    def test_slot_2_substitutes_boot_b(self, tmp_path):
+        root = tmp_path / "root"
+        (root / "etc").mkdir(parents=True)
+        (root / "etc" / "fstab.template").write_bytes(_FSTAB_TEMPLATE)
+
+        substitute_fstab(root, 2)
+
+        out = (root / "etc" / "fstab").read_bytes()
+        assert b"PARTLABEL=boot-B" in out
+        assert b"{{BOOT_PARTLABEL}}" not in out
+
+    def test_missing_placeholder_raises_fstab_error(self, tmp_path):
+        """A template with no ``{{BOOT_PARTLABEL}}`` placeholder is a
+        producer bug — refuse to write a "rendered" fstab that would
+        silently mount the wrong boot partition."""
+        root = tmp_path / "root"
+        (root / "etc").mkdir(parents=True)
+        (root / "etc" / "fstab.template").write_bytes(
+            b"# no placeholder\nPARTLABEL=boot-A  /boot/firmware  vfat  defaults  0  2\n"
+        )
+        with pytest.raises(FstabError, match="placeholder"):
+            substitute_fstab(root, 1)
+
+    def test_missing_template_raises_fstab_error(self, tmp_path):
+        """No template file at all is also a producer bug; bricks the
+        device on tryboot — the v0.0.6-test class of failure."""
+        root = tmp_path / "root"
+        (root / "etc").mkdir(parents=True)
+        with pytest.raises(FstabError, match="template"):
+            substitute_fstab(root, 1)
+
+
+# ── rewrite_cmdline ────────────────────────────────────────────────────────
+
+
+class TestRewriteCmdline:
+    def test_slot_1_writes_root_partlabel_a(self, tmp_path):
+        boot = tmp_path / "boot"
+        boot.mkdir()
+        (boot / "cmdline.txt").write_text(
+            "console=tty1 root=PARTLABEL=root-B rw rootfstype=ext4\n"
+        )
+
+        rewrite_cmdline(boot, 1)
+
+        out = (boot / "cmdline.txt").read_text()
+        assert "root=PARTLABEL=root-A" in out
+        # The old "root=PARTLABEL=root-B" must be gone.
+        assert "root=PARTLABEL=root-B" not in out
+        # Other tokens preserved.
+        assert "console=tty1" in out
+        assert "rootfstype=ext4" in out
+
+    def test_slot_2_writes_root_partlabel_b(self, tmp_path):
+        boot = tmp_path / "boot"
+        boot.mkdir()
+        (boot / "cmdline.txt").write_text(
+            "console=tty1 root=PARTLABEL=root-A rw\n"
+        )
+
+        rewrite_cmdline(boot, 2)
+
+        out = (boot / "cmdline.txt").read_text()
+        assert "root=PARTLABEL=root-B" in out
+        assert "root=PARTLABEL=root-A" not in out
+
+    def test_appends_rw_if_missing(self, tmp_path):
+        """rootfs must be mounted r/w so agora-firstboot can resize and
+        seed /data. A cmdline lacking ``rw`` is a producer bug we
+        defend against."""
+        boot = tmp_path / "boot"
+        boot.mkdir()
+        (boot / "cmdline.txt").write_text(
+            "console=tty1 root=PARTLABEL=root-A ro rootfstype=ext4\n"
+        )
+
+        rewrite_cmdline(boot, 2)
+
+        out = (boot / "cmdline.txt").read_text()
+        # ``ro`` token preserved verbatim (we don't strip it), but ``rw``
+        # is appended if not present.
+        assert " rw" in out or out.startswith("rw") or "rw " in out
+
+    def test_strips_stray_root_token(self, tmp_path):
+        """Multiple ``root=`` tokens in the source would be ambiguous;
+        rewrite collapses to exactly one."""
+        boot = tmp_path / "boot"
+        boot.mkdir()
+        (boot / "cmdline.txt").write_text(
+            "root=/dev/mmcblk0p3 console=tty1 root=PARTLABEL=root-A rw\n"
+        )
+
+        rewrite_cmdline(boot, 1)
+
+        out = (boot / "cmdline.txt").read_text()
+        assert out.count("root=") == 1
+        assert "root=PARTLABEL=root-A" in out
+        assert "/dev/mmcblk0p3" not in out
+
+    def test_missing_cmdline_raises_cmdline_error(self, tmp_path):
+        boot = tmp_path / "boot"
+        boot.mkdir()
+        with pytest.raises(CmdlineError, match="cmdline"):
+            rewrite_cmdline(boot, 1)
+
+
+# ── rsync_tree (still exported for fleet-state callers / tests) ────────────
 
 
 class TestRsyncTree:
@@ -314,38 +563,60 @@ class TestRsyncTree:
 # ── SlotStager: pipeline helpers ───────────────────────────────────────────
 
 
-def _build_unpacked_tree(
-    staging_dir: Path,
+_DEFAULT_BOOT_FILES = {
+    "cmdline.txt": b"console=tty1 root=PARTLABEL=root-A rw rootfstype=ext4\n",
+}
+_DEFAULT_ROOT_FILES = {
+    "etc/os-release": b'NAME="Agora OS"\n',
+    "etc/fstab.template": _FSTAB_TEMPLATE,
+}
+
+
+def _build_partitioned_bundle(
+    *,
     target_version: str = "1.1.0",
-    files: dict[str, bytes] | None = None,
-    extra_top_level: list[str] | None = None,
-    missing_top_level: list[str] | None = None,
-) -> tuple[Path, dict]:
-    """Build a faux ``unpacked/`` tree under ``staging_dir`` and return
-    the path + the meta dict that names every regular file under it.
+    boot_files: dict[str, bytes] | None = None,
+    root_files: dict[str, bytes] | None = None,
+    extra_manifest_entries: dict[str, bytes] | None = None,
+    drop_manifest_entries: list[str] | None = None,
+) -> tuple[bytes, dict[str, dict[str, bytes]]]:
+    """Build ``(meta_bytes, files_by_subpath)`` matching what a real
+    ``zstd | tar --strip-components=1`` pipeline would have produced.
 
-    Used to simulate what zstd + tar would have produced. The
-    SlotStager pipeline picks up from there.
+    The manifest in ``meta_bytes`` uses bundle-relative paths (e.g.
+    ``"boot/cmdline.txt"`` / ``"root/etc/fstab.template"``); the
+    ``files_by_subpath`` dict has the partition-relative paths the
+    fake pipeline runner writes after ``--strip-components=1``.
+
+    ``extra_manifest_entries`` adds rows to the manifest using their
+    hashes — the matching files are NOT written by the runner, which
+    is how we simulate the "missing on disk" error path.
+
+    ``drop_manifest_entries`` removes rows from the manifest by their
+    bundle-relative path — the matching files ARE still written by
+    the runner, simulating "extra file on disk".
     """
-    unpacked = staging_dir / "unpacked"
-    boot = unpacked / "boot"
-    root = unpacked / "root"
-    boot.mkdir(parents=True)
-    root.mkdir(parents=True)
-    if files is None:
-        files = {
-            "boot/cmdline.txt": b"console=tty1 root=PARTLABEL=root-A",
-            "root/etc/os-release": b'NAME="Agora OS"\n',
-        }
-    for relpath, content in files.items():
-        target = unpacked / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+    boot_files = (
+        dict(_DEFAULT_BOOT_FILES) if boot_files is None else dict(boot_files)
+    )
+    root_files = (
+        dict(_DEFAULT_ROOT_FILES) if root_files is None else dict(root_files)
+    )
 
-    manifest = {
-        relpath: hashlib.sha256(content).hexdigest()
-        for relpath, content in files.items()
-    }
+    files_by_subpath = {"boot": boot_files, "root": root_files}
+
+    manifest: dict[str, str] = {}
+    for rel, content in boot_files.items():
+        manifest[f"boot/{rel}"] = hashlib.sha256(content).hexdigest()
+    for rel, content in root_files.items():
+        manifest[f"root/{rel}"] = hashlib.sha256(content).hexdigest()
+
+    for key, content in (extra_manifest_entries or {}).items():
+        manifest[key] = hashlib.sha256(content).hexdigest()
+
+    for key in drop_manifest_entries or []:
+        manifest.pop(key, None)
+
     meta = {
         "version": target_version,
         "min_from_version": "1.0.0",
@@ -354,21 +625,7 @@ def _build_unpacked_tree(
         "created_at": "2026-04-22T00:00:00Z",
         "builder": "test",
     }
-    (unpacked / "meta.json").write_text(json.dumps(meta))
-
-    for extra in extra_top_level or []:
-        (unpacked / extra).touch()
-    for missing in missing_top_level or []:
-        target = unpacked / missing
-        if target.is_dir():
-            for child in target.rglob("*"):
-                if child.is_file():
-                    child.unlink()
-            target.rmdir()
-        elif target.exists():
-            target.unlink()
-
-    return unpacked, meta
+    return json.dumps(meta).encode(), files_by_subpath
 
 
 class _FakeSlotStatus:
@@ -416,6 +673,7 @@ def _make_stager(
     tmp_path: Path,
     *,
     runner: _FakeRunner | None = None,
+    pipeline_runner: _FakePipelineRunner | None = None,
     running_slot=1,
     trigger_tryboot_exc: Exception | None = None,
     trigger_tryboot_calls: list[int] | None = None,
@@ -427,11 +685,16 @@ def _make_stager(
     populated with every :data:`FLEET_STATE_REQUIRED` fixture so the
     full happy-path pipeline runs end-to-end. Pass
     ``seed_fleet_state=False`` to leave slot A empty for "missing
-    required" tests; pass a custom seeded ``slot_a_root`` to construct
-    SlotStager directly otherwise.
+    required" tests.
+
+    ``pipeline_runner`` defaults to a no-canned-files fake which is
+    useful for tests that don't drive the full pipeline (e.g. the
+    slot-state error tests that bail before ``stream_extract_subtree``).
     """
     if runner is None:
         runner = _FakeRunner()
+    if pipeline_runner is None:
+        pipeline_runner = _FakePipelineRunner()
 
     def fake_slot_state():
         return _FakeSlotStatus(running_slot)
@@ -459,6 +722,7 @@ def _make_stager(
 
     return SlotStager(
         runner=runner,
+        pipeline_runner=pipeline_runner,
         boot_mount_slot_a=slot_a_boot,
         boot_mount_slot_b=slot_b_boot,
         inactive_root_mount=inactive_root,
@@ -468,14 +732,50 @@ def _make_stager(
     )
 
 
-def _seed_staging(tmp_path: Path) -> Path:
-    """Create ``staging_dir/bundle.tar.zst`` + matching ``unpacked/``
-    tree so the SlotStager pipeline can run without real zstd/tar."""
+def _setup_stager_with_bundle(
+    tmp_path: Path,
+    *,
+    target_version: str = "1.1.0",
+    boot_files: dict[str, bytes] | None = None,
+    root_files: dict[str, bytes] | None = None,
+    extra_manifest_entries: dict[str, bytes] | None = None,
+    drop_manifest_entries: list[str] | None = None,
+    runner: _FakeRunner | None = None,
+    running_slot=1,
+    trigger_tryboot_exc: Exception | None = None,
+    trigger_tryboot_calls: list[int] | None = None,
+    seed_fleet_state: bool = True,
+) -> tuple[Path, SlotStager, _FakePipelineRunner]:
+    """One-call setup: build staging dir + canned bundle + stager.
+
+    Returns ``(staging_dir, stager, pipeline_runner)``. The pipeline
+    runner is exposed so tests can introspect or mutate it (e.g. add a
+    second invocation that fails)."""
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     (staging_dir / "bundle.tar.zst").write_bytes(b"fake compressed")
-    _build_unpacked_tree(staging_dir)
-    return staging_dir
+
+    meta_bytes, files_by_subpath = _build_partitioned_bundle(
+        target_version=target_version,
+        boot_files=boot_files,
+        root_files=root_files,
+        extra_manifest_entries=extra_manifest_entries,
+        drop_manifest_entries=drop_manifest_entries,
+    )
+    pipeline_runner = _FakePipelineRunner(
+        files_by_subpath=files_by_subpath, meta_bytes=meta_bytes
+    )
+
+    stager = _make_stager(
+        tmp_path,
+        runner=runner,
+        pipeline_runner=pipeline_runner,
+        running_slot=running_slot,
+        trigger_tryboot_exc=trigger_tryboot_exc,
+        trigger_tryboot_calls=trigger_tryboot_calls,
+        seed_fleet_state=seed_fleet_state,
+    )
+    return staging_dir, stager, pipeline_runner
 
 
 # ── SlotStager: happy path ─────────────────────────────────────────────────
@@ -483,12 +783,18 @@ def _seed_staging(tmp_path: Path) -> Path:
 
 class TestSlotStagerHappyPath:
     def test_full_pipeline_running_slot_1(self, tmp_path):
-        """Running slot 1 ⇒ tryboot must target slot 2 ⇒ boot rsync hits
-        slot-B mount."""
-        staging_dir = _seed_staging(tmp_path)
+        """Running slot 1 ⇒ tryboot must target slot 2 ⇒ streaming
+        writes hit the slot-B boot mount + the inactive-root mount.
+
+        Asserts (a) trigger_tryboot fired with slot 2, (b) only cp -a
+        calls land in the synchronous runner (zstd/tar/rsync go through
+        the pipeline_runner now), (c) substitute_fstab wrote
+        ``etc/fstab`` referencing boot-B, (d) rewrite_cmdline rewrote
+        cmdline.txt to ``root=PARTLABEL=root-B``.
+        """
         runner = _FakeRunner()
         tryboot_calls: list[int] = []
-        stager = _make_stager(
+        staging_dir, stager, pipeline = _setup_stager_with_bundle(
             tmp_path,
             runner=runner,
             running_slot=1,
@@ -499,33 +805,52 @@ class TestSlotStagerHappyPath:
 
         # Tryboot fired with the inactive slot.
         assert tryboot_calls == [2]
-        # zstd, tar, rsync, rsync, then cp -a once per fleet-state file.
+
+        # Pipeline calls: meta-only, then boot, then root.
+        pipeline_subpaths = [c[0] for c in pipeline.calls]
+        assert pipeline_subpaths == ["__meta__", "boot", "root"]
+
+        # Runner only saw cp calls — no zstd/tar/rsync at all.
         heads = [c[0] for c in runner.calls]
-        assert heads[:4] == ["zstd", "tar", "rsync", "rsync"]
-        assert heads[4:] and all(h == "cp" for h in heads[4:]), (
-            f"expected only cp calls after the rsyncs, got {heads}"
+        assert heads, "expected cp invocations for fleet-state copy"
+        assert all(h == "cp" for h in heads), (
+            f"expected only cp calls in runner, got {heads}"
         )
         # 4 required literals + 2 ssh host keys + 1 optional wifi nmconnection
         # from _seed_fake_slot_a == 7 cp invocations.
-        assert len(heads[4:]) == 7
-        # First rsync writes the slot-B boot mount.
-        rsync_calls = [c for c in runner.calls if c[0] == "rsync"]
-        assert str(stager.boot_mount_slot_b) in rsync_calls[0][-1]
-        # Second rsync writes inactive-root.
-        assert str(stager.inactive_root_mount) in rsync_calls[1][-1]
+        assert len(heads) == 7
+
+        # Boot was streamed into slot-B boot mount.
+        boot_call = next(c for c in pipeline.calls if c[0] == "boot")
+        assert boot_call[2] == str(stager.boot_mount_slot_b)
+
+        # Root was streamed into inactive-root mount.
+        root_call = next(c for c in pipeline.calls if c[0] == "root")
+        assert root_call[2] == str(stager.inactive_root_mount)
+
         # Every cp's destination must be inside the inactive_root_mount —
         # otherwise we're writing identity files into the running slot.
         cp_calls = [c for c in runner.calls if c[0] == "cp"]
         for cp in cp_calls:
             assert str(stager.inactive_root_mount) in cp[-1]
 
+        # substitute_fstab side-effect: etc/fstab now exists on slot B
+        # and references boot-B (since we tryboot to slot 2).
+        fstab = (stager.inactive_root_mount / "etc" / "fstab").read_bytes()
+        assert b"PARTLABEL=boot-B" in fstab
+        assert b"{{BOOT_PARTLABEL}}" not in fstab
+
+        # rewrite_cmdline side-effect: cmdline.txt references root-B.
+        cmdline = (stager.boot_mount_slot_b / "cmdline.txt").read_text()
+        assert "root=PARTLABEL=root-B" in cmdline
+        assert "root=PARTLABEL=root-A" not in cmdline
+
     def test_full_pipeline_running_slot_2(self, tmp_path):
-        """Running slot 2 ⇒ tryboot must target slot 1 ⇒ rsync hits
-        slot-A mount."""
-        staging_dir = _seed_staging(tmp_path)
+        """Running slot 2 ⇒ tryboot must target slot 1 ⇒ streaming
+        writes hit the slot-A boot mount + the inactive-root mount."""
         runner = _FakeRunner()
         tryboot_calls: list[int] = []
-        stager = _make_stager(
+        staging_dir, stager, pipeline = _setup_stager_with_bundle(
             tmp_path,
             runner=runner,
             running_slot=2,
@@ -533,17 +858,25 @@ class TestSlotStagerHappyPath:
         )
         stager._stage_sync(_make_payload(), staging_dir)
         assert tryboot_calls == [1]
-        rsync_calls = [c for c in runner.calls if c[0] == "rsync"]
-        assert str(stager.boot_mount_slot_a) in rsync_calls[0][-1]
+
+        boot_call = next(c for c in pipeline.calls if c[0] == "boot")
+        assert boot_call[2] == str(stager.boot_mount_slot_a)
+
+        # cmdline rewritten to root-A.
+        cmdline = (stager.boot_mount_slot_a / "cmdline.txt").read_text()
+        assert "root=PARTLABEL=root-A" in cmdline
+
+        # fstab references boot-A.
+        fstab = (stager.inactive_root_mount / "etc" / "fstab").read_bytes()
+        assert b"PARTLABEL=boot-A" in fstab
 
     def test_stage_async_entrypoint_dispatches_to_sync(self, tmp_path):
         """The async ``stage()`` is a thin :func:`asyncio.to_thread` wrapper.
         Hitting it once proves the wiring."""
         import asyncio
 
-        staging_dir = _seed_staging(tmp_path)
         tryboot_calls: list[int] = []
-        stager = _make_stager(
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
             tmp_path,
             running_slot=1,
             trigger_tryboot_calls=tryboot_calls,
@@ -556,62 +889,129 @@ class TestSlotStagerHappyPath:
 
 
 class TestSlotStagerErrors:
-    def test_unexpected_top_level_entries_raises_integrity_error(self, tmp_path):
-        staging_dir = tmp_path / "staging"
-        staging_dir.mkdir()
-        (staging_dir / "bundle.tar.zst").write_bytes(b"x")
-        _build_unpacked_tree(staging_dir, extra_top_level=["unexpected.txt"])
-        stager = _make_stager(tmp_path, running_slot=1)
-        with pytest.raises(BundleIntegrityError, match="unexpected top-level entries"):
+    def test_missing_on_disk_raises_integrity_error(self, tmp_path):
+        """Manifest references a file the pipeline runner didn't write
+        (simulates a tar bug, an unexpected ``--strip-components`` mismatch,
+        or a builder regression). verify_bundle_manifest catches it."""
+        # The runner only writes etc/os-release; the manifest also
+        # references etc/fstab.template (via _DEFAULT_ROOT_FILES) but
+        # we'll strip it from the runner's payload below.
+        runner = _FakeRunner()
+        tryboot_calls: list[int] = []
+        staging_dir, stager, pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            runner=runner,
+            running_slot=1,
+            trigger_tryboot_calls=tryboot_calls,
+        )
+        # Drop a file from the runner so manifest verify sees it missing.
+        pipeline.files_by_subpath["root"].pop("etc/fstab.template")
+
+        with pytest.raises(BundleIntegrityError, match="missing on disk"):
             stager._stage_sync(_make_payload(), staging_dir)
 
-    def test_missing_top_level_entry_raises_integrity_error(self, tmp_path):
-        staging_dir = tmp_path / "staging"
-        staging_dir.mkdir()
-        (staging_dir / "bundle.tar.zst").write_bytes(b"x")
-        # Build the tree, then yank one of the required dirs.
-        _build_unpacked_tree(staging_dir, missing_top_level=["boot"])
-        stager = _make_stager(tmp_path, running_slot=1)
-        with pytest.raises(BundleIntegrityError, match="missing required top-level"):
+        # tryboot must NOT fire — verify failed first.
+        assert tryboot_calls == []
+
+    def test_extra_file_on_disk_raises_integrity_error(self, tmp_path):
+        """Pipeline runner writes a file the manifest doesn't list —
+        could be a tar bug or a tampered bundle that added rootkit
+        binaries the producer never signed. verify_bundle_manifest
+        catches it."""
+        runner = _FakeRunner()
+        tryboot_calls: list[int] = []
+        staging_dir, stager, pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            runner=runner,
+            running_slot=1,
+            trigger_tryboot_calls=tryboot_calls,
+        )
+        # Add an extra file to the runner that's not in the manifest.
+        pipeline.files_by_subpath["root"]["etc/sneaky.bin"] = b"surprise!\n"
+
+        with pytest.raises(BundleIntegrityError, match="extra file"):
             stager._stage_sync(_make_payload(), staging_dir)
+
+        assert tryboot_calls == []
 
     def test_meta_version_mismatch_raises_integrity_error(self, tmp_path):
         """Defense-in-depth: bundle's ``meta.version`` must match the
         dispatch payload's ``target_version`` even if the signature is
         valid. Catches a swapped-bundle scenario."""
-        staging_dir = tmp_path / "staging"
-        staging_dir.mkdir()
-        (staging_dir / "bundle.tar.zst").write_bytes(b"x")
+        tryboot_calls: list[int] = []
         # Bundle says 1.2.0; payload below says 1.1.0.
-        _build_unpacked_tree(staging_dir, target_version="1.2.0")
-        stager = _make_stager(tmp_path, running_slot=1)
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            target_version="1.2.0",
+            running_slot=1,
+            trigger_tryboot_calls=tryboot_calls,
+        )
         with pytest.raises(BundleIntegrityError, match="does not match.*target_version"):
             stager._stage_sync(_make_payload("1.1.0"), staging_dir)
+        # tryboot must NOT fire — version mismatch is detected BEFORE
+        # we write a single byte to slot B.
+        assert tryboot_calls == []
 
-    def test_manifest_mismatch_raises_integrity_error(self, tmp_path):
-        """File on disk hashes differently than the manifest claims."""
-        staging_dir = tmp_path / "staging"
-        staging_dir.mkdir()
-        (staging_dir / "bundle.tar.zst").write_bytes(b"x")
-        unpacked, _meta = _build_unpacked_tree(staging_dir)
-        # Tamper with one of the files after the manifest was sealed.
-        (unpacked / "boot/cmdline.txt").write_bytes(b"tampered")
-        stager = _make_stager(tmp_path, running_slot=1)
+    def test_manifest_sha256_mismatch_raises_integrity_error(self, tmp_path):
+        """File written by the pipeline runner hashes differently than
+        the manifest claims (simulates a torn write or a tampered bundle
+        whose manifest wasn't re-signed)."""
+        runner = _FakeRunner()
+        tryboot_calls: list[int] = []
+        staging_dir, stager, pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            runner=runner,
+            running_slot=1,
+            trigger_tryboot_calls=tryboot_calls,
+        )
+        # Tamper with the file the runner will write.
+        pipeline.files_by_subpath["boot"]["cmdline.txt"] = b"tampered\n"
+
         with pytest.raises(BundleIntegrityError, match="sha256 mismatch"):
             stager._stage_sync(_make_payload(), staging_dir)
+
+        assert tryboot_calls == []
+
+    def test_meta_extract_failure_raises_integrity_error(self, tmp_path):
+        """``tar -xOf - meta.json`` returns non-zero (meta member absent
+        from archive). Should surface BEFORE any partition writes."""
+        runner = _FakeRunner()
+        tryboot_calls: list[int] = []
+        staging_dir, stager, pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            runner=runner,
+            running_slot=1,
+            trigger_tryboot_calls=tryboot_calls,
+        )
+        pipeline.fail_rc_by_subpath["__meta__"] = (
+            0,
+            "",
+            2,
+            "meta.json: Not found in archive",
+        )
+        with pytest.raises(BundleIntegrityError):
+            stager._stage_sync(_make_payload(), staging_dir)
+        assert tryboot_calls == []
 
     def test_running_slot_none_raises_staging_error(self, tmp_path):
         """``slot_state()`` couldn't determine which slot is running —
         refuse to stage (would otherwise risk writing to the live slot)."""
-        staging_dir = _seed_staging(tmp_path)
-        stager = _make_stager(tmp_path, running_slot=None)
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=None
+        )
         with pytest.raises(StagingError, match="could not determine running slot"):
             stager._stage_sync(_make_payload(), staging_dir)
 
     def test_slot_state_fn_raising_is_wrapped_in_staging_error(self, tmp_path):
         """slot_mgr may raise — wrap as :class:`StagingError` so the
         service classifies it as ``stage_failed``, not ``error_<TypeName>``."""
-        staging_dir = _seed_staging(tmp_path)
+        staging_dir = tmp_path / "staging"
+        staging_dir.mkdir()
+        (staging_dir / "bundle.tar.zst").write_bytes(b"fake")
+        meta_bytes, files_by_subpath = _build_partitioned_bundle()
+        pipeline = _FakePipelineRunner(
+            files_by_subpath=files_by_subpath, meta_bytes=meta_bytes
+        )
 
         def boom():
             raise RuntimeError("dbus is down")
@@ -623,6 +1023,7 @@ class TestSlotStagerErrors:
         slot_a.mkdir(); slot_b.mkdir(); inactive.mkdir()
         stager = SlotStager(
             runner=runner,
+            pipeline_runner=pipeline,
             boot_mount_slot_a=slot_a,
             boot_mount_slot_b=slot_b,
             inactive_root_mount=inactive,
@@ -636,8 +1037,9 @@ class TestSlotStagerErrors:
         """If the systemd unit didn't mount slot-B's boot partition, the
         stager must refuse — writing into a non-mount would silently
         target the *running* slot's filesystem."""
-        staging_dir = _seed_staging(tmp_path)
-        stager = _make_stager(tmp_path, running_slot=1)
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=1
+        )
         # Yank the slot-B boot dir we built in the helper.
         import shutil
         shutil.rmtree(stager.boot_mount_slot_b)
@@ -645,30 +1047,20 @@ class TestSlotStagerErrors:
             stager._stage_sync(_make_payload(), staging_dir)
 
     def test_missing_inactive_root_mountpoint_raises_staging_error(self, tmp_path):
-        staging_dir = _seed_staging(tmp_path)
-        stager = _make_stager(tmp_path, running_slot=1)
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=1
+        )
         import shutil
         shutil.rmtree(stager.inactive_root_mount)
         with pytest.raises(StagingError, match="root mountpoint missing"):
-            stager._stage_sync(_make_payload(), staging_dir)
-
-    def test_rsync_failure_raises_rsync_error(self, tmp_path):
-        staging_dir = _seed_staging(tmp_path)
-        runner = _FakeRunner(
-            results_by_head={"rsync": 23},
-            stderr_by_head={"rsync": "vanished"},
-        )
-        stager = _make_stager(tmp_path, runner=runner, running_slot=1)
-        with pytest.raises(RsyncError, match="rsync failed"):
             stager._stage_sync(_make_payload(), staging_dir)
 
     def test_pinned_device_raises_tryboot_error(self, tmp_path):
         """``slot_mgr.trigger_tryboot`` can raise ``PinnedError`` (or any
         exception) when 3-strikes pinning is active. The stager must wrap
         that as :class:`TrybootError` for the wire code."""
-        staging_dir = _seed_staging(tmp_path)
         tryboot_calls: list[int] = []
-        stager = _make_stager(
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
             tmp_path,
             running_slot=1,
             trigger_tryboot_exc=RuntimeError("device pinned"),
@@ -678,20 +1070,6 @@ class TestSlotStagerErrors:
             stager._stage_sync(_make_payload(), staging_dir)
         # The trigger was actually called — wrapping happens after the raise.
         assert tryboot_calls == [2]
-
-    def test_meta_json_missing_raises_integrity_error(self, tmp_path):
-        """Edge: ``meta.json`` deleted after extract but before parse.
-        Shouldn't normally happen but the parse error must still surface."""
-        staging_dir = tmp_path / "staging"
-        staging_dir.mkdir()
-        (staging_dir / "bundle.tar.zst").write_bytes(b"x")
-        unpacked, _ = _build_unpacked_tree(staging_dir)
-        (unpacked / "meta.json").unlink()
-        # Top-level entries check fires first — it sees boot/, root/ but
-        # no meta.json — that's a "missing required top-level" error.
-        stager = _make_stager(tmp_path, running_slot=1)
-        with pytest.raises(BundleIntegrityError, match="missing required top-level"):
-            stager._stage_sync(_make_payload(), staging_dir)
 
 
 # ── copy_fleet_state (D60) ─────────────────────────────────────────────────
@@ -824,11 +1202,10 @@ class TestSlotStagerFleetStateIntegration:
     becomes the active slot."""
 
     def test_missing_required_aborts_before_trigger_tryboot(self, tmp_path):
-        staging_dir = _seed_staging(tmp_path)
         tryboot_calls: list[int] = []
         # seed_fleet_state=False ⇒ slot A is empty ⇒ FLEET_STATE_REQUIRED
         # check fails on the first entry.
-        stager = _make_stager(
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
             tmp_path,
             running_slot=1,
             trigger_tryboot_calls=tryboot_calls,
