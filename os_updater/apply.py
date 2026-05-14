@@ -11,8 +11,13 @@ follow-up):
 3. Defense-in-depth: compare ``meta.version`` to
    ``payload.target_version`` BEFORE we write a single byte to slot B.
 4. Determine running + inactive slots via :func:`slot_mgr.slot_state`.
-5. Resolve target mountpoints for the inactive slot's boot + root
-   partitions (mounted by the daemon-launcher systemd unit).
+5. Ensure target mountpoints for the inactive slot's boot + root
+   partitions are mounted; if not (the agora-os v0.0.7-test failure
+   mode — no ``.mount`` units shipped), mount them ourselves via
+   :func:`ensure_partition_mounted` against the GPT partition labels
+   baked by ``agora-os/image-build/assemble.sh``. Idempotent — a
+   future agora-os release that ships systemd ``.mount`` units will
+   trip the already-mounted short-circuit and no-op here.
 6. ``zstd -dc | tar -x --strip-components=1 -C <boot_target> boot``
    — stream the boot subtree straight onto the inactive boot
    partition. ``--strip-components=1`` rewrites ``boot/foo`` to
@@ -117,10 +122,48 @@ DEFAULT_BOOT_MOUNT_SLOT_A = Path("/boot/firmware")
 DEFAULT_BOOT_MOUNT_SLOT_B = Path("/boot/firmware-b")
 
 #: Where the inactive slot's root partition is mounted while the
-#: running slot writes into it. The systemd unit that launches the
-#: agora-os-updater daemon mounts this path before daemon start;
-#: :class:`SlotStager` does not mount or unmount it.
+#: running slot writes into it. :class:`SlotStager` ensures this is
+#: mounted itself at the start of step 5 via
+#: :func:`ensure_partition_mounted` — earlier versions trusted the
+#: daemon-launcher systemd unit to mount it before daemon start, but
+#: no such unit shipped in agora-os v0.0.7-test or earlier, leading
+#: to silent writes onto the active rootfs and a brick on tryboot.
 DEFAULT_INACTIVE_ROOT_MOUNT = Path("/mnt/inactive-root")
+
+#: Default location of the kernel's mount table. Tests inject a path
+#: to a fixture file with mountinfo-style content (one mount per
+#: line, mountpoint in column 2).
+DEFAULT_MOUNTS_PATH = Path("/proc/self/mounts")
+
+#: Base path under which the kernel materializes GPT-partition-label
+#: symlinks. Tests inject a tmp path. Parallels
+#: :data:`precheck.core.DEFAULT_PARTLABEL_BASE` — duplicated here so
+#: ``apply`` does not depend on ``precheck``.
+DEFAULT_PARTLABEL_BASE = Path("/dev/disk/by-partlabel")
+
+#: Mount options for the inactive slot's boot (FAT32) partition.
+#: ``flush`` makes writes more durable and matches the fstab template
+#: shipped by agora-os.
+DEFAULT_BOOT_MOUNT_OPTS = "defaults,flush"
+
+#: Mount options for the inactive slot's root (ext4) partition.
+#: ``noatime`` because the partition is write-once-then-tryboot —
+#: avoiding noisy atime writes during the multi-GB streaming extract.
+DEFAULT_ROOT_MOUNT_OPTS = "defaults,noatime"
+
+#: Per-call timeout for the ``mount(8)`` invocations issued by
+#: :func:`ensure_partition_mounted`. The kernel and udev are fast;
+#: anything taking longer than this on a healthy partition is
+#: structurally wrong.
+DEFAULT_MOUNT_TIMEOUT_S = 30.0
+
+#: Compiled regex matching the C-style octal escapes used by
+#: ``/proc/self/mounts`` to encode special characters in mountpoint
+#: paths (``\040`` space, ``\011`` tab, ``\012`` newline, ``\134``
+#: backslash). Only octal escapes are valid; the kernel never emits
+#: ``\u``/``\U``/``\N`` style escapes that Python's ``unicode_escape``
+#: codec would otherwise mishandle for Windows-style test paths.
+_MOUNTS_OCTAL_RE = re.compile(r"\\([0-7]{3})")
 
 #: zstd long-range window matching the builder side
 #: (docs/bundle-format.md §"Compression": ``zstd -19 --long=27``).
@@ -307,6 +350,32 @@ def boot_mount_for_slot(
     raise StagingError(f"invalid slot number: {slot!r} (expected 1 or 2)")
 
 
+#: GPT partition labels baked into the image by
+#: ``agora-os/image-build/assemble.sh`` (see plan.md D51).
+_BOOT_PARTLABEL_FOR_SLOT = {1: "boot-A", 2: "boot-B"}
+_ROOT_PARTLABEL_FOR_SLOT = {1: "root-A", 2: "root-B"}
+
+
+def boot_partlabel_for_slot(slot: int) -> str:
+    """Return the GPT partition label for ``slot``'s boot (FAT32) partition.
+
+    Raises :class:`StagingError` on bad input.
+    """
+    if slot in _BOOT_PARTLABEL_FOR_SLOT:
+        return _BOOT_PARTLABEL_FOR_SLOT[slot]
+    raise StagingError(f"invalid slot number: {slot!r} (expected 1 or 2)")
+
+
+def root_partlabel_for_slot(slot: int) -> str:
+    """Return the GPT partition label for ``slot``'s root (ext4) partition.
+
+    Raises :class:`StagingError` on bad input.
+    """
+    if slot in _ROOT_PARTLABEL_FOR_SLOT:
+        return _ROOT_PARTLABEL_FOR_SLOT[slot]
+    raise StagingError(f"invalid slot number: {slot!r} (expected 1 or 2)")
+
+
 # ── Subprocess wrappers ────────────────────────────────────────────────────
 
 
@@ -317,6 +386,124 @@ def _tail(text: Optional[str], limit: int = 2000) -> str:
     if len(text) <= limit:
         return text
     return "…" + text[-limit:]
+
+
+def _is_mountpoint(
+    target: Path,
+    *,
+    mounts_path: Path = DEFAULT_MOUNTS_PATH,
+) -> bool:
+    """Return True if ``target`` appears as a mountpoint in ``mounts_path``.
+
+    Reads ``mounts_path`` (``/proc/self/mounts`` in production) and looks
+    for a line whose second field (mountpoint) resolves to the same path
+    as ``target`` after :py:meth:`Path.resolve`. Returns False if
+    ``mounts_path`` is missing — pure read with no side effects.
+
+    ``/proc/self/mounts`` encodes special characters in mountpoint paths
+    with C-style octal escapes (e.g. a literal space becomes ``\\040``);
+    this helper decodes them before comparison so that paths containing
+    spaces still match.
+    """
+    target = Path(target).resolve()
+    try:
+        content = Path(mounts_path).read_text()
+    except FileNotFoundError:
+        return False
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        # ``/proc/self/mounts`` encodes only a fixed set of characters as
+        # C-style **octal** escapes (\040 space, \011 tab, \012 newline,
+        # \134 backslash). We deliberately do not run this through
+        # Python's full ``unicode_escape`` codec because that would also
+        # try to interpret ``\U``/``\u``/``\N`` etc., which blows up on
+        # Windows paths like ``C:\Users\...`` even though we never see
+        # such paths on real Pi hardware. Tests still want to run on
+        # the maintainer's workstation.
+        decoded = _MOUNTS_OCTAL_RE.sub(
+            lambda m: chr(int(m.group(1), 8)), parts[1]
+        )
+        try:
+            if Path(decoded).resolve() == target:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def ensure_partition_mounted(
+    partlabel: str,
+    target: Path,
+    *,
+    fstype: str,
+    opts: str,
+    runner: Runner = _default_runner,
+    mounts_path: Path = DEFAULT_MOUNTS_PATH,
+    partlabel_base: Path = DEFAULT_PARTLABEL_BASE,
+    timeout_s: float = DEFAULT_MOUNT_TIMEOUT_S,
+) -> None:
+    """Ensure the partition labeled ``partlabel`` is mounted at ``target``.
+
+    Idempotent. If ``target`` is already a mountpoint per ``mounts_path``
+    this no-ops (we do not validate that the *right* partition is
+    mounted there — :func:`copy_fleet_state` and the manifest verify
+    step will catch a wrong-partition case). Otherwise:
+
+    1. Create ``target`` (and any missing parents) as a directory.
+    2. Invoke ``mount(8)`` via ``runner`` to mount
+       ``<partlabel_base>/<partlabel>`` at ``target`` with the supplied
+       fstype and options.
+
+    Raises :class:`StagingError` on any of:
+    - ``mount(8)`` returning non-zero (with stderr in the message),
+    - ``mount(8)`` binary missing from PATH,
+    - ``mount(8)`` exceeding ``timeout_s``.
+
+    This is the defense-in-depth that fixes the v0.0.7-test brick: if
+    agora-os didn't ship systemd .mount units for ``boot-B`` and
+    ``root-B``, slot B's mountpoints are empty rootfs directories, and
+    the streaming extract in step 6/7 would silently write the bundle
+    onto the *active* rootfs (slot A) — leaving slot B stale and
+    bricking the device on tryboot.
+    """
+    target = Path(target)
+    target.mkdir(parents=True, exist_ok=True)
+    if _is_mountpoint(target, mounts_path=mounts_path):
+        logger.info(
+            "partition %s already mounted at %s, skipping mount",
+            partlabel,
+            target,
+        )
+        return
+    device = Path(partlabel_base) / partlabel
+    cmd = ["mount", "-t", fstype, "-o", opts, str(device), str(target)]
+    logger.info(
+        "mounting partition: partlabel=%s device=%s target=%s fstype=%s opts=%s",
+        partlabel,
+        device,
+        target,
+        fstype,
+        opts,
+    )
+    try:
+        result = runner(cmd, timeout=timeout_s)
+    except FileNotFoundError as exc:
+        raise StagingError(
+            f"mount(8) binary not found on PATH while mounting {partlabel}: {exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise StagingError(
+            f"mount(8) timed out after {timeout_s}s while mounting "
+            f"{partlabel} at {target}"
+        ) from exc
+    if result.returncode != 0:
+        raise StagingError(
+            f"failed to mount {partlabel} at {target}: "
+            f"rc={result.returncode} stderr={_tail(result.stderr)!r}"
+        )
+    logger.info("mounted partition %s at %s", partlabel, target)
 
 
 #: Type alias for the pipeline-runner seam — exists so tests can inject
@@ -940,6 +1127,23 @@ class SlotStager:
     fstab_template_rel: str = DEFAULT_FSTAB_TEMPLATE_REL
     fstab_rel: str = DEFAULT_FSTAB_REL
     cmdline_rel: str = DEFAULT_CMDLINE_REL
+    #: Mount options for slot B's boot (FAT32) partition when this
+    #: stager has to mount it itself in step 5. Tests do not exercise
+    #: this knob; production matches the fstab template shipped by
+    #: agora-os.
+    boot_mount_opts: str = DEFAULT_BOOT_MOUNT_OPTS
+    #: Mount options for slot B's root (ext4) partition when this
+    #: stager has to mount it itself in step 5.
+    root_mount_opts: str = DEFAULT_ROOT_MOUNT_OPTS
+    #: Per-call timeout for the ``mount(8)`` invocations in step 5.
+    mount_timeout_s: float = DEFAULT_MOUNT_TIMEOUT_S
+    #: Path to the kernel mount table consulted by step 5 to detect
+    #: an already-mounted target. Tests inject a fixture file.
+    mounts_path: Path = field(default_factory=lambda: DEFAULT_MOUNTS_PATH)
+    #: Base path to ``/dev/disk/by-partlabel/`` consulted by step 5
+    #: to resolve ``boot-A``/``boot-B``/``root-A``/``root-B`` to a
+    #: device node. Tests inject a tmp path.
+    partlabel_base: Path = field(default_factory=lambda: DEFAULT_PARTLABEL_BASE)
 
     async def stage(self, payload: DispatchPayload, staging_dir: Path) -> None:
         """Run the full stage-and-tryboot pipeline (10-step streaming orchestration).
@@ -1004,25 +1208,43 @@ class SlotStager:
             payload.release_id,
         )
 
-        # 5. Resolve target mountpoints for the inactive slot. These must
-        # exist as mountpoints — daemon-launcher systemd unit mounts both
-        # /boot/firmware-b (or -a) and /mnt/inactive-root before us.
+        # 5. Ensure the inactive slot's boot + root partitions are
+        # mounted. Defense-in-depth (see plan.md §"OTA v0.0.7-test
+        # mount gap"): early agora-os images did not ship systemd
+        # ``.mount`` units for ``/boot/firmware-b`` and
+        # ``/mnt/inactive-root``, so the mountpoints were empty rootfs
+        # directories and step 6/7's stream-extract would silently
+        # write the bundle onto the **active** rootfs (slot A),
+        # leaving slot B stale and bricking the device on tryboot.
+        # ``ensure_partition_mounted`` is idempotent — if a systemd
+        # unit already mounted the partition (the agora-os 0.0.8+
+        # path), this is a no-op.
         boot_target = boot_mount_for_slot(
             inactive,
             slot_a_mount=self.boot_mount_slot_a,
             slot_b_mount=self.boot_mount_slot_b,
         )
         root_target = Path(self.inactive_root_mount)
-        if not boot_target.is_dir():
-            raise StagingError(
-                f"inactive slot's boot mountpoint missing: {boot_target} "
-                f"(expected mounted by systemd unit before daemon start)"
-            )
-        if not root_target.is_dir():
-            raise StagingError(
-                f"inactive slot's root mountpoint missing: {root_target} "
-                f"(expected mounted by systemd unit before daemon start)"
-            )
+        ensure_partition_mounted(
+            boot_partlabel_for_slot(inactive),
+            boot_target,
+            fstype="vfat",
+            opts=self.boot_mount_opts,
+            runner=self.runner,
+            mounts_path=self.mounts_path,
+            partlabel_base=self.partlabel_base,
+            timeout_s=self.mount_timeout_s,
+        )
+        ensure_partition_mounted(
+            root_partlabel_for_slot(inactive),
+            root_target,
+            fstype="ext4",
+            opts=self.root_mount_opts,
+            runner=self.runner,
+            mounts_path=self.mounts_path,
+            partlabel_base=self.partlabel_base,
+            timeout_s=self.mount_timeout_s,
+        )
 
         # 6. Stream boot/ subtree straight onto the inactive boot partition.
         # --strip-components=1 turns "boot/foo" into "<boot_target>/foo" and
