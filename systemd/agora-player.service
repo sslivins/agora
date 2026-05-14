@@ -1,7 +1,7 @@
 [Unit]
 Description=Agora Media Player
-After=opt-agora-state.mount agora-provision.service
-Requires=opt-agora-state.mount
+After=data.mount agora-provision.service
+RequiresMountsFor=/opt/agora/state /opt/agora/persist /data
 ConditionPathExists=/opt/agora/persist/provisioned
 DefaultDependencies=no
 
