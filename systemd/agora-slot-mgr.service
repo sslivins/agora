@@ -11,6 +11,14 @@ After=agora-cms-client.service
 After=agora-player.service
 After=agora-watchdog.service
 DefaultDependencies=yes
+# StartLimit* must live in [Unit], NOT [Service]. systemd interprets
+# Restart=/RestartSec= per-unit instance, but the StartLimit* knobs that
+# bound the total restart budget belong to the unit's lifecycle. When
+# they were misplaced in [Service] (pre-#193) systemd silently ignored
+# them and emitted a warning at unit-load time. Move here to actually
+# enforce the bounded retry budget the comment in [Service] promised.
+StartLimitBurst=10
+StartLimitIntervalSec=600
 
 [Service]
 # `oneshot` so the unit runs once after boot and exits; the gate's job
@@ -30,8 +38,6 @@ Environment=AGORA_BASE=/opt/agora
 # recorded.
 Restart=on-failure
 RestartSec=30
-StartLimitBurst=10
-StartLimitIntervalSec=600
 
 # Both `--auto` exit codes that mean "ran to completion" are 0 or 1,
 # and we already filter exit 1 via `--auto` (which always exits 0 or 2).
