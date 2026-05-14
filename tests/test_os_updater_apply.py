@@ -33,8 +33,11 @@ from typing import Optional, Sequence
 import pytest
 
 from os_updater.apply import (
+    DEFAULT_BOOT_MOUNT_OPTS,
     DEFAULT_BOOT_MOUNT_SLOT_A,
     DEFAULT_BOOT_MOUNT_SLOT_B,
+    DEFAULT_MOUNT_TIMEOUT_S,
+    DEFAULT_ROOT_MOUNT_OPTS,
     FLEET_STATE_COPY_IF_PRESENT,
     FLEET_STATE_REQUIRED,
     CmdlineError,
@@ -45,11 +48,15 @@ from os_updater.apply import (
     SlotStager,
     StagingError,
     TrybootError,
+    _is_mountpoint,
     boot_mount_for_slot,
+    boot_partlabel_for_slot,
     copy_fleet_state,
+    ensure_partition_mounted,
     extract_meta_only,
     other_slot,
     rewrite_cmdline,
+    root_partlabel_for_slot,
     rsync_tree,
     stream_extract_subtree,
     substitute_fstab,
@@ -230,6 +237,223 @@ class TestBootMountForSlot:
     def test_invalid_slot_raises_staging_error(self, bad):
         with pytest.raises(StagingError, match="invalid slot number"):
             boot_mount_for_slot(bad)
+
+
+# ── boot_partlabel_for_slot / root_partlabel_for_slot ──────────────────────
+
+
+class TestPartlabelHelpers:
+    """Slot→partlabel mapping — these must NEVER drift from
+    ``agora-os/image-build/assemble.sh``'s ``sgdisk -c`` invocations,
+    or the wrong partition gets mounted in step 5."""
+
+    def test_boot_slot_1_returns_boot_a(self):
+        assert boot_partlabel_for_slot(1) == "boot-A"
+
+    def test_boot_slot_2_returns_boot_b(self):
+        assert boot_partlabel_for_slot(2) == "boot-B"
+
+    def test_root_slot_1_returns_root_a(self):
+        assert root_partlabel_for_slot(1) == "root-A"
+
+    def test_root_slot_2_returns_root_b(self):
+        assert root_partlabel_for_slot(2) == "root-B"
+
+    @pytest.mark.parametrize("bad", [0, 3, -1, 99])
+    def test_invalid_slot_raises_staging_error_for_boot(self, bad):
+        with pytest.raises(StagingError, match="invalid slot number"):
+            boot_partlabel_for_slot(bad)
+
+    @pytest.mark.parametrize("bad", [0, 3, -1, 99])
+    def test_invalid_slot_raises_staging_error_for_root(self, bad):
+        with pytest.raises(StagingError, match="invalid slot number"):
+            root_partlabel_for_slot(bad)
+
+
+# ── _is_mountpoint ─────────────────────────────────────────────────────────
+
+
+class TestIsMountpoint:
+    """Pure-function tests for the ``/proc/self/mounts`` lookup."""
+
+    def test_returns_true_when_target_present(self, tmp_path):
+        target = tmp_path / "mnt-target"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text(f"/dev/foo {target} ext4 rw 0 0\n")
+        assert _is_mountpoint(target, mounts_path=mounts) is True
+
+    def test_returns_false_when_target_absent(self, tmp_path):
+        target = tmp_path / "mnt-target"
+        target.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text(f"/dev/bar {other} ext4 rw 0 0\n")
+        assert _is_mountpoint(target, mounts_path=mounts) is False
+
+    def test_returns_false_when_mounts_file_missing(self, tmp_path):
+        target = tmp_path / "mnt-target"
+        target.mkdir()
+        missing = tmp_path / "does-not-exist"
+        assert _is_mountpoint(target, mounts_path=missing) is False
+
+    def test_decodes_octal_escapes_in_mountpoint(self, tmp_path):
+        """``/proc/self/mounts`` encodes literal spaces in mountpoints
+        as ``\\040``. The helper must decode those before comparing."""
+        target = tmp_path / "with space"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        # Field 2 must be encoded with \040 for the space.
+        encoded = str(target).replace(" ", r"\040")
+        mounts.write_text(f"/dev/baz {encoded} ext4 rw 0 0\n")
+        assert _is_mountpoint(target, mounts_path=mounts) is True
+
+    def test_ignores_short_lines(self, tmp_path):
+        """A blank or 1-field line in mounts must not crash the parser."""
+        target = tmp_path / "mnt-target"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text(
+            "\n"
+            "single-field-line\n"
+            f"/dev/foo {target} ext4 rw 0 0\n"
+        )
+        assert _is_mountpoint(target, mounts_path=mounts) is True
+
+
+# ── ensure_partition_mounted ───────────────────────────────────────────────
+
+
+class TestEnsurePartitionMounted:
+    """Step-5 helper: idempotent mount of a labeled partition."""
+
+    def test_noop_when_already_mounted(self, tmp_path):
+        target = tmp_path / "mnt"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text(f"/dev/foo {target} ext4 rw 0 0\n")
+        runner = _FakeRunner()
+        ensure_partition_mounted(
+            "root-B",
+            target,
+            fstype="ext4",
+            opts="rw",
+            runner=runner,
+            mounts_path=mounts,
+            partlabel_base=tmp_path / "partlabel-base",
+        )
+        # No mount(8) call should have been recorded.
+        assert runner.calls == []
+
+    def test_invokes_mount_when_not_mounted(self, tmp_path):
+        target = tmp_path / "mnt"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text("")
+        partlabel_base = tmp_path / "partlabel-base"
+        partlabel_base.mkdir()
+        runner = _FakeRunner()
+        ensure_partition_mounted(
+            "boot-B",
+            target,
+            fstype="vfat",
+            opts="umask=0077",
+            runner=runner,
+            mounts_path=mounts,
+            partlabel_base=partlabel_base,
+        )
+        assert len(runner.calls) == 1
+        argv = runner.calls[0]
+        # Verify argv shape: mount -t vfat -o umask=0077 /<base>/boot-B <target>
+        assert argv[0] == "mount"
+        assert argv[1:3] == ["-t", "vfat"]
+        assert argv[3:5] == ["-o", "umask=0077"]
+        assert argv[5] == str(partlabel_base / "boot-B")
+        assert argv[6] == str(target)
+
+    def test_creates_target_directory_if_absent(self, tmp_path):
+        target = tmp_path / "deep" / "nested" / "mnt"
+        assert not target.exists()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text("")
+        partlabel_base = tmp_path / "partlabel-base"
+        partlabel_base.mkdir()
+        runner = _FakeRunner()
+        ensure_partition_mounted(
+            "boot-B",
+            target,
+            fstype="vfat",
+            opts="rw",
+            runner=runner,
+            mounts_path=mounts,
+            partlabel_base=partlabel_base,
+        )
+        assert target.is_dir()
+
+    def test_raises_staging_error_when_mount_returns_nonzero(self, tmp_path):
+        target = tmp_path / "mnt"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text("")
+        partlabel_base = tmp_path / "partlabel-base"
+        partlabel_base.mkdir()
+        runner = _FakeRunner(
+            results_by_head={"mount": 32},
+            stderr_by_head={"mount": "wrong fs type, bad option, bad superblock"},
+        )
+        with pytest.raises(StagingError) as exc:
+            ensure_partition_mounted(
+                "root-B",
+                target,
+                fstype="ext4",
+                opts="rw",
+                runner=runner,
+                mounts_path=mounts,
+                partlabel_base=partlabel_base,
+            )
+        msg = str(exc.value)
+        assert "failed to mount root-B" in msg
+        assert "rc=32" in msg
+        # Stderr is surfaced so the wire telemetry actually says what went wrong.
+        assert "bad superblock" in msg
+
+    def test_raises_staging_error_when_mount_binary_missing(self, tmp_path):
+        target = tmp_path / "mnt"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text("")
+        runner = _FakeRunner(raise_file_not_found_for={"mount"})
+        with pytest.raises(StagingError, match="mount\\(8\\) binary not found"):
+            ensure_partition_mounted(
+                "boot-B",
+                target,
+                fstype="vfat",
+                opts="rw",
+                runner=runner,
+                mounts_path=mounts,
+                partlabel_base=tmp_path / "partlabel-base",
+            )
+
+    def test_raises_staging_error_when_mount_times_out(self, tmp_path):
+        target = tmp_path / "mnt"
+        target.mkdir()
+        mounts = tmp_path / "proc-mounts"
+        mounts.write_text("")
+        partlabel_base = tmp_path / "partlabel-base"
+        partlabel_base.mkdir()
+        runner = _FakeRunner(raise_timeout_for={"mount"})
+        with pytest.raises(StagingError, match="mount\\(8\\) timed out"):
+            ensure_partition_mounted(
+                "boot-B",
+                target,
+                fstype="vfat",
+                opts="rw",
+                runner=runner,
+                mounts_path=mounts,
+                partlabel_base=partlabel_base,
+                timeout_s=0.5,
+            )
 
 
 # ── stream_extract_subtree ─────────────────────────────────────────────────
@@ -706,13 +930,33 @@ def _make_stager(
             raise trigger_tryboot_exc
         return _FakeSlotStatus(target_slot)
 
-    # All mountpoints live under tmp_path so the .is_dir() checks pass.
+    # All mountpoints live under tmp_path. They start as empty dirs;
+    # SlotStager.step5 calls ensure_partition_mounted on slot-B's boot
+    # + the inactive-root, which reads ``mounts_path`` (a fake
+    # /proc/self/mounts) and no-ops if the target is already mounted.
+    # We seed that fake mounts file with the slot-B + inactive-root
+    # entries so happy-path tests skip mount(8) entirely — there's no
+    # real device node to mount and the runner would record a phantom
+    # ``mount`` call. Tests that exercise the mount-fails-with-stderr
+    # path can swap in a runner whose `results_by_head["mount"]=N` and
+    # leave the entries out of the mounts file (rewriting mounts_file
+    # after _make_stager returns, or constructing the stager
+    # explicitly).
     slot_a_boot = tmp_path / "boot-slot-a"
     slot_b_boot = tmp_path / "boot-slot-b"
     inactive_root = tmp_path / "inactive-root"
     slot_a_boot.mkdir()
     slot_b_boot.mkdir()
     inactive_root.mkdir()
+
+    mounts_file = tmp_path / "proc-mounts"
+    mounts_file.write_text(
+        f"/dev/mmcblk0p1 {slot_a_boot} vfat rw 0 0\n"
+        f"/dev/mmcblk0p2 {slot_b_boot} vfat rw 0 0\n"
+        f"/dev/mmcblk0p4 {inactive_root} ext4 rw 0 0\n"
+    )
+    partlabel_base = tmp_path / "partlabel-base"
+    partlabel_base.mkdir()
 
     slot_a_root = tmp_path / "slot-a-root"
     if seed_fleet_state:
@@ -729,6 +973,8 @@ def _make_stager(
         slot_state_fn=fake_slot_state,
         trigger_tryboot_fn=fake_trigger_tryboot,
         slot_a_root=slot_a_root,
+        mounts_path=mounts_file,
+        partlabel_base=partlabel_base,
     )
 
 
@@ -1033,26 +1279,54 @@ class TestSlotStagerErrors:
         with pytest.raises(StagingError, match="could not read slot state"):
             stager._stage_sync(_make_payload(), staging_dir)
 
-    def test_missing_boot_mountpoint_raises_staging_error(self, tmp_path):
-        """If the systemd unit didn't mount slot-B's boot partition, the
-        stager must refuse — writing into a non-mount would silently
-        target the *running* slot's filesystem."""
-        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
-            tmp_path, running_slot=1
+    def test_mount_failure_for_boot_raises_staging_error(self, tmp_path):
+        """If ``mount(8)`` fails on slot-B's boot partition (e.g. the
+        device node doesn't exist), the stager must refuse — writing
+        into a non-mount would silently target the running slot."""
+        runner = _FakeRunner(
+            results_by_head={"mount": 32},
+            stderr_by_head={"mount": "no such device"},
         )
-        # Yank the slot-B boot dir we built in the helper.
-        import shutil
-        shutil.rmtree(stager.boot_mount_slot_b)
-        with pytest.raises(StagingError, match="boot mountpoint missing"):
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=1, runner=runner
+        )
+        # Empty mounts file → ensure_partition_mounted will try to
+        # mount → runner returns rc=32.
+        stager.mounts_path.write_text("")
+        with pytest.raises(StagingError, match="failed to mount boot-B"):
             stager._stage_sync(_make_payload(), staging_dir)
 
-    def test_missing_inactive_root_mountpoint_raises_staging_error(self, tmp_path):
+    def test_mount_failure_for_root_raises_staging_error(self, tmp_path):
+        """Same as the boot variant but the boot partition mount
+        succeeds first; root mount fails second."""
+        # Fake runner: mount succeeds for vfat, fails for ext4.
+        class _PerArgRunner:
+            calls: list[Sequence[str]] = []
+
+            def __call__(self, args, **kwargs):
+                argv = list(args)
+                self.calls.append(argv)
+                if argv[:3] == ["mount", "-t", "vfat"]:
+                    return subprocess.CompletedProcess(
+                        args=argv, returncode=0, stdout="", stderr=""
+                    )
+                if argv[:3] == ["mount", "-t", "ext4"]:
+                    return subprocess.CompletedProcess(
+                        args=argv,
+                        returncode=32,
+                        stdout="",
+                        stderr="superblock corrupt",
+                    )
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="", stderr=""
+                )
+
+        runner = _PerArgRunner()
         staging_dir, stager, _pipeline = _setup_stager_with_bundle(
-            tmp_path, running_slot=1
+            tmp_path, running_slot=1, runner=runner
         )
-        import shutil
-        shutil.rmtree(stager.inactive_root_mount)
-        with pytest.raises(StagingError, match="root mountpoint missing"):
+        stager.mounts_path.write_text("")
+        with pytest.raises(StagingError, match="failed to mount root-B"):
             stager._stage_sync(_make_payload(), staging_dir)
 
     def test_pinned_device_raises_tryboot_error(self, tmp_path):
@@ -1222,3 +1496,91 @@ class TestSlotStagerFleetStateIntegration:
         )
         # Surface the missing path for the operator-facing telemetry.
         assert exc_info.value.path in FLEET_STATE_REQUIRED
+
+
+# ── SlotStager mount integration (step 5) ──────────────────────────────────
+
+
+class TestSlotStagerMountIntegration:
+    """End-to-end style: drive ``_stage_sync`` and assert that step 5
+    calls mount(8) with the correct argv for the inactive slot's boot
+    *and* root partitions, in that order.
+
+    These tests exist because v0.0.7-test bricked the Pi by trusting
+    non-existent systemd ``.mount`` units. Step 5 now self-mounts.
+    """
+
+    def _capture_runner(self):
+        """Return a runner that records mount(8) calls but no-ops them
+        (rc=0). Non-mount commands fall through to plain rc=0 so the
+        rest of ``_stage_sync`` (e.g. ``sync``) keeps working."""
+        recorder = _FakeRunner()
+        return recorder
+
+    def test_running_slot_1_mounts_slot_b_partitions(self, tmp_path):
+        runner = self._capture_runner()
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            running_slot=1,
+            runner=runner,
+        )
+        # Empty the mounts file so _is_mountpoint reports False for
+        # everything; ensure_partition_mounted must invoke mount(8).
+        stager.mounts_path.write_text("")
+
+        stager._stage_sync(_make_payload(), staging_dir)
+
+        mount_calls = [c for c in runner.calls if c[0] == "mount"]
+        assert len(mount_calls) >= 2, (
+            f"expected at least 2 mount(8) calls (boot + root); got {mount_calls!r}"
+        )
+
+        # The first two mounts produced by step 5 are the boot and root
+        # of the *inactive* slot (slot B when running_slot=1).
+        boot_call, root_call = mount_calls[0], mount_calls[1]
+        assert boot_call[1:3] == ["-t", "vfat"], boot_call
+        assert "boot-B" in boot_call[5], boot_call
+        assert root_call[1:3] == ["-t", "ext4"], root_call
+        assert "root-B" in root_call[5], root_call
+
+    def test_running_slot_2_mounts_slot_a_partitions(self, tmp_path):
+        runner = self._capture_runner()
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            running_slot=2,
+            runner=runner,
+        )
+        stager.mounts_path.write_text("")
+
+        stager._stage_sync(_make_payload(), staging_dir)
+
+        mount_calls = [c for c in runner.calls if c[0] == "mount"]
+        assert len(mount_calls) >= 2, (
+            f"expected at least 2 mount(8) calls (boot + root); got {mount_calls!r}"
+        )
+        boot_call, root_call = mount_calls[0], mount_calls[1]
+        assert "boot-A" in boot_call[5], boot_call
+        assert "root-A" in root_call[5], root_call
+
+    def test_already_mounted_short_circuits(self, tmp_path):
+        """Defense in depth: if a future agora-os release ever ships
+        systemd ``.mount`` units that pre-mount the inactive slot, step
+        5 must no-op rather than fight."""
+        runner = self._capture_runner()
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path,
+            running_slot=1,
+            runner=runner,
+        )
+        # The fixture from _make_stager already populated mounts_path
+        # with entries for both slot B's boot + root mountpoints. So
+        # ensure_partition_mounted should short-circuit on both.
+
+        stager._stage_sync(_make_payload(), staging_dir)
+
+        mount_calls = [c for c in runner.calls if c[0] == "mount"]
+        assert mount_calls == [], (
+            f"step 5 must not invoke mount(8) when targets are already "
+            f"mountpoints; got {mount_calls!r}"
+        )
+
