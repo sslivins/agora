@@ -663,6 +663,7 @@ class CMSClient:
                 "device_id": self.device_id,
                 "auth_token": auth_token,
                 "firmware_version": self._get_version(),
+                "os_version": self._get_os_version(),
                 "device_name": self.settings.device_name,
                 "device_name_custom": name_is_custom,
                 "device_type": _get_device_type(),
@@ -716,6 +717,14 @@ class CMSClient:
                         await self._handle_wipe_assets(msg, ws)
                     elif msg_type == "request_logs":
                         await self._handle_request_logs(msg, ws)
+                    elif msg_type == "os_update_dispatch":
+                        # Routed independently by agora-os-updater.service,
+                        # which opens its own WPS connection. We see it on
+                        # this connection because WPS broadcasts to all
+                        # subscribers on the device's channel; explicitly
+                        # ignore it here so it doesn't trip the catch-all
+                        # warning below once CMS starts dispatching.
+                        pass
                     elif "error" in msg:
                         error_text = msg["error"]
                         logger.error("CMS error: %s", error_text)
@@ -2390,6 +2399,29 @@ class CMSClient:
             return __version__
         except ImportError:
             return "unknown"
+
+    def _get_os_version(self) -> str | None:
+        """Best-effort read of ``agora_os_version`` from ``/etc/agora/version``.
+
+        Used to populate the ``os_version`` field of the register
+        message so CMS can show the running rootfs version alongside
+        the agora-app version. Returns ``None`` rather than raising
+        when the file is missing (off-device workstation checkouts) or
+        malformed — the field is informational and must not block
+        registration.
+        """
+        try:
+            from shared.version_file import parse_version_file
+            return parse_version_file()["agora_os_version"]
+        except FileNotFoundError:
+            return None
+        except Exception:  # pragma: no cover - parser raised on malformed file
+            logger.warning(
+                "Could not parse /etc/agora/version for os_version; "
+                "omitting from register message",
+                exc_info=True,
+            )
+            return None
 
     def _read_schedule_cache(self) -> dict | None:
         try:

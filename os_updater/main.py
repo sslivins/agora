@@ -59,48 +59,27 @@ log = logging.getLogger("agora.os_updater")
 #:
 #: We consume only ``agora_os_version`` here (per Decision #2 the
 #: ``agora_app_floor`` is the agora-app channel's contract, not the OS
-#: updater's). Naive .strip() of the whole file would return the entire
-#: multi-line blob as the "version" string and torpedo every floor check.
+#: updater's). The shared :mod:`shared.version_file` parser handles the
+#: actual line-by-line parsing — both this daemon and ``cms_client``
+#: (which reads the file to populate ``os_version`` in its register
+#: message, per the M4 phase of the CMS-migration plan) go through that
+#: single parser so any future regex change stays in lockstep.
 DEFAULT_CURRENT_VERSION_FILE = Path("/etc/agora/version")
 
 
 def _read_current_version(path: Path) -> str:
-    """Parse ``/etc/agora/version`` and return ``agora_os_version``.
+    """Thin back-compat wrapper around the shared parser.
 
-    File format: ``# comment`` lines and blank lines are skipped; every
-    other line must be ``key=value``. The ``agora_os_version`` value is
-    returned (whitespace-stripped). Other keys (e.g. ``agora_app_floor``)
-    are tolerated so this parser doesn't have to be lockstepped with every
-    future field added by agora-os.
-
-    Raises ``RuntimeError`` if the file is missing the
-    ``agora_os_version`` key, contains a malformed line, or has an empty
-    value for ``agora_os_version`` — better to fail loud at daemon startup
-    than to ship an empty string into the floor check.
+    The actual parser lives in :func:`shared.version_file.read_os_version_strict`
+    so ``cms_client`` can use the same logic for its register-message
+    construction. This wrapper exists so the daemon's call sites and
+    its long-standing test suite (which imports this symbol directly)
+    don't have to know about the shared module.
     """
 
-    raw = path.read_text(encoding="utf-8")
-    version: str | None = None
-    for lineno, line in enumerate(raw.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        key, sep, value = stripped.partition("=")
-        if not sep:
-            raise RuntimeError(
-                f"{path}:{lineno}: malformed line (expected key=value): {line!r}"
-            )
-        if key.strip() == "agora_os_version":
-            version = value.strip()
-    if version is None:
-        raise RuntimeError(
-            f"{path} did not contain an 'agora_os_version=...' line"
-        )
-    if not version:
-        raise RuntimeError(
-            f"{path}: 'agora_os_version' has an empty value; cannot determine current version"
-        )
-    return version
+    from shared.version_file import read_os_version_strict
+
+    return read_os_version_strict(path)
 
 
 def _build_parser() -> argparse.ArgumentParser:
