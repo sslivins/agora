@@ -927,6 +927,14 @@ def _seed_fake_slot_a(slot_a_root: Path) -> None:
         "etc/NetworkManager/system-connections/wifi-home.nmconnection": (
             b"[connection]\nid=home\n"
         ),
+        # Optional operator SSH state — D60 gap fix (agora#198). The
+        # ``home/agora/.ssh`` entry in FLEET_STATE_COPY_IF_PRESENT is a
+        # directory; seeding ``authorized_keys`` here causes the parent
+        # ``.ssh`` dir to exist on slot A, which is what
+        # ``_resolve_fleet_state_sources`` returns for that literal.
+        "home/agora/.ssh/authorized_keys": (
+            b"ssh-ed25519 AAAAfake-key-for-test operator@workstation\n"
+        ),
     }
     for rel, content in files.items():
         path = slot_a_root / rel
@@ -1104,8 +1112,8 @@ class TestSlotStagerHappyPath:
             f"expected only cp calls in runner, got {heads}"
         )
         # 4 required literals + 2 ssh host keys + 1 optional wifi nmconnection
-        # from _seed_fake_slot_a == 7 cp invocations.
-        assert len(heads) == 7
+        # + 1 home/agora/.ssh dir from _seed_fake_slot_a == 8 cp invocations.
+        assert len(heads) == 8
 
         # Boot was streamed into slot-B boot mount.
         boot_call = next(c for c in pipeline.calls if c[0] == "boot")
@@ -1409,8 +1417,9 @@ class TestCopyFleetState:
         copy_fleet_state(slot_a, slot_b, runner=runner)
 
         cps = [c for c in runner.calls if c[0] == "cp"]
-        # 4 required literals + 2 ssh host keys + 1 optional wifi conn = 7
-        assert len(cps) == 7, f"expected 7 cp invocations, got {len(cps)}: {cps}"
+        # 4 required literals + 2 ssh host keys + 1 optional wifi conn
+        # + 1 home/agora/.ssh dir = 8
+        assert len(cps) == 8, f"expected 8 cp invocations, got {len(cps)}: {cps}"
         # Every cp call uses cp -a (preserve mode/owner/timestamps).
         for cp in cps:
             assert cp[1] == "-a", f"expected cp -a, got {cp}"
@@ -1473,8 +1482,9 @@ class TestCopyFleetState:
             copy_fleet_state(slot_a, slot_b, runner=runner)
 
         cps = [c for c in runner.calls if c[0] == "cp"]
-        # Required set still copied: 4 literals + 2 ssh keys = 6.
-        assert len(cps) == 6
+        # Required set still copied: 4 literals + 2 ssh keys = 6, plus
+        # the still-present home/agora/.ssh optional dir = 7.
+        assert len(cps) == 7
         # A skip event must be logged for diagnostic purposes.
         assert any("fleet_state_skipped" in r.message for r in caplog.records)
 
@@ -1505,6 +1515,109 @@ class TestCopyFleetState:
             copy_fleet_state(slot_a, slot_b, runner=runner)
 
         assert exc_info.value.path == "etc/agora/environment"
+
+    # ── home/agora/.ssh — D60 gap fix (agora#198) ──────────────────────────
+
+    def test_ssh_dir_copied_when_present(self, tmp_path):
+        """``home/agora/.ssh`` is a directory entry in COPY_IF_PRESENT.
+        When the directory exists on slot A, ``copy_fleet_state`` issues
+        a single ``cp -a`` for the directory itself (not one per child),
+        so ``cp -a`` preserves the 0700 perms + ``agora:agora`` ownership
+        that ``sshd`` enforces on ``authorized_keys`` (see agora#198).
+        """
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        runner = _FakeRunner()
+
+        copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        cps = [c for c in runner.calls if c[0] == "cp"]
+        ssh_cps = [
+            c for c in cps
+            if c[-2].endswith(str(Path("home/agora/.ssh")))
+            or c[-2].endswith(str(Path("home") / "agora" / ".ssh"))
+        ]
+        assert len(ssh_cps) == 1, (
+            f"expected exactly one cp -a for home/agora/.ssh as a directory, "
+            f"got: {ssh_cps}"
+        )
+        # cp -a was used (preserves perms/owner).
+        assert ssh_cps[0][1] == "-a"
+        # Source is the slot-A .ssh dir; destination is under slot-B.
+        assert str(slot_a / "home" / "agora" / ".ssh") == ssh_cps[0][-2]
+        assert str(slot_b / "home" / "agora" / ".ssh") == ssh_cps[0][-1]
+
+    def test_ssh_dir_absent_skips_silently(self, tmp_path, caplog):
+        """A production-deployed Pi may have no operator SSH access.
+        Absence of ``home/agora/.ssh`` must NOT abort the apply — it's
+        ``COPY_IF_PRESENT``, not ``REQUIRED``.
+        """
+        import logging
+        import shutil as _shutil
+
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        # Drop the seeded .ssh dir.
+        _shutil.rmtree(slot_a / "home" / "agora" / ".ssh")
+        runner = _FakeRunner()
+
+        with caplog.at_level(logging.INFO, logger="os_updater.apply"):
+            copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        cps = [c for c in runner.calls if c[0] == "cp"]
+        # 4 required literals + 2 ssh host keys + 1 wifi optional = 7.
+        assert len(cps) == 7
+        # The skip event must mention the .ssh path so operator-facing
+        # telemetry can distinguish "missing wifi" from "missing .ssh".
+        skip_records = [
+            r for r in caplog.records
+            if "fleet_state_skipped" in r.message and "home/agora/.ssh" in r.message
+        ]
+        assert skip_records, (
+            f"expected a fleet_state_skipped log for home/agora/.ssh, "
+            f"got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_ssh_dir_idempotent_replaces_stale_dst(self, tmp_path):
+        """If slot B already has a ``home/agora/.ssh`` from a prior
+        partial-apply recovery, ``_cp_one`` must ``rmtree`` it before
+        ``cp -a`` so the source ends up AT dst, not nested as
+        ``slot_b/home/agora/.ssh/.ssh``.
+        """
+        slot_a = tmp_path / "slot-a"
+        slot_b = tmp_path / "slot-b"
+        slot_b.mkdir()
+        _seed_fake_slot_a(slot_a)
+        # Simulate a stale .ssh directory left over from a prior
+        # partial apply (e.g. apply aborted after rsync but before
+        # tryboot triggered).
+        stale_ssh = slot_b / "home" / "agora" / ".ssh"
+        stale_ssh.mkdir(parents=True)
+        stale_marker = stale_ssh / "stale_authorized_keys"
+        stale_marker.write_bytes(b"this should be removed before cp -a runs\n")
+        assert stale_marker.exists()
+
+        runner = _FakeRunner()
+        copy_fleet_state(slot_a, slot_b, runner=runner)
+
+        # The stale destination must have been removed by ``_cp_one``'s
+        # rmtree guard. Because ``_FakeRunner`` does NOT execute ``cp``,
+        # the dst directory should now not exist at all (rmtree removed
+        # it; the mocked cp left nothing).
+        assert not stale_marker.exists(), (
+            "stale slot-B .ssh content survived: rmtree guard in _cp_one did not fire"
+        )
+        assert not stale_ssh.exists(), (
+            "expected slot_b/home/agora/.ssh to be removed by _cp_one's rmtree guard "
+            "(mocked cp does not recreate it)"
+        )
+        # And the parent home/agora dir must still exist (mkdir was called
+        # before the rmtree, on the parent — that's the structural invariant).
+        assert (slot_b / "home" / "agora").exists()
 
 
 # ── SlotStager × fleet-state integration (D60) ─────────────────────────────
