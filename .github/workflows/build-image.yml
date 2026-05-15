@@ -13,17 +13,16 @@ on:
           - zero2w
           - pi4
           - pi5
-  # Auto-build all boards when a stable release is published. The image is
-  # fully tenant-agnostic — no CMS URL, no WiFi creds, no fleet identity
-  # baked in. The CMS imager stamps /boot/firmware/agora-fleet.env at
-  # imaging time with deployment-specific values, and
-  # agora-fleet-provision.sh (in the firmware) consumes it at first boot.
+  # NOTE: auto-trigger on release-prereleased was disabled in favour of
+  # the agora-os bundle path. Pi5 fresh-flash images are now produced by
+  # sslivins/agora-os's release.yml (A/B GPT layout, OTA-capable). This
+  # workflow is kept for manual builds of zero2w / pi4 images, which
+  # agora-os doesn't yet support. Re-enable by uncommenting the block
+  # below (the job's `if:` and matrix expressions still understand the
+  # `release` event_name).
   #
-  # We trigger on `prereleased` (not `released`) because create-release.yml
-  # publishes new releases as pre-releases. The publish-catalog job below
-  # promotes to a normal release at the end of a successful build.
-  release:
-    types: [prereleased]
+  # release:
+  #   types: [prereleased]
 
 permissions:
   contents: write
