@@ -186,6 +186,44 @@ DEFAULT_RSYNC_TIMEOUT_S = 1800.0
 #: 30 s is comfortably 1000× the worst real-world case.
 DEFAULT_FLEET_STATE_CP_TIMEOUT_S = 30.0
 
+#: Closed enumeration of phase names emitted by :meth:`SlotStager._stage_sync`
+#: via the optional ``progress_callback``. The CMS-side parser switches
+#: on these strings (carried in ``LifecycleEvent.payload["phase"]``) to
+#: render an upgrade-progress UI, so any addition is a coordinated
+#: change. Order matches the actual emission order during a happy-path
+#: stage. Tracked as ``sslivins/agora#202``.
+STAGE_PROGRESS_PHASES: tuple[str, ...] = (
+    "extracting_meta",
+    "mounting_inactive",
+    "extracting_boot",
+    "extracting_rootfs",
+    "verifying_manifest",
+    "copying_fleet_state",
+    "finalizing",
+)
+
+
+def _safe_emit_progress(
+    progress_callback: Optional[Callable[[str], None]], phase: str
+) -> None:
+    """Best-effort invocation of a stage progress callback.
+
+    The callback is wired by the service to ``emit_event(STAGE_PROGRESS, ...)``
+    which can fail (full disk on ``/data``, sink down, etc.). A buggy
+    callback or a sink failure must NOT brick an OTA mid-stage — the
+    progress signal is purely advisory. Swallow + log on failure;
+    :meth:`_stage_sync` keeps running.
+    """
+
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(phase)
+    except Exception:  # noqa: BLE001 — intentional firewall around advisory callback
+        logger.exception(
+            "progress_callback raised on phase=%s; continuing stage", phase
+        )
+
 #: Root of the currently-running rootfs (slot A) from which
 #: :func:`copy_fleet_state` reads per-device identity files. Path is
 #: ``/`` in production; tests inject ``tmp_path`` to bypass.
@@ -1168,16 +1206,38 @@ class SlotStager:
     #: device node. Tests inject a tmp path.
     partlabel_base: Path = field(default_factory=lambda: DEFAULT_PARTLABEL_BASE)
 
-    async def stage(self, payload: DispatchPayload, staging_dir: Path) -> None:
+    async def stage(
+        self,
+        payload: DispatchPayload,
+        staging_dir: Path,
+        *,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         """Run the full stage-and-tryboot pipeline (10-step streaming orchestration).
 
         Async entrypoint matching the :class:`Stager` protocol. The
         synchronous body lives in :meth:`_stage_sync` for ease of
         testing without an event loop.
-        """
-        await asyncio.to_thread(self._stage_sync, payload, staging_dir)
 
-    def _stage_sync(self, payload: DispatchPayload, staging_dir: Path) -> None:
+        ``progress_callback``, if provided, is invoked with each phase
+        name from :data:`STAGE_PROGRESS_PHASES` at that phase's
+        boundary (before the phase's work begins). Callback exceptions
+        are caught and logged — they do not interrupt the stage.
+        """
+        await asyncio.to_thread(
+            self._stage_sync,
+            payload,
+            staging_dir,
+            progress_callback=progress_callback,
+        )
+
+    def _stage_sync(
+        self,
+        payload: DispatchPayload,
+        staging_dir: Path,
+        *,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         staging_dir = Path(staging_dir)
         bundle_path = staging_dir / self.bundle_filename
         meta_path = staging_dir / self.meta_filename
@@ -1193,6 +1253,7 @@ class SlotStager:
 
         # 1. Meta-only extract — cheapest target_version reject before
         # we touch the inactive partitions. ~30s zstd pass with tar -O.
+        _safe_emit_progress(progress_callback, "extracting_meta")
         extract_meta_only(
             bundle_path,
             meta_path,
@@ -1242,6 +1303,7 @@ class SlotStager:
         # ``ensure_partition_mounted`` is idempotent — if a systemd
         # unit already mounted the partition (the agora-os 0.0.8+
         # path), this is a no-op.
+        _safe_emit_progress(progress_callback, "mounting_inactive")
         boot_target = boot_mount_for_slot(
             inactive,
             slot_a_mount=self.boot_mount_slot_a,
@@ -1272,6 +1334,7 @@ class SlotStager:
         # 6. Stream boot/ subtree straight onto the inactive boot partition.
         # --strip-components=1 turns "boot/foo" into "<boot_target>/foo" and
         # naturally filters anything not under boot/.
+        _safe_emit_progress(progress_callback, "extracting_boot")
         stream_extract_subtree(
             bundle_path,
             self.boot_subdir,
@@ -1282,6 +1345,7 @@ class SlotStager:
         )
 
         # 7. Stream root/ subtree straight onto the inactive root partition.
+        _safe_emit_progress(progress_callback, "extracting_rootfs")
         stream_extract_subtree(
             bundle_path,
             self.root_subdir,
@@ -1293,6 +1357,7 @@ class SlotStager:
 
         # 8. Manifest sha256 verification — hash the bytes that actually
         # landed on the partitions.
+        _safe_emit_progress(progress_callback, "verifying_manifest")
         verify_bundle_manifest(
             {self.boot_subdir: boot_target, self.root_subdir: root_target},
             meta,
@@ -1306,6 +1371,7 @@ class SlotStager:
         # 9. Copy per-device fleet-state files from slot A into slot B.
         # Done AFTER manifest verify so the manifest check doesn't see
         # files added by us. Implements D60 of plan.md §"Phase 2".
+        _safe_emit_progress(progress_callback, "copying_fleet_state")
         copy_fleet_state(
             self.slot_a_root,
             root_target,
@@ -1320,6 +1386,7 @@ class SlotStager:
         # was deleted by build-bundle.sh. We render it for the inactive
         # slot here. Per plan.md §"v0.0.4-test bug list", this is critical
         # to avoid bricking the device on tryboot.
+        _safe_emit_progress(progress_callback, "finalizing")
         substitute_fstab(root_target, inactive)
 
         # 10b. Rewrite cmdline.txt for the target slot — bundles ship per-

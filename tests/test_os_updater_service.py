@@ -638,3 +638,104 @@ class TestContinueAfterPromote:
         assert s.state.fsm is UpdaterFSMState.IDLE
         assert migrator.calls == 0
         assert sink.events == []
+
+
+
+# -- handle_dispatch wires STAGE_PROGRESS (agora#202) ----------------------
+
+
+class _ProgressEmittingStager:
+    """Fake stager that captures the ``progress_callback`` kwarg and
+    invokes it once during ``stage()``. Used to verify the service
+    closure emits a STAGE_PROGRESS lifecycle event with the right
+    phase payload."""
+
+    def __init__(self, phase: str = "extracting_rootfs") -> None:
+        self.phase = phase
+        self.calls: list[tuple] = []
+        self.captured_callback = None
+
+    async def stage(self, payload, staging_dir, *, progress_callback=None):
+        self.calls.append(("stage", payload, staging_dir))
+        self.captured_callback = progress_callback
+        if progress_callback is not None:
+            progress_callback(self.phase)
+
+
+class TestHandleDispatchStageProgress:
+    """The service-side ``_on_stage_progress`` closure forwards each
+    phase the stager announces into a STAGE_PROGRESS lifecycle event
+    on the outbox (agora#202)."""
+
+    def test_stager_callback_emits_stage_progress_event(self, tmp_path):
+        sink = _ListSink()
+        stager = _ProgressEmittingStager(phase="extracting_rootfs")
+        s = _build_service(
+            tmp_path,
+            current_version="1.0.0",
+            sink=sink,
+            stager=stager,
+        )
+
+        asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-progress")))
+
+        # Service handed the stager a non-None callback.
+        assert stager.captured_callback is not None
+
+        # Exactly one STAGE_PROGRESS event with the right payload.
+        progress_events = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.STAGE_PROGRESS
+        ]
+        assert len(progress_events) == 1
+        assert progress_events[0].payload == {"phase": "extracting_rootfs"}
+        assert progress_events[0].release_id == "rel-progress"
+        assert progress_events[0].target_version == "1.1.0"
+
+    def test_stage_progress_lands_between_staged_and_tryboot_initiated(self, tmp_path):
+        """Progress is mid-stage, so its event_id must sit after STAGED
+        and before TRYBOOT_INITIATED in the outbox stream. Pinning the
+        ordering keeps CMS-side rollups sane."""
+        sink = _ListSink()
+        stager = _ProgressEmittingStager(phase="finalizing")
+        s = _build_service(tmp_path, current_version="1.0.0", sink=sink, stager=stager)
+
+        asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-order")))
+
+        kinds = [e.event_type for e in sink.events]
+        assert LifecycleEventType.STAGE_PROGRESS in kinds
+
+        progress_idx = kinds.index(LifecycleEventType.STAGE_PROGRESS)
+        # The service emits SIGNATURE_VERIFIED + STAGED *before* it
+        # calls stager.stage(progress_callback=...), then emits
+        # TRYBOOT_INITIATED once stage() resolves. The progress
+        # callback fires *inside* stage(), so the progress event
+        # lands between STAGED and TRYBOOT_INITIATED in event_id
+        # order. Pinning this ordering keeps CMS-side rollups sane.
+        staged_idx = kinds.index(LifecycleEventType.STAGED)
+        tryboot_idx = kinds.index(LifecycleEventType.TRYBOOT_INITIATED)
+        assert staged_idx < progress_idx < tryboot_idx
+
+        # Monotonic event_id matches ordering.
+        ids = [e.event_id for e in sink.events]
+        assert ids == sorted(ids)
+
+    def test_no_progress_event_when_stager_never_invokes_callback(self, tmp_path):
+        """If a stager doesn't call its progress_callback (e.g. legacy
+        stager from before #202, or one that fails before any phase
+        boundary), the outbox simply has no STAGE_PROGRESS events.
+        Regression guard against accidentally emitting an empty/None
+        event from the closure."""
+        sink = _ListSink()
+        # _OkStub.stage just appends to .calls and returns — never calls back.
+        s = _build_service(
+            tmp_path, current_version="1.0.0", sink=sink, stager=_OkStub(),
+        )
+
+        asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-silent")))
+
+        progress_events = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.STAGE_PROGRESS
+        ]
+        assert progress_events == []

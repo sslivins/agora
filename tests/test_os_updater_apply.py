@@ -40,6 +40,7 @@ from os_updater.apply import (
     DEFAULT_ROOT_MOUNT_OPTS,
     FLEET_STATE_COPY_IF_PRESENT,
     FLEET_STATE_REQUIRED,
+    STAGE_PROGRESS_PHASES,
     CmdlineError,
     FleetStateMissingError,
     FleetStateWriteError,
@@ -1738,3 +1739,74 @@ class TestSlotStagerMountIntegration:
             f"mountpoints; got {mount_calls!r}"
         )
 
+
+
+# -- SlotStager: progress_callback (agora#202) ----------------------------
+
+
+class TestSlotStagerProgressCallback:
+    """The optional ``progress_callback`` kwarg fires once per phase boundary.
+
+    Wired by the service to ``emit_event(STAGE_PROGRESS, ...)``; tests
+    here pin the contract that (a) all 7 phases fire in declared order,
+    (b) a missing kwarg keeps the legacy code path silent, (c) a
+    raising callback does NOT brick the stage. The exhaustive phase
+    list lives in :data:`STAGE_PROGRESS_PHASES`.
+    """
+
+    def test_phases_emitted_in_declared_order(self, tmp_path):
+        """Happy-path stage with a list-collector callback gets all
+        7 phase names in :data:`STAGE_PROGRESS_PHASES` order."""
+        phases: list[str] = []
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=1,
+        )
+        stager._stage_sync(
+            _make_payload(), staging_dir, progress_callback=phases.append,
+        )
+        assert tuple(phases) == STAGE_PROGRESS_PHASES
+
+    def test_default_no_callback_keeps_legacy_behavior(self, tmp_path):
+        """Omitting the kwarg matches pre-#202 behavior — regression guard."""
+        tryboot_calls: list[int] = []
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=1, trigger_tryboot_calls=tryboot_calls,
+        )
+        stager._stage_sync(_make_payload(), staging_dir)
+        assert tryboot_calls == [2]
+
+    def test_raising_callback_does_not_break_stage(self, tmp_path):
+        """A buggy callback that throws on every phase must NOT brick
+        an in-flight OTA — STAGE_PROGRESS is advisory. Tryboot still
+        fires; cmdline + fstab still rewritten on slot B."""
+        tryboot_calls: list[int] = []
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=1, trigger_tryboot_calls=tryboot_calls,
+        )
+
+        def boom(phase: str) -> None:
+            raise RuntimeError(f"crash on phase {phase!r}")
+
+        stager._stage_sync(
+            _make_payload(), staging_dir, progress_callback=boom,
+        )
+
+        assert tryboot_calls == [2]
+        cmdline = (stager.boot_mount_slot_b / "cmdline.txt").read_text()
+        assert "root=PARTLABEL=root-B" in cmdline
+
+    def test_async_entrypoint_forwards_callback(self, tmp_path):
+        """``SlotStager.stage`` is the async wrapper around ``_stage_sync``;
+        the new kwarg must pass through both layers."""
+        import asyncio
+
+        phases: list[str] = []
+        staging_dir, stager, _pipeline = _setup_stager_with_bundle(
+            tmp_path, running_slot=1,
+        )
+        asyncio.run(
+            stager.stage(
+                _make_payload(), staging_dir, progress_callback=phases.append,
+            )
+        )
+        assert tuple(phases) == STAGE_PROGRESS_PHASES
