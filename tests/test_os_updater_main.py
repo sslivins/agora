@@ -5,13 +5,20 @@ agora-os ships ``/etc/agora/version`` as a multi-line key=value file
 implementation did a naive ``.strip()`` of the entire file and treated
 the result as the version string, which broke every floor check. These
 tests pin the new parser's contract.
+
+Also covers ``_build_transport_factory`` — see TestBuildTransportFactory
+at the bottom of the file.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import types
+
 import pytest
 
-from os_updater.main import _read_current_version
+from os_updater.main import _read_current_version, _build_transport_factory
 
 
 def _write(tmp_path, content: str):
@@ -94,3 +101,167 @@ class TestReadCurrentVersion:
             "agora_os_version=1.0.0\nagora_os_version=2.0.0\n",
         )
         assert _read_current_version(p) == "2.0.0"
+
+
+# ---------------------------------------------------------------------------
+# _build_transport_factory — dual-path (bootstrap-v2 / legacy api_key)
+# ---------------------------------------------------------------------------
+
+
+class _CapturedOpenWPS:
+    """Async stand-in for ``cms_client.transport.open_wps``.
+
+    Records the kwargs it was called with so tests can assert the
+    factory routed through the right path.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return types.SimpleNamespace(
+            send=lambda *_a, **_kw: None,
+            recv=lambda *_a, **_kw: None,
+            close=lambda *_a, **_kw: None,
+        )
+
+
+def _stub_settings(tmp_path, *, bootstrap_v2: bool, **overrides):
+    """Minimal duck-typed Settings stand-in for these tests.
+
+    Avoids pulling in api.config.Settings full validation surface, which
+    would force these tests to bake in unrelated fields.
+    """
+    s = types.SimpleNamespace(
+        bootstrap_v2=bootstrap_v2,
+        bootstrap_state_path=tmp_path / "bootstrap_state.json",
+        cms_url="wss://cms.example/ws/device",
+        device_name="legacy-device-name",
+        device_api_key="legacy-api-key",
+        cms_api_url="https://cms.example",
+    )
+    for k, v in overrides.items():
+        setattr(s, k, v)
+    return s
+
+
+def _write_bootstrap_state(path, **fields):
+    base = {
+        "wps_url": "wss://wps.example/client/hubs/agora?access_token=AAA",
+        "wps_jwt": "AAA",
+        "cms_api_base": "https://cms.example",
+        "device_id": "v2-device-uuid",
+    }
+    base.update(fields)
+    path.write_text(json.dumps(base))
+
+
+class TestBuildTransportFactory:
+    """Pins the bootstrap-v2 / legacy api_key dual-path contract.
+
+    The factory itself constructs the connect closure but does not
+    invoke ``open_wps``; the closure runs only when the service
+    asks for a fresh transport. Tests below exercise both halves —
+    factory-build time (validation, error messages) and connect time
+    (which kwargs the closure passes through).
+    """
+
+    def test_bootstrap_v2_routes_through_pre_minted_kwargs(self, tmp_path, monkeypatch):
+        captured = _CapturedOpenWPS()
+        monkeypatch.setattr("cms_client.transport.open_wps", captured)
+        _write_bootstrap_state(tmp_path / "bootstrap_state.json")
+        settings = _stub_settings(tmp_path, bootstrap_v2=True)
+
+        factory = _build_transport_factory(settings)
+        # Drive the opener closure directly — the adapter's full
+        # connect() path adds an async-iterator dance we don't need
+        # to mock to assert routing.
+        asyncio.run(factory()._opener())
+
+        assert len(captured.calls) == 1
+        call = captured.calls[0]
+        assert call["pre_minted_url"] == "wss://wps.example/client/hubs/agora?access_token=AAA"
+        assert call["pre_minted_token"] == "AAA"
+        assert call["cms_url"] == "https://cms.example"
+        assert call["device_id"] == "v2-device-uuid"
+        assert "api_key" not in call
+
+    def test_bootstrap_v2_rereads_state_on_each_connect(self, tmp_path, monkeypatch):
+        # cms_client refreshes bootstrap_state.json out-of-band; the
+        # factory must pick up the new JWT on the next reconnect rather
+        # than caching the first read.
+        captured = _CapturedOpenWPS()
+        monkeypatch.setattr("cms_client.transport.open_wps", captured)
+        state_path = tmp_path / "bootstrap_state.json"
+        _write_bootstrap_state(state_path, wps_jwt="JWT-1")
+        settings = _stub_settings(tmp_path, bootstrap_v2=True)
+
+        factory = _build_transport_factory(settings)
+
+        asyncio.run(factory()._opener())
+        _write_bootstrap_state(state_path, wps_jwt="JWT-2")
+        asyncio.run(factory()._opener())
+
+        assert [c["pre_minted_token"] for c in captured.calls] == ["JWT-1", "JWT-2"]
+
+    def test_bootstrap_v2_missing_state_falls_back_to_legacy(self, tmp_path, monkeypatch):
+        # Fresh-flash race: bootstrap-v2 enabled in settings but the
+        # device hasn't completed enrollment yet. Rather than crashing
+        # the os-updater service, fall through to the legacy path
+        # (which will then surface its own clearer error if env vars
+        # are also missing).
+        captured = _CapturedOpenWPS()
+        monkeypatch.setattr("cms_client.transport.open_wps", captured)
+        # state file absent
+        settings = _stub_settings(tmp_path, bootstrap_v2=True)
+
+        factory = _build_transport_factory(settings)
+        asyncio.run(factory()._opener())
+
+        assert captured.calls[0]["api_key"] == "legacy-api-key"
+        assert "pre_minted_url" not in captured.calls[0]
+
+    def test_bootstrap_v2_state_missing_keys_falls_back_to_legacy(self, tmp_path, monkeypatch):
+        # Partially populated state file (e.g. cms_client mid-write,
+        # or an older state format that pre-dates wps_url). Same fallback
+        # rule as the missing-file case.
+        captured = _CapturedOpenWPS()
+        monkeypatch.setattr("cms_client.transport.open_wps", captured)
+        state_path = tmp_path / "bootstrap_state.json"
+        state_path.write_text(json.dumps({"wps_url": "wss://x", "wps_jwt": ""}))
+        settings = _stub_settings(tmp_path, bootstrap_v2=True)
+
+        factory = _build_transport_factory(settings)
+        asyncio.run(factory()._opener())
+
+        assert captured.calls[0]["api_key"] == "legacy-api-key"
+
+    def test_legacy_path_when_flag_off_even_if_state_present(self, tmp_path, monkeypatch):
+        # Defensive: a stale bootstrap_state.json shouldn't accidentally
+        # flip a legacy device onto the v2 path. The settings flag is
+        # the source of truth.
+        captured = _CapturedOpenWPS()
+        monkeypatch.setattr("cms_client.transport.open_wps", captured)
+        _write_bootstrap_state(tmp_path / "bootstrap_state.json")
+        settings = _stub_settings(tmp_path, bootstrap_v2=False)
+
+        factory = _build_transport_factory(settings)
+        asyncio.run(factory()._opener())
+
+        assert captured.calls[0]["api_key"] == "legacy-api-key"
+        assert "pre_minted_url" not in captured.calls[0]
+
+    @pytest.mark.parametrize(
+        "missing_field,expected_msg",
+        [
+            ("cms_url", "AGORA_CMS_URL"),
+            ("device_name", "AGORA_DEVICE_NAME"),
+            ("device_api_key", "AGORA_DEVICE_API_KEY"),
+        ],
+    )
+    def test_legacy_path_raises_on_missing_env(self, tmp_path, missing_field, expected_msg):
+        settings = _stub_settings(tmp_path, bootstrap_v2=False)
+        setattr(settings, missing_field, "")
+        with pytest.raises(RuntimeError, match=expected_msg):
+            _build_transport_factory(settings)
