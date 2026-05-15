@@ -10,6 +10,13 @@ After=agora-api.service
 After=agora-cms-client.service
 After=agora-player.service
 After=agora-watchdog.service
+# Belt-and-suspenders for bug #197: don't run the service-age check
+# until NTP has had a chance to sync the wallclock. The clock-source
+# fix in ``check_agora_services_active`` uses CLOCK_MONOTONIC and is
+# immune to NTP step on its own; this just removes one more variable
+# from the diagnostic ("did we even sync before deciding?").
+After=time-sync.target
+Wants=time-sync.target
 DefaultDependencies=yes
 # StartLimit* must live in [Unit], NOT [Service]. systemd interprets
 # Restart=/RestartSec= per-unit instance, but the StartLimit* knobs that

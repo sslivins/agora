@@ -49,14 +49,29 @@ def _fixed_now(seconds_ago: int = 0) -> datetime:
     return base + timedelta(seconds=seconds_ago)
 
 
-def _show_output(active_state: str, entered_at: str = "") -> str:
-    return f"ActiveState={active_state}\nActiveEnterTimestamp={entered_at}\n"
+def _show_output(
+    active_state: str,
+    entered_at: str = "",
+    monotonic_us: str = "0",
+) -> str:
+    return (
+        f"ActiveState={active_state}\n"
+        f"ActiveEnterTimestamp={entered_at}\n"
+        f"ActiveEnterTimestampMonotonic={monotonic_us}\n"
+    )
 
 
-def _systemctl_runner(per_service: dict[str, tuple[str, str]]) -> scc.Runner:
+def _systemctl_runner(
+    per_service: dict[str, tuple[str, ...]],
+) -> scc.Runner:
     """Build a runner that returns canned ``systemctl show`` output per service.
 
-    ``per_service`` is ``{unit: (active_state, entered_raw)}``.
+    ``per_service`` is ``{unit: (active_state, entered_raw)}`` or
+    ``{unit: (active_state, entered_raw, monotonic_us)}``. The 2-tuple
+    form is preserved for backward compatibility with the existing
+    wallclock-only tests; missing monotonic defaults to ``"0"`` (the
+    systemd sentinel for "never activated" — handled as wallclock
+    fallback by :func:`check_agora_services_active`).
     """
 
     def runner(
@@ -68,11 +83,14 @@ def _systemctl_runner(per_service: dict[str, tuple[str, str]]) -> scc.Runner:
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         unit = args[2]
-        active, entered = per_service.get(unit, ("inactive", ""))
+        triple = per_service.get(unit, ("inactive", "", "0"))
+        active = triple[0]
+        entered = triple[1] if len(triple) > 1 else ""
+        monotonic = triple[2] if len(triple) > 2 else "0"
         return subprocess.CompletedProcess(
             args=list(args),
             returncode=0,
-            stdout=_show_output(active, entered),
+            stdout=_show_output(active, entered, monotonic),
             stderr="",
         )
 
@@ -212,6 +230,151 @@ class TestCheckAgoraServicesActive:
         )
         assert result.ok is False  # because we returned "inactive"
         assert captured["args"][0][0] == "systemctl"
+
+    # ── monotonic clock path (bug #197) ────────────────────────────────────
+
+    def test_uses_monotonic_clock_when_available(self) -> None:
+        """Happy path: systemd reports ``ActiveEnterTimestampMonotonic``,
+        clock-source is recorded as ``monotonic``, age math uses the
+        injected monotonic-now-fn rather than the wallclock now-fn."""
+        wall_now = _fixed_now(0)
+        # 600s elapsed in monotonic clock; wallclock irrelevant.
+        monotonic_now_s = 3600.0
+        entered_monotonic_us = (3600.0 - 600.0) * 1_000_000
+        entered_at = (wall_now - timedelta(seconds=600)).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        runner = _systemctl_runner(
+            {
+                svc: ("active", entered_at, str(int(entered_monotonic_us)))
+                for svc in DEFAULT_AGORA_SERVICES
+            }
+        )
+        result = check_agora_services_active(
+            runner=runner,
+            now_fn=lambda: wall_now,
+            monotonic_now_fn=lambda: monotonic_now_s,
+        )
+        assert result.ok is True
+        per_service = result.measurement["per_service"]
+        for svc in DEFAULT_AGORA_SERVICES:
+            assert per_service[svc]["clock_source"] == "monotonic"
+            assert per_service[svc]["active_for_seconds"] == pytest.approx(600.0)
+
+    def test_clock_skew_immunity_via_monotonic(self) -> None:
+        """The bug #197 repro: wallclock-derived age is negative because
+        NTP stepped the clock forward after the service registered its
+        ``ActiveEnterTimestamp``. With the monotonic property populated,
+        the gate must ignore the corrupt wallclock and report passing."""
+        wall_now = _fixed_now(0)
+        # The corrupt wallclock entered_at is 1h *ahead* of now, which
+        # would yield active_for_seconds=-3600 on the wallclock path
+        # (exactly the symptom we saw on Pi100 v0.0.13).
+        bad_entered_at = (wall_now + timedelta(seconds=3600)).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        # Monotonic clock — independently — says 600s of uptime, which
+        # is a clean pass against the 300s default threshold.
+        monotonic_now_s = 1200.0
+        entered_monotonic_us = 600 * 1_000_000
+        runner = _systemctl_runner(
+            {
+                svc: ("active", bad_entered_at, str(entered_monotonic_us))
+                for svc in DEFAULT_AGORA_SERVICES
+            }
+        )
+        result = check_agora_services_active(
+            runner=runner,
+            now_fn=lambda: wall_now,
+            monotonic_now_fn=lambda: monotonic_now_s,
+        )
+        assert result.ok is True, (
+            f"monotonic path must mask wallclock skew, got {result}"
+        )
+        per_service = result.measurement["per_service"]
+        for svc in DEFAULT_AGORA_SERVICES:
+            assert per_service[svc]["clock_source"] == "monotonic"
+            assert per_service[svc]["active_for_seconds"] == pytest.approx(600.0)
+
+    def test_falls_back_to_wallclock_when_monotonic_zero(self) -> None:
+        """systemd reports ``ActiveEnterTimestampMonotonic=0`` for units
+        that have never activated (or for transient bugs we shouldn't
+        amplify). The gate must fall back to the wallclock path and
+        report ``clock_source="wallclock"`` so the caller can audit."""
+        wall_now = _fixed_now(0)
+        entered_at = (wall_now - timedelta(seconds=600)).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        runner = _systemctl_runner(
+            {
+                svc: ("active", entered_at, "0")
+                for svc in DEFAULT_AGORA_SERVICES
+            }
+        )
+        result = check_agora_services_active(
+            runner=runner,
+            now_fn=lambda: wall_now,
+            monotonic_now_fn=lambda: 9999.0,  # ignored
+        )
+        assert result.ok is True
+        per_service = result.measurement["per_service"]
+        for svc in DEFAULT_AGORA_SERVICES:
+            assert per_service[svc]["clock_source"] == "wallclock"
+            assert per_service[svc]["active_for_seconds"] == pytest.approx(600.0)
+
+    def test_negative_age_treated_as_failure(self) -> None:
+        """If the monotonic clock disagrees with the property (e.g. the
+        property was sampled *after* the now-fn returned), the gate
+        must not silently pass — it must report failure with
+        ``measurement.reason='negative_age'``. This is the safety net
+        in case there's an unanticipated clock-source ordering bug."""
+        wall_now = _fixed_now(0)
+        entered_at = (wall_now - timedelta(seconds=600)).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        # Monotonic now < monotonic entered: -100s age.
+        runner = _systemctl_runner(
+            {
+                svc: ("active", entered_at, str(1000 * 1_000_000))
+                for svc in DEFAULT_AGORA_SERVICES
+            }
+        )
+        result = check_agora_services_active(
+            runner=runner,
+            now_fn=lambda: wall_now,
+            monotonic_now_fn=lambda: 900.0,
+        )
+        assert result.ok is False
+        assert result.measurement["reason"] == "negative_age"
+        assert result.measurement["clock_source"] == "monotonic"
+        assert result.measurement["active_for_seconds"] < 0
+
+
+# ── _parse_systemd_monotonic_us ────────────────────────────────────────────
+
+
+class TestParseSystemdMonotonicUs:
+    def test_zero_returns_none(self) -> None:
+        assert scc._parse_systemd_monotonic_us("0") is None
+
+    def test_empty_returns_none(self) -> None:
+        assert scc._parse_systemd_monotonic_us("") is None
+
+    def test_whitespace_returns_none(self) -> None:
+        assert scc._parse_systemd_monotonic_us("   ") is None
+
+    def test_non_integer_returns_none(self) -> None:
+        assert scc._parse_systemd_monotonic_us("not-a-number") is None
+
+    def test_negative_returns_none(self) -> None:
+        assert scc._parse_systemd_monotonic_us("-1") is None
+
+    def test_positive_returns_int(self) -> None:
+        # 10s after boot expressed as microseconds.
+        assert scc._parse_systemd_monotonic_us("10000000") == 10_000_000
+
+    def test_strips_whitespace(self) -> None:
+        assert scc._parse_systemd_monotonic_us("  12345  ") == 12345
 
 
 # ── check_framebuffer ──────────────────────────────────────────────────────
