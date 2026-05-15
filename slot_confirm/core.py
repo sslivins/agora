@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -120,6 +121,7 @@ class ConfirmStatus:
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 NowFn = Callable[[], datetime]
+MonotonicNowFn = Callable[[], float]
 FrameOpener = Callable[[str], Any]
 ProbeWriter = Callable[[str, bytes], None]
 StatusReader = Callable[[str], str]
@@ -145,6 +147,39 @@ def _default_runner(
 
 def _default_now() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+def _default_monotonic_now() -> float:
+    """Default source for the monotonic "now" used by the service-age math.
+
+    Returns ``time.monotonic()`` (CLOCK_MONOTONIC on Linux), which is
+    immune to NTP step corrections. Pi 5 has no battery-backed RTC, so
+    on a fresh boot the wallclock can jump forward by minutes-to-hours
+    once ``systemd-timesyncd`` syncs — making
+    ``datetime.now() - systemd_ActiveEnterTimestamp`` produce a
+    negative age and a spurious slot-confirm strike. See bug #197.
+    """
+    return time.monotonic()
+
+
+def _parse_systemd_monotonic_us(raw: str) -> Optional[int]:
+    """Parse a systemd ``ActiveEnterTimestampMonotonic`` value.
+
+    systemd emits the property as an integer microsecond count since
+    the kernel started (i.e. against ``CLOCK_MONOTONIC``). Returns
+    ``None`` for empty / ``"0"`` / unparseable values — ``0`` is the
+    sentinel emitted by systemd before a unit has ever activated.
+    """
+    raw = (raw or "").strip()
+    if not raw or raw == "0":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
 
 
 # ── 1. agora services active for ≥5 min ────────────────────────────────────
@@ -187,12 +222,24 @@ def check_agora_services_active(
     min_active_seconds: int = DEFAULT_MIN_ACTIVE_SECONDS,
     runner: Optional[Runner] = None,
     now_fn: Optional[NowFn] = None,
+    monotonic_now_fn: Optional[MonotonicNowFn] = None,
 ) -> CheckResult:
     """Verify every ``services`` entry is Active and has been so for ≥ ``min_active_seconds``.
 
     Returns ``ok=False`` on the first service that is not active or has
     been active for less than the threshold. The reason and offending
     service are recorded in ``detail`` and ``measurement``.
+
+    Age math prefers ``ActiveEnterTimestampMonotonic`` (CLOCK_MONOTONIC)
+    over the wallclock ``ActiveEnterTimestamp``. Pi 5 has no
+    battery-backed RTC, so on a fresh boot the wallclock can jump
+    forward by minutes-to-hours once ``systemd-timesyncd`` syncs,
+    yielding negative wallclock-derived ages and spurious strikes.
+    See bug #197. The wallclock path remains as a fallback when systemd
+    reports ``ActiveEnterTimestampMonotonic=0`` (the sentinel for
+    "never activated"); a negative age from either source is treated as
+    a failure (with ``measurement.reason="negative_age"``) since both
+    inputs must be monotonic w.r.t. their own clock.
     """
     if min_active_seconds < 0:
         raise SlotConfirmError(
@@ -203,6 +250,7 @@ def check_agora_services_active(
 
     run = runner or _default_runner
     now = (now_fn or _default_now)()
+    monotonic_now_s = (monotonic_now_fn or _default_monotonic_now)()
 
     per_service: dict[str, dict[str, Any]] = {}
     for unit in services:
@@ -214,6 +262,7 @@ def check_agora_services_active(
                     unit,
                     "--property=ActiveState",
                     "--property=ActiveEnterTimestamp",
+                    "--property=ActiveEnterTimestampMonotonic",
                 ],
                 check=False,
                 capture_output=True,
@@ -237,6 +286,7 @@ def check_agora_services_active(
 
         active_state: Optional[str] = None
         enter_raw: str = ""
+        enter_monotonic_raw: str = ""
         for line in (cp.stdout or "").splitlines():
             if "=" not in line:
                 continue
@@ -245,6 +295,8 @@ def check_agora_services_active(
                 active_state = value.strip()
             elif key == "ActiveEnterTimestamp":
                 enter_raw = value.strip()
+            elif key == "ActiveEnterTimestampMonotonic":
+                enter_monotonic_raw = value.strip()
 
         if active_state != "active":
             return CheckResult(
@@ -270,11 +322,47 @@ def check_agora_services_active(
                 },
             )
 
-        age = (now - entered).total_seconds()
+        entered_monotonic_us = _parse_systemd_monotonic_us(enter_monotonic_raw)
+        if entered_monotonic_us is not None:
+            # Preferred path: monotonic clock; immune to NTP step.
+            age = monotonic_now_s - (entered_monotonic_us / 1_000_000.0)
+            clock_source = "monotonic"
+        else:
+            # Fallback: wallclock — only triggers if systemd reports
+            # ``ActiveEnterTimestampMonotonic=0`` (unit never activated)
+            # which would already have tripped the ``active_state`` gate.
+            age = (now - entered).total_seconds()
+            clock_source = "wallclock"
+
         per_service[unit] = {
             "active_for_seconds": age,
             "entered_at": entered.isoformat(),
+            "clock_source": clock_source,
         }
+
+        if age < 0:
+            # Both clock sources are supposed to be monotonic w.r.t.
+            # themselves; a negative delta means the systemd property
+            # disagrees with our "now" (clock jumped backwards, or unit
+            # entered ``ActiveEnterTimestampMonotonic`` after the
+            # daemon read its own clock — neither can be reasoned about).
+            return CheckResult(
+                name="agora_services_active",
+                ok=False,
+                detail=(
+                    f"{unit} has negative active-for age ({age:.1f}s) "
+                    f"via {clock_source} clock"
+                ),
+                measurement={
+                    "service": unit,
+                    "active_for_seconds": age,
+                    "min_active_seconds": min_active_seconds,
+                    "entered_at": entered.isoformat(),
+                    "clock_source": clock_source,
+                    "reason": "negative_age",
+                },
+            )
+
         if age < min_active_seconds:
             return CheckResult(
                 name="agora_services_active",
@@ -288,6 +376,7 @@ def check_agora_services_active(
                     "active_for_seconds": age,
                     "min_active_seconds": min_active_seconds,
                     "entered_at": entered.isoformat(),
+                    "clock_source": clock_source,
                 },
             )
 
