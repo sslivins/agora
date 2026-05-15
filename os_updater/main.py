@@ -197,16 +197,106 @@ def _build_transport_factory(settings):
     """Build a factory that the service can call to get a fresh transport
     on each reconnect.
 
-    Imports :mod:`api.config` and :mod:`cms_client.transport` lazily so
-    unit tests can exercise this module without those deps installed.
-    Phase 3 will likely refactor this to share the cms_client daemon's
-    existing WPS connection (plan §"Phase 2 — Deliverables", line about
-    "the existing WPS connection") — for now, agora-os-updater opens its
-    own connection with its own connect-token round-trip.
+    Two paths, selected at runtime:
+
+    * **Bootstrap-v2** (``settings.bootstrap_v2`` is truthy and
+      ``settings.bootstrap_state_path`` exists with usable
+      ``wps_url`` + ``wps_jwt``): each ``_open()`` re-reads the
+      state file and uses the pre-minted WPS URL + JWT directly,
+      bypassing the legacy api_key connect-token round-trip. The
+      cms_client daemon running alongside os_updater proactively
+      refreshes the JWT and rewrites this file, so re-reading on
+      every reconnect picks up new tokens without os_updater
+      having to do its own refresh dance.
+    * **Legacy api_key**: original behavior. Requires
+      ``AGORA_CMS_URL``, ``AGORA_DEVICE_NAME``, and
+      ``AGORA_DEVICE_API_KEY`` env vars. Will be deleted once the
+      bootstrap-v2 migration is complete (see plan M8).
+
+    Imports :mod:`cms_client.transport` lazily so unit tests can
+    exercise this module without that dep installed.
     """
 
     from cms_client.transport import open_wps  # local import per docstring
 
+    if _bootstrap_v2_available(settings):
+        return _build_bootstrap_v2_factory(settings, open_wps)
+    return _build_legacy_api_key_factory(settings, open_wps)
+
+
+def _bootstrap_v2_available(settings) -> bool:
+    """Return True iff bootstrap-v2 is enabled AND its state file is usable.
+
+    A truthy ``settings.bootstrap_v2`` alone isn't enough: on a freshly
+    flashed device that hasn't yet completed bootstrap-v2 enrollment the
+    state file won't exist, and we'd rather fail open to the legacy path
+    than crash on first boot.
+    """
+    if not getattr(settings, "bootstrap_v2", False):
+        return False
+    path = getattr(settings, "bootstrap_state_path", None)
+    if not path:
+        return False
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        state = _json.loads(_Path(path).read_text())
+    except (OSError, ValueError):
+        return False
+    return bool(state.get("wps_url")) and bool(state.get("wps_jwt"))
+
+
+def _build_bootstrap_v2_factory(settings, open_wps):
+    """Factory for the bootstrap-v2 (pre-minted JWT) path.
+
+    cms_url and device_id are sourced from ``bootstrap_state.json``
+    too — the legacy ``settings.cms_url`` / ``settings.device_name``
+    fields are *not* required on bootstrap-v2 devices, since the
+    pre-minted URL contains everything ``open_wps`` actually needs
+    to dial. The two are passed defensively for forward-compat with
+    older ``open_wps`` signatures.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    bootstrap_path = _Path(settings.bootstrap_state_path)
+
+    async def _open():
+        try:
+            state = _json.loads(bootstrap_path.read_text())
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"bootstrap_state.json missing at {bootstrap_path}; "
+                "device not paired via bootstrap-v2"
+            ) from e
+        wps_url = state.get("wps_url") or ""
+        wps_jwt = state.get("wps_jwt") or ""
+        if not wps_url or not wps_jwt:
+            raise RuntimeError(
+                f"bootstrap_state.json at {bootstrap_path} missing wps_url/wps_jwt"
+            )
+        cms_url = state.get("cms_api_base") or getattr(settings, "cms_url", "") or ""
+        device_id = state.get("device_id") or getattr(settings, "device_name", "") or ""
+        return await open_wps(
+            cms_url=cms_url,
+            device_id=device_id,
+            pre_minted_url=wps_url,
+            pre_minted_token=wps_jwt,
+        )
+
+    def factory() -> WPSTransport:
+        return _CMSWPSTransportAdapter(_open)
+
+    return factory
+
+
+def _build_legacy_api_key_factory(settings, open_wps):
+    """Factory for the legacy api_key WPS connect path.
+
+    Slated for deletion in plan M8 once every fleet device is on
+    bootstrap-v2.
+    """
     cms_url = settings.cms_url
     device_id = settings.device_name
     api_key = settings.device_api_key
