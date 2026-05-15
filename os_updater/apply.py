@@ -114,13 +114,32 @@ logger = logging.getLogger(__name__)
 #: :data:`os_updater.verifier.DEFAULT_BUNDLE_FILENAME`.
 DEFAULT_BUNDLE_FILENAME = "bundle.tar.zst"
 
-#: Slot A's boot partition mountpoint. Phase 0 fstab.
-DEFAULT_BOOT_MOUNT_SLOT_A = Path("/boot/firmware")
+#: Mountpoint of the **active** slot's boot (FAT32) partition. agora-os
+#: assemble.sh convention: regardless of which slot is active, the
+#: bootloader-selected boot partition is always exposed at
+#: ``/boot/firmware``. Read-only from the OTA stager's perspective —
+#: this is where we **read** per-device boot fleet-state from (e.g.
+#: ``autoboot.txt``) before tryboot.
+#:
+#: **Naming history:** previously called ``DEFAULT_BOOT_MOUNT_SLOT_A``,
+#: but the value never depended on slot identity — it always pointed at
+#: whatever slot the bootloader landed on. The old name caused a 5-bug
+#: chain (sslivins/agora-os v0.0.18-test brick) where the stager
+#: dispatched the inactive boot extract to ``/boot/firmware`` (the
+#: ACTIVE slot's boot, corrupting it) because :func:`boot_mount_for_slot`
+#: returned ``slot_a_mount`` when ``slot == 1`` even though the running
+#: slot was 2. Renamed to ``DEFAULT_ACTIVE_BOOT_MOUNT`` to make the
+#: invariant unambiguous.
+DEFAULT_ACTIVE_BOOT_MOUNT = Path("/boot/firmware")
 
-#: Slot B's boot partition mountpoint. Phase 0 fstab keeps slot B's
-#: FAT32 partition mounted at the mirror path so slot_mgr can keep
-#: ``autoboot.txt`` in sync across both copies.
-DEFAULT_BOOT_MOUNT_SLOT_B = Path("/boot/firmware-b")
+#: Mountpoint of the **inactive** slot's boot (FAT32) partition. Phase 0
+#: fstab keeps the inactive slot's FAT32 partition mounted at the mirror
+#: path so slot_mgr can keep ``autoboot.txt`` in sync across both copies
+#: and the OTA stager has a stable target for the boot-subtree extract.
+#:
+#: **Naming history:** previously ``DEFAULT_BOOT_MOUNT_SLOT_B``. See
+#: :data:`DEFAULT_ACTIVE_BOOT_MOUNT` for the rename rationale.
+DEFAULT_INACTIVE_BOOT_MOUNT = Path("/boot/firmware-b")
 
 #: Where the inactive slot's root partition is mounted while the
 #: running slot writes into it. :class:`SlotStager` ensures this is
@@ -195,6 +214,7 @@ DEFAULT_FLEET_STATE_CP_TIMEOUT_S = 30.0
 STAGE_PROGRESS_PHASES: tuple[str, ...] = (
     "extracting_meta",
     "mounting_inactive",
+    "wiping_inactive",
     "extracting_boot",
     "extracting_rootfs",
     "verifying_manifest",
@@ -224,10 +244,16 @@ def _safe_emit_progress(
             "progress_callback raised on phase=%s; continuing stage", phase
         )
 
-#: Root of the currently-running rootfs (slot A) from which
+#: Root of the currently-running rootfs from which
 #: :func:`copy_fleet_state` reads per-device identity files. Path is
 #: ``/`` in production; tests inject ``tmp_path`` to bypass.
-DEFAULT_SLOT_A_ROOT = Path("/")
+#:
+#: **Naming history:** previously ``DEFAULT_SLOT_A_ROOT``. The value
+#: was always ``/`` (the running slot's rootfs) regardless of which
+#: slot the device booted into, so "slot_a" was misleading. Renamed
+#: to ``DEFAULT_RUNNING_ROOT`` alongside the broader
+#: active-vs-inactive rename in the v0.0.19-test fix.
+DEFAULT_RUNNING_ROOT = Path("/")
 
 #: Files that **must** be present on slot A and copied into slot B
 #: before tryboot. Each entry is a path **relative** to the rootfs
@@ -264,6 +290,28 @@ FLEET_STATE_COPY_IF_PRESENT: tuple[str, ...] = (
     "etc/NetworkManager/system-connections/wifi-*.nmconnection",
     "home/agora/.ssh",
 )
+
+#: Files that **must** be present on the active boot partition
+#: (``/boot/firmware``) and copied into the inactive boot partition
+#: (``/boot/firmware-b``) before tryboot.
+#:
+#: ``autoboot.txt`` is the **canonical** target: the bundle producer
+#: deliberately omits it so we can copy the device's own copy here.
+#: It carries the per-device tryboot/active slot selection and MUST
+#: survive the OTA — without it the bootloader has no slot-selection
+#: information and the device hangs at the rainbow screen.
+#:
+#: This is the boot-partition analog of :data:`FLEET_STATE_REQUIRED`.
+#: Refusing to apply on absence is the safe default: a device missing
+#: ``autoboot.txt`` on its active boot is either pre-A/B (vintage
+#: image, manual reflash required) or in a broken state, and the OTA
+#: shouldn't paper over that. See plan.md §"OTA v0.0.18-test brick".
+BOOT_FLEET_STATE_REQUIRED: tuple[str, ...] = ("autoboot.txt",)
+
+#: Boot-partition analog of :data:`FLEET_STATE_COPY_IF_PRESENT`.
+#: Currently empty — no boot files are merely-optional. Reserved for
+#: future use (e.g. a per-device ``config.txt`` overlay).
+BOOT_FLEET_STATE_COPY_IF_PRESENT: tuple[str, ...] = ()
 
 #: Relative path inside the inactive slot's root where the bundle ships
 #: an fstab template with ``{{BOOT_PARTLABEL}}`` placeholder. Replaced
@@ -377,23 +425,6 @@ def other_slot(slot: int) -> int:
     raise StagingError(f"invalid slot number: {slot!r} (expected 1 or 2)")
 
 
-def boot_mount_for_slot(
-    slot: int,
-    *,
-    slot_a_mount: Path = DEFAULT_BOOT_MOUNT_SLOT_A,
-    slot_b_mount: Path = DEFAULT_BOOT_MOUNT_SLOT_B,
-) -> Path:
-    """Return the mountpoint of ``slot``'s boot (FAT32) partition.
-
-    Raises :class:`StagingError` on bad input.
-    """
-    if slot == 1:
-        return slot_a_mount
-    if slot == 2:
-        return slot_b_mount
-    raise StagingError(f"invalid slot number: {slot!r} (expected 1 or 2)")
-
-
 #: GPT partition labels baked into the image by
 #: ``agora-os/image-build/assemble.sh`` (see plan.md D51).
 _BOOT_PARTLABEL_FOR_SLOT = {1: "boot-A", 2: "boot-B"}
@@ -432,28 +463,37 @@ def _tail(text: Optional[str], limit: int = 2000) -> str:
     return "…" + text[-limit:]
 
 
-def _is_mountpoint(
+def _mounted_device(
     target: Path,
     *,
     mounts_path: Path = DEFAULT_MOUNTS_PATH,
-) -> bool:
-    """Return True if ``target`` appears as a mountpoint in ``mounts_path``.
+) -> Optional[Path]:
+    """Return the device backing ``target`` per ``mounts_path``, or None.
 
     Reads ``mounts_path`` (``/proc/self/mounts`` in production) and looks
     for a line whose second field (mountpoint) resolves to the same path
-    as ``target`` after :py:meth:`Path.resolve`. Returns False if
+    as ``target`` after :py:meth:`Path.resolve`. The first field
+    (device) of the matching line is returned as a :class:`Path`.
+    Returns ``None`` if ``target`` is not a mountpoint or if
     ``mounts_path`` is missing — pure read with no side effects.
 
-    ``/proc/self/mounts`` encodes special characters in mountpoint paths
-    with C-style octal escapes (e.g. a literal space becomes ``\\040``);
-    this helper decodes them before comparison so that paths containing
-    spaces still match.
+    ``/proc/self/mounts`` encodes special characters in both the device
+    and mountpoint fields with C-style octal escapes (e.g. a literal
+    space becomes ``\\040``); this helper decodes them before
+    comparison/return so that paths containing spaces still match and
+    round-trip correctly.
+
+    This is the partlabel-verification primitive that fixes Bug 2 of
+    the v0.0.18-test brick: :func:`ensure_partition_mounted` uses it
+    to confirm the **right** device is mounted at ``target`` before
+    treating the mountpoint as ready, rather than admitting any
+    occupied mountpoint as "good enough."
     """
     target = Path(target).resolve()
     try:
         content = Path(mounts_path).read_text()
     except FileNotFoundError:
-        return False
+        return None
     for line in content.splitlines():
         parts = line.split()
         if len(parts) < 2:
@@ -466,15 +506,33 @@ def _is_mountpoint(
         # Windows paths like ``C:\Users\...`` even though we never see
         # such paths on real Pi hardware. Tests still want to run on
         # the maintainer's workstation.
-        decoded = _MOUNTS_OCTAL_RE.sub(
+        decoded_target = _MOUNTS_OCTAL_RE.sub(
             lambda m: chr(int(m.group(1), 8)), parts[1]
         )
         try:
-            if Path(decoded).resolve() == target:
-                return True
+            if Path(decoded_target).resolve() == target:
+                decoded_device = _MOUNTS_OCTAL_RE.sub(
+                    lambda m: chr(int(m.group(1), 8)), parts[0]
+                )
+                return Path(decoded_device)
         except OSError:
             continue
-    return False
+    return None
+
+
+def _is_mountpoint(
+    target: Path,
+    *,
+    mounts_path: Path = DEFAULT_MOUNTS_PATH,
+) -> bool:
+    """Return True if ``target`` appears as a mountpoint in ``mounts_path``.
+
+    Thin wrapper around :func:`_mounted_device` that discards the
+    device identity. Kept as a separate helper so existing callers
+    (and tests) that only care about "is anything mounted here?" stay
+    boolean-shaped.
+    """
+    return _mounted_device(target, mounts_path=mounts_path) is not None
 
 
 def ensure_partition_mounted(
@@ -490,10 +548,15 @@ def ensure_partition_mounted(
 ) -> None:
     """Ensure the partition labeled ``partlabel`` is mounted at ``target``.
 
-    Idempotent. If ``target`` is already a mountpoint per ``mounts_path``
-    this no-ops (we do not validate that the *right* partition is
-    mounted there — :func:`copy_fleet_state` and the manifest verify
-    step will catch a wrong-partition case). Otherwise:
+    Idempotent. If ``target`` is already a mountpoint per ``mounts_path``,
+    the device backing it is read via :func:`_mounted_device` and
+    compared byte-for-byte against the expected
+    ``<partlabel_base>/<partlabel>`` path. On match: no-op. On
+    mismatch: raise :class:`StagingError` immediately with both device
+    names — refusing to extract a bundle onto whatever happens to be
+    mounted there.
+
+    Otherwise (no mountpoint):
 
     1. Create ``target`` (and any missing parents) as a directory.
     2. Invoke ``mount(8)`` via ``runner`` to mount
@@ -501,20 +564,44 @@ def ensure_partition_mounted(
        fstype and options.
 
     Raises :class:`StagingError` on any of:
+    - mismatched device at an already-mounted ``target``,
     - ``mount(8)`` returning non-zero (with stderr in the message),
     - ``mount(8)`` binary missing from PATH,
     - ``mount(8)`` exceeding ``timeout_s``.
 
-    This is the defense-in-depth that fixes the v0.0.7-test brick: if
+    The partlabel-mismatch check fixes Bug 2 of the v0.0.18-test
+    brick: in that incident the active boot partition (``boot-B``,
+    GPT label) was mounted at ``/boot/firmware`` (the canonical
+    ACTIVE boot mountpoint), but the OTA stager treated
+    ``/boot/firmware`` as the **slot A** boot mount because of Bug
+    1's slot-keyed lookup, and dispatched the inactive-boot extract
+    onto the active slot. With partlabel verification, the apply step
+    would have aborted at ``ensure_partition_mounted("boot-A",
+    /boot/firmware)`` because the actual device at that mountpoint
+    was ``/dev/disk/by-partlabel/boot-B``.
+
+    Defense-in-depth from the v0.0.7-test brick is preserved: if
     agora-os didn't ship systemd .mount units for ``boot-B`` and
-    ``root-B``, slot B's mountpoints are empty rootfs directories, and
-    the streaming extract in step 6/7 would silently write the bundle
-    onto the *active* rootfs (slot A) — leaving slot B stale and
-    bricking the device on tryboot.
+    ``root-B``, this function still re-runs ``mount(8)`` after
+    finding no mountpoint at ``target``.
     """
     target = Path(target)
     target.mkdir(parents=True, exist_ok=True)
-    if _is_mountpoint(target, mounts_path=mounts_path):
+    expected_device = (Path(partlabel_base) / partlabel).resolve()
+    actual_device = _mounted_device(target, mounts_path=mounts_path)
+    if actual_device is not None:
+        try:
+            actual_resolved = actual_device.resolve()
+        except OSError:
+            actual_resolved = actual_device
+        if actual_resolved != expected_device:
+            raise StagingError(
+                f"partition mismatch at {target}: expected "
+                f"{expected_device} (partlabel {partlabel}) but "
+                f"{actual_device} is mounted there. Refusing to "
+                "extract bundle onto the wrong partition; check the "
+                "device's fstab and slot identification logic."
+            )
         logger.info(
             "partition %s already mounted at %s, skipping mount",
             partlabel,
@@ -962,28 +1049,36 @@ def rsync_tree(
 
 
 def copy_fleet_state(
-    slot_a_root: Path,
-    slot_b_root: Path,
+    source_root: Path,
+    dest_root: Path,
     *,
     runner: Runner = _default_runner,
     required: tuple[str, ...] = FLEET_STATE_REQUIRED,
     copy_if_present: tuple[str, ...] = FLEET_STATE_COPY_IF_PRESENT,
     cp_timeout_s: float = DEFAULT_FLEET_STATE_CP_TIMEOUT_S,
 ) -> None:
-    """Copy per-device identity files from slot A into slot B.
+    """Copy per-device identity files from one rootfs into another.
 
     Implements step 8b of the apply flow (D60 in plan.md §"Phase 2").
     Each entry in ``required`` and ``copy_if_present`` is a path
     **relative** to the rootfs root (no leading slash). Patterns
     containing ``*`` are treated as globs evaluated against
-    ``slot_a_root``; literal patterns are required to exist as
+    ``source_root``; literal patterns are required to exist as
     regular files / symlinks.
+
+    Historically this was hardcoded ``slot_a_root`` → ``slot_b_root``
+    for the rootfs identity copy. With the v0.0.19 fix, the same
+    primitive is also used for ``active_boot_mount`` →
+    ``inactive_boot_mount`` (copying ``autoboot.txt`` so the
+    bootloader can still find a slot to boot after the inactive
+    boot partition is wiped and re-extracted). Naming is generic
+    (source/dest) to reflect that.
 
     Semantics:
 
-    * **Required literal** — file must exist on slot A. Raises
-      :class:`FleetStateMissingError` (with ``path`` set to the
-      relative pattern) otherwise.
+    * **Required literal** — file must exist on ``source_root``.
+      Raises :class:`FleetStateMissingError` (with ``path`` set to
+      the relative pattern) otherwise.
     * **Required glob** — at least one match required. Zero matches
       raises :class:`FleetStateMissingError`.
     * **Copy-if-present literal/glob** — zero matches is fine and
@@ -993,67 +1088,68 @@ def copy_fleet_state(
     preserves uid/gid/mode/atime/mtime/xattrs/symlinks (matching
     rsync's ``-a`` semantics for the per-file case but without
     rsync's source-list ergonomics that don't fit a glob+literal
-    mix). Parent directories on slot B are created with mode 0755 if
-    missing.
+    mix). Parent directories on ``dest_root`` are created with mode
+    0755 if missing.
 
     Any non-zero ``cp`` exit, missing-binary error, or timeout
     raises :class:`FleetStateWriteError`. Per the module-level "no
-    cleanup on failure" policy, neither slot B nor the staging
-    directory is touched on failure — the device boots from slot A
-    on next reboot and the operator can forensic the partial copy.
+    cleanup on failure" policy, neither ``dest_root`` nor the
+    staging directory is touched on failure — the device boots from
+    its active slot on next reboot and the operator can forensic
+    the partial copy.
     """
-    slot_a_root = Path(slot_a_root)
-    slot_b_root = Path(slot_b_root)
+    source_root = Path(source_root)
+    dest_root = Path(dest_root)
 
     for pattern in required:
-        sources = _resolve_fleet_state_sources(slot_a_root, pattern)
+        sources = _resolve_fleet_state_sources(source_root, pattern)
         if not sources:
             raise FleetStateMissingError(
-                f"required fleet-state entry not present on slot A: "
-                f"{pattern!r} (resolved under {slot_a_root})",
+                f"required fleet-state entry not present at source: "
+                f"{pattern!r} (resolved under {source_root})",
                 path=pattern,
             )
         for src in sources:
             _cp_one(
                 src,
-                slot_a_root,
-                slot_b_root,
+                source_root,
+                dest_root,
                 pattern,
                 runner=runner,
                 cp_timeout_s=cp_timeout_s,
             )
 
     for pattern in copy_if_present:
-        sources = _resolve_fleet_state_sources(slot_a_root, pattern)
+        sources = _resolve_fleet_state_sources(source_root, pattern)
         if not sources:
             logger.info(
                 "fleet_state_skipped: %r (no match under %s)",
                 pattern,
-                slot_a_root,
+                source_root,
             )
             continue
         for src in sources:
             _cp_one(
                 src,
-                slot_a_root,
-                slot_b_root,
+                source_root,
+                dest_root,
                 pattern,
                 runner=runner,
                 cp_timeout_s=cp_timeout_s,
             )
 
 
-def _resolve_fleet_state_sources(slot_a_root: Path, pattern: str) -> list[Path]:
-    """Return the list of slot-A source paths matched by ``pattern``.
+def _resolve_fleet_state_sources(source_root: Path, pattern: str) -> list[Path]:
+    """Return the list of source paths matched by ``pattern``.
 
     Glob patterns (containing ``*``) are evaluated against
-    ``slot_a_root`` via :meth:`Path.glob`; literal patterns return
-    ``[slot_a_root / pattern]`` if the path exists, else ``[]``.
+    ``source_root`` via :meth:`Path.glob`; literal patterns return
+    ``[source_root / pattern]`` if the path exists, else ``[]``.
     Symlinks count as existing — ``cp -a`` will preserve them.
     """
     if "*" in pattern:
-        return sorted(slot_a_root.glob(pattern))
-    candidate = slot_a_root / pattern
+        return sorted(source_root.glob(pattern))
+    candidate = source_root / pattern
     if candidate.exists() or candidate.is_symlink():
         return [candidate]
     return []
@@ -1061,8 +1157,8 @@ def _resolve_fleet_state_sources(slot_a_root: Path, pattern: str) -> list[Path]:
 
 def _cp_one(
     src: Path,
-    slot_a_root: Path,
-    slot_b_root: Path,
+    source_root: Path,
+    dest_root: Path,
     pattern: str,
     *,
     runner: Runner,
@@ -1070,21 +1166,21 @@ def _cp_one(
 ) -> None:
     """Run ``cp -a <src> <dst>`` for a single fleet-state file.
 
-    Computes ``dst`` by re-rooting ``src`` from ``slot_a_root`` onto
-    ``slot_b_root`` (preserving the in-rootfs path). Creates the
-    parent directory on slot B if missing. Raises
+    Computes ``dst`` by re-rooting ``src`` from ``source_root`` onto
+    ``dest_root`` (preserving the in-rootfs path). Creates the
+    parent directory on ``dest_root`` if missing. Raises
     :class:`FleetStateWriteError` on any subprocess failure.
     """
-    rel = src.relative_to(slot_a_root)
-    dst = slot_b_root / rel
+    rel = src.relative_to(source_root)
+    dst = dest_root / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     # If ``src`` is a directory (e.g. ``home/agora/.ssh``) and ``dst``
-    # already exists on slot B from a prior partial apply, remove it
+    # already exists on dest_root from a prior partial apply, remove it
     # first so ``cp -a`` writes AT ``dst`` rather than INTO ``dst`` —
-    # i.e. avoids creating ``slot_b/home/agora/.ssh/.ssh``. Safe
+    # i.e. avoids creating ``dest_root/home/agora/.ssh/.ssh``. Safe
     # because copy_fleet_state is the sole source of truth for the
-    # fleet-state entries on slot B.
+    # fleet-state entries on dest_root.
     if src.is_dir() and dst.exists():
         shutil.rmtree(dst)
 
@@ -1170,8 +1266,17 @@ class SlotStager:
     boot_subdir: str = "boot"
     root_subdir: str = "root"
     meta_filename: str = "meta.json"
-    boot_mount_slot_a: Path = field(default_factory=lambda: DEFAULT_BOOT_MOUNT_SLOT_A)
-    boot_mount_slot_b: Path = field(default_factory=lambda: DEFAULT_BOOT_MOUNT_SLOT_B)
+    #: Mountpoint of the ACTIVE slot's boot partition — always
+    #: ``/boot/firmware`` on a healthy device per agora-os fstab
+    #: convention (regardless of whether the active slot is 1 or 2).
+    #: Read-only source for boot-fleet-state copy (``autoboot.txt``);
+    #: never written by the stager.
+    active_boot_mount: Path = field(default_factory=lambda: DEFAULT_ACTIVE_BOOT_MOUNT)
+    #: Mountpoint of the INACTIVE slot's boot partition — always
+    #: ``/boot/firmware-b`` on a healthy device per agora-os fstab
+    #: convention. Destination for the boot-subtree extract +
+    #: boot-fleet-state copy.
+    inactive_boot_mount: Path = field(default_factory=lambda: DEFAULT_INACTIVE_BOOT_MOUNT)
     inactive_root_mount: Path = field(default_factory=lambda: DEFAULT_INACTIVE_ROOT_MOUNT)
     zstd_long: int = DEFAULT_ZSTD_LONG
     stream_timeout_s: float = DEFAULT_STREAM_TIMEOUT_S
@@ -1181,9 +1286,24 @@ class SlotStager:
     )
     slot_state_fn: Optional[Callable[[], Any]] = None
     trigger_tryboot_fn: Optional[Callable[[int], Any]] = None
-    slot_a_root: Path = field(default_factory=lambda: DEFAULT_SLOT_A_ROOT)
+    #: Mountpoint of the running rootfs — always ``/`` on a real
+    #: device, overridable in tests. Read-only source for the
+    #: rootfs-fleet-state copy (machine-id, ssh host keys, etc.);
+    #: never written by the stager.
+    running_root: Path = field(default_factory=lambda: DEFAULT_RUNNING_ROOT)
     fleet_state_required: tuple[str, ...] = FLEET_STATE_REQUIRED
     fleet_state_copy_if_present: tuple[str, ...] = FLEET_STATE_COPY_IF_PRESENT
+    #: Fleet-state files copied from the active boot partition into
+    #: the inactive boot partition AFTER the boot subtree is wiped
+    #: and re-extracted. Default = ``("autoboot.txt",)``; the bundle
+    #: deliberately omits autoboot.txt because slot_mgr (not the
+    #: stager) is the authority for which slot the bootloader
+    #: should select. Without this copy, the bootloader has no way
+    #: to find any slot — device bricks.
+    boot_fleet_state_required: tuple[str, ...] = BOOT_FLEET_STATE_REQUIRED
+    boot_fleet_state_copy_if_present: tuple[str, ...] = (
+        BOOT_FLEET_STATE_COPY_IF_PRESENT
+    )
     fleet_state_cp_timeout_s: float = DEFAULT_FLEET_STATE_CP_TIMEOUT_S
     fstab_template_rel: str = DEFAULT_FSTAB_TEMPLATE_REL
     fstab_rel: str = DEFAULT_FSTAB_REL
@@ -1293,22 +1413,30 @@ class SlotStager:
         )
 
         # 5. Ensure the inactive slot's boot + root partitions are
-        # mounted. Defense-in-depth (see plan.md §"OTA v0.0.7-test
-        # mount gap"): early agora-os images did not ship systemd
+        # mounted at their canonical mountpoints. Per agora-os fstab
+        # convention the INACTIVE slot's boot is always
+        # ``/boot/firmware-b`` and its root always at
+        # ``/mnt/inactive-root``, regardless of whether the inactive
+        # slot is 1 or 2. (The pre-v0.0.19 ``boot_mount_for_slot``
+        # lookup was slot-keyed; if Bug 1 had not been fixed, this
+        # would have resolved to ``/boot/firmware`` when the inactive
+        # slot was 1, which is the ACTIVE slot's mountpoint —
+        # bricking the device by extracting the bundle onto the
+        # running slot. See v0.0.18-test post-mortem.)
+        #
+        # Defense-in-depth (see plan.md §"OTA v0.0.7-test mount
+        # gap"): early agora-os images did not ship systemd
         # ``.mount`` units for ``/boot/firmware-b`` and
-        # ``/mnt/inactive-root``, so the mountpoints were empty rootfs
-        # directories and step 6/7's stream-extract would silently
-        # write the bundle onto the **active** rootfs (slot A),
-        # leaving slot B stale and bricking the device on tryboot.
-        # ``ensure_partition_mounted`` is idempotent — if a systemd
-        # unit already mounted the partition (the agora-os 0.0.8+
-        # path), this is a no-op.
+        # ``/mnt/inactive-root``, so the mountpoints were empty
+        # rootfs directories and step 6/7's stream-extract would
+        # silently write the bundle onto the **active** rootfs (slot
+        # A), leaving slot B stale. ``ensure_partition_mounted`` is
+        # idempotent — if a systemd unit already mounted the
+        # partition (the agora-os 0.0.8+ path), this is a no-op,
+        # AND it now verifies the correct partlabel is mounted
+        # there (Bug 2 fix).
         _safe_emit_progress(progress_callback, "mounting_inactive")
-        boot_target = boot_mount_for_slot(
-            inactive,
-            slot_a_mount=self.boot_mount_slot_a,
-            slot_b_mount=self.boot_mount_slot_b,
-        )
+        boot_target = Path(self.inactive_boot_mount)
         root_target = Path(self.inactive_root_mount)
         ensure_partition_mounted(
             boot_partlabel_for_slot(inactive),
@@ -1330,6 +1458,21 @@ class SlotStager:
             partlabel_base=self.partlabel_base,
             timeout_s=self.mount_timeout_s,
         )
+
+        # 5b. Wipe the inactive slot's boot + root partitions before
+        # extracting the bundle. Without this, an old release's files
+        # that are NOT in the new bundle's manifest survive into the
+        # newly-extracted slot and quietly contaminate it. The
+        # streaming extract overwrites same-path files but leaves
+        # orphans alone — this is how v0.0.18-test left a stale
+        # ``bcm2712-rpi-5-b.dtb`` + companion overlays on the boot
+        # partition that pointed the bootloader at a kernel the new
+        # rootfs no longer matched. Wiping is a destructive, slot-B-
+        # only operation; the staging runner aborts before this if
+        # the wrong device is mounted at either target (see Bug 2
+        # fix in ``ensure_partition_mounted``).
+        _safe_emit_progress(progress_callback, "wiping_inactive")
+        self._wipe_inactive_partitions(boot_target, root_target)
 
         # 6. Stream boot/ subtree straight onto the inactive boot partition.
         # --strip-components=1 turns "boot/foo" into "<boot_target>/foo" and
@@ -1368,16 +1511,28 @@ class SlotStager:
             len(meta.sha256_manifest),
         )
 
-        # 9. Copy per-device fleet-state files from slot A into slot B.
-        # Done AFTER manifest verify so the manifest check doesn't see
-        # files added by us. Implements D60 of plan.md §"Phase 2".
+        # 9. Copy per-device fleet-state from the active slot into
+        # the inactive slot. Done AFTER manifest verify so the
+        # manifest check doesn't see files added by us. Two distinct
+        # copies — the rootfs identity files (D60 of plan.md §"Phase
+        # 2") and the boot-partition state (``autoboot.txt``,
+        # required so the bootloader still has a slot to select
+        # post-extract). See v0.0.18-test post-mortem.
         _safe_emit_progress(progress_callback, "copying_fleet_state")
         copy_fleet_state(
-            self.slot_a_root,
+            self.running_root,
             root_target,
             runner=self.runner,
             required=self.fleet_state_required,
             copy_if_present=self.fleet_state_copy_if_present,
+            cp_timeout_s=self.fleet_state_cp_timeout_s,
+        )
+        copy_fleet_state(
+            self.active_boot_mount,
+            boot_target,
+            runner=self.runner,
+            required=self.boot_fleet_state_required,
+            copy_if_present=self.boot_fleet_state_copy_if_present,
             cp_timeout_s=self.fleet_state_cp_timeout_s,
         )
 
@@ -1409,6 +1564,56 @@ class SlotStager:
                 f"trigger_tryboot({inactive}) failed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+
+    def _wipe_inactive_partitions(self, boot_target: Path, root_target: Path) -> None:
+        """Delete every entry under ``boot_target`` and ``root_target``.
+
+        Run between mount (step 5) and extract (step 6) to clear out
+        stale files from a prior release that are NOT in the new
+        bundle's manifest. Without this, the streaming extract only
+        overwrites same-path files and orphans survive — the exact
+        contamination mode that bricked Pi100 on v0.0.18-test, where
+        a stale ``bcm2712-rpi-5-b.dtb`` from the prior bundle pointed
+        the bootloader at a kernel the new rootfs no longer matched.
+
+        Uses ``find <target> -mindepth 1 -delete`` on the live mount
+        so the mountpoint itself stays (preserving the device-node /
+        FS — we are emphatically NOT formatting). ``-mindepth 1``
+        keeps the mountpoint inode. The find binary handles
+        FAT32-on-boot and ext4-on-root identically.
+
+        Aborts with :class:`StagingError` on any subprocess failure;
+        in particular this fails fast on EROFS, which would indicate
+        the wrong partition is mounted (the active slot's root
+        partition is mounted read-only on a healthy boot — wiping it
+        would be catastrophic). The Bug 2 partlabel check in
+        :func:`ensure_partition_mounted` should already have caught
+        that case in step 5; this is defense-in-depth.
+        """
+        for label, target in (("boot", boot_target), ("root", root_target)):
+            logger.info(
+                "wiping inactive %s partition: %s (find -mindepth 1 -delete)",
+                label,
+                target,
+            )
+            try:
+                result = self.runner(
+                    ["find", str(target), "-mindepth", "1", "-delete"],
+                    timeout=self.mount_timeout_s,
+                )
+            except FileNotFoundError as exc:
+                raise StagingError(
+                    f"find binary not found on PATH while wiping {target}: {exc}"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise StagingError(
+                    f"wipe of {target} timed out after {self.mount_timeout_s}s"
+                ) from exc
+            if result.returncode != 0:
+                raise StagingError(
+                    f"wipe of {target} failed (rc={result.returncode}): "
+                    f"stderr={_tail(result.stderr)!r}"
+                )
 
     def _read_running_slot(self) -> int:
         slot_state_fn = self.slot_state_fn or _default_slot_state
