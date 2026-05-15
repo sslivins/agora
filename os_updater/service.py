@@ -168,7 +168,11 @@ class Stager(Protocol):
     """Owns rsync-to-inactive-slot + agora-slot-mgr trigger-tryboot (p2-stage-and-tryboot)."""
 
     async def stage(
-        self, payload: DispatchPayload, staging_dir: Path
+        self,
+        payload: DispatchPayload,
+        staging_dir: Path,
+        *,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> None:  # pragma: no cover - protocol
         ...
 
@@ -230,7 +234,13 @@ class _DefaultVerifier:
 
 @dataclass
 class _DefaultStager:
-    async def stage(self, payload: DispatchPayload, staging_dir: Path) -> None:
+    async def stage(
+        self,
+        payload: DispatchPayload,
+        staging_dir: Path,
+        *,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         raise NotImplementedError("stager not wired; see p2-stage-and-tryboot")
 
 
@@ -426,7 +436,30 @@ class OSUpdaterService:
 
             transition(self.state, UpdaterFSMState.TRYBOOT_PENDING)
             save_state(self.state, path=self.state_path)
-            await self.stager.stage(payload, staging_dir)
+
+            def _on_stage_progress(phase: str) -> None:
+                """Wired into :meth:`Stager.stage` so each phase boundary
+                emits a STAGE_PROGRESS lifecycle event (agora#202).
+
+                Bound here so the closure captures ``self.state`` /
+                ``self.event_sink`` / ``self.state_path`` at the moment
+                this dispatch is in flight, not at stager-construction
+                time. ``emit_event`` already swallows sink failures, and
+                the stager wraps this callback in its own safe-invoke,
+                so any failure here is logged-and-ignored — STAGE_PROGRESS
+                is advisory.
+                """
+                emit_event(
+                    self.state,
+                    LifecycleEventType.STAGE_PROGRESS,
+                    self.event_sink,
+                    payload={"phase": phase},
+                    state_path=self.state_path,
+                )
+
+            await self.stager.stage(
+                payload, staging_dir, progress_callback=_on_stage_progress
+            )
 
             transition(self.state, UpdaterFSMState.TRYBOOT_RUNNING)
             save_state(self.state, path=self.state_path)

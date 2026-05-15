@@ -272,3 +272,35 @@ class TestOutboxEventSink:
         )
         assert (outbox / "2026-05-07.jsonl").exists()
         assert (outbox / "2026-05-08.jsonl").exists()
+
+
+
+class TestStageProgressEnum:
+    """Pins the public contract that the STAGE_PROGRESS enum value
+    is stable (agora#202). CMS dispatches lifecycle-event handlers off
+    this string; renaming it without coordinating the CMS change would
+    silently lose progress events."""
+
+    def test_enum_value_is_stable_wire_format(self):
+        assert LifecycleEventType.STAGE_PROGRESS.value == "stage_progress"
+
+    def test_event_round_trips_through_sink_with_phase_payload(self, tmp_path):
+        """emit_event must accept payload={'phase': ...} and the sink
+        must receive a LifecycleEvent whose payload preserves it. This
+        is the exact shape the service-side closure produces."""
+        state_path = tmp_path / "state.json"
+        s = UpdaterState(release_id="rel-1", target_version="1.0.0")
+        sink = _ListSink()
+
+        event = emit_event(
+            s,
+            LifecycleEventType.STAGE_PROGRESS,
+            sink,
+            payload={"phase": "extracting_rootfs"},
+            state_path=state_path,
+            now_fn=_FixedNow(),
+        )
+
+        assert event.event_type is LifecycleEventType.STAGE_PROGRESS
+        assert event.payload == {"phase": "extracting_rootfs"}
+        assert sink.events == [event]

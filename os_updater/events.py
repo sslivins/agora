@@ -57,6 +57,16 @@ class LifecycleEventType(str, enum.Enum):
     DOWNLOAD_STARTED = "download_started"
     SIGNATURE_VERIFIED = "signature_verified"
     STAGED = "staged"
+    #: Sub-phase milestone emitted from within :meth:`SlotStager.stage`
+    #: so the operator (and a future CMS upgrade-progress UI) can see
+    #: which phase of the multi-minute staging pipeline is in flight.
+    #: Carries ``payload = {"phase": <one of STAGE_PROGRESS_PHASES>}``.
+    #: This is in-addition-to the existing ``STAGED`` bookends emitted
+    #: by the service before stage starts and the ``TRYBOOT_INITIATED``
+    #: emitted after stage ends, so dropping STAGE_PROGRESS events
+    #: never desynchronizes the CMS-side state machine. Tracked as
+    #: ``sslivins/agora#202``.
+    STAGE_PROGRESS = "stage_progress"
     TRYBOOT_INITIATED = "tryboot_initiated"
     SLOT_CONFIRMED = "slot_confirmed"
     PROMOTED = "promoted"
