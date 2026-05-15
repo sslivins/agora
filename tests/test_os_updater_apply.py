@@ -33,9 +33,11 @@ from typing import Optional, Sequence
 import pytest
 
 from os_updater.apply import (
+    BOOT_FLEET_STATE_COPY_IF_PRESENT,
+    BOOT_FLEET_STATE_REQUIRED,
+    DEFAULT_ACTIVE_BOOT_MOUNT,
     DEFAULT_BOOT_MOUNT_OPTS,
-    DEFAULT_BOOT_MOUNT_SLOT_A,
-    DEFAULT_BOOT_MOUNT_SLOT_B,
+    DEFAULT_INACTIVE_BOOT_MOUNT,
     DEFAULT_MOUNT_TIMEOUT_S,
     DEFAULT_ROOT_MOUNT_OPTS,
     FLEET_STATE_COPY_IF_PRESENT,
@@ -50,7 +52,6 @@ from os_updater.apply import (
     StagingError,
     TrybootError,
     _is_mountpoint,
-    boot_mount_for_slot,
     boot_partlabel_for_slot,
     copy_fleet_state,
     ensure_partition_mounted,
@@ -219,25 +220,10 @@ class TestOtherSlot:
             other_slot(bad)
 
 
-class TestBootMountForSlot:
-    def test_slot_1_returns_a_mount(self, tmp_path):
-        a, b = tmp_path / "a", tmp_path / "b"
-        assert boot_mount_for_slot(1, slot_a_mount=a, slot_b_mount=b) == a
-
-    def test_slot_2_returns_b_mount(self, tmp_path):
-        a, b = tmp_path / "a", tmp_path / "b"
-        assert boot_mount_for_slot(2, slot_a_mount=a, slot_b_mount=b) == b
-
-    def test_defaults_match_phase_0_fstab(self):
-        """Sanity-pin the production paths — touching these is a fleet-wide
-        breaking change."""
-        assert boot_mount_for_slot(1) == DEFAULT_BOOT_MOUNT_SLOT_A
-        assert boot_mount_for_slot(2) == DEFAULT_BOOT_MOUNT_SLOT_B
-
-    @pytest.mark.parametrize("bad", [0, 3, -1])
-    def test_invalid_slot_raises_staging_error(self, bad):
-        with pytest.raises(StagingError, match="invalid slot number"):
-            boot_mount_for_slot(bad)
+# NOTE: TestBootMountForSlot deleted with the slot-keyed boot mount lookup —
+# the agora-os fstab convention pins active boot to /boot/firmware and
+# inactive boot to /boot/firmware-b regardless of slot number. See
+# DEFAULT_ACTIVE_BOOT_MOUNT / DEFAULT_INACTIVE_BOOT_MOUNT in apply.py.
 
 
 # ── boot_partlabel_for_slot / root_partlabel_for_slot ──────────────────────
@@ -332,8 +318,16 @@ class TestEnsurePartitionMounted:
     def test_noop_when_already_mounted(self, tmp_path):
         target = tmp_path / "mnt"
         target.mkdir()
+        partlabel_base = tmp_path / "partlabel-base"
+        partlabel_base.mkdir()
+        # Device at the already-mounted target must match
+        # ``<partlabel_base>/root-B`` (Bug 2 fix: partlabel verification
+        # against /proc/self/mounts). Touch so .resolve() returns the
+        # canonical path on every platform.
+        device = partlabel_base / "root-B"
+        device.touch()
         mounts = tmp_path / "proc-mounts"
-        mounts.write_text(f"/dev/foo {target} ext4 rw 0 0\n")
+        mounts.write_text(f"{device} {target} ext4 rw 0 0\n")
         runner = _FakeRunner()
         ensure_partition_mounted(
             "root-B",
@@ -342,7 +336,7 @@ class TestEnsurePartitionMounted:
             opts="rw",
             runner=runner,
             mounts_path=mounts,
-            partlabel_base=tmp_path / "partlabel-base",
+            partlabel_base=partlabel_base,
         )
         # No mount(8) call should have been recorded.
         assert runner.calls == []
@@ -902,16 +896,16 @@ class _FakeSlotStatus:
         self.running_slot = running_slot
 
 
-def _seed_fake_slot_a(slot_a_root: Path) -> None:
-    """Populate ``slot_a_root`` with every :data:`FLEET_STATE_REQUIRED`
+def _seed_fake_active_root(active_root: Path) -> None:
+    """Populate ``active_root`` with every :data:`FLEET_STATE_REQUIRED`
     fixture plus one ``copy_if_present`` optional file.
 
-    Mirrors a real provisioned device's slot A so fleet-state copy
-    sees a satisfied required set. Tests that want to exercise
+    Mirrors a real provisioned device's running rootfs so fleet-state
+    copy sees a satisfied required set. Tests that want to exercise
     "missing required" / "missing optional" paths call ``unlink``
     on individual files after this seeds.
     """
-    slot_a_root.mkdir(parents=True, exist_ok=True)
+    active_root.mkdir(parents=True, exist_ok=True)
 
     files = {
         "etc/agora/environment": b"AGORA_FLEET_ID=test-fleet\n",
@@ -938,7 +932,7 @@ def _seed_fake_slot_a(slot_a_root: Path) -> None:
         ),
     }
     for rel, content in files.items():
-        path = slot_a_root / rel
+        path = active_root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
 
@@ -955,11 +949,11 @@ def _make_stager(
 ) -> SlotStager:
     """Build a SlotStager pointed at ``tmp_path`` with injected seams.
 
-    By default seeds a fake slot-A rootfs under ``tmp_path/slot-a-root``
+    By default seeds a fake active rootfs under ``tmp_path/active-root``
     populated with every :data:`FLEET_STATE_REQUIRED` fixture so the
     full happy-path pipeline runs end-to-end. Pass
-    ``seed_fleet_state=False`` to leave slot A empty for "missing
-    required" tests.
+    ``seed_fleet_state=False`` to leave the active root empty for
+    "missing required" tests.
 
     ``pipeline_runner`` defaults to a no-canned-files fake which is
     useful for tests that don't drive the full pipeline (e.g. the
@@ -981,48 +975,83 @@ def _make_stager(
         return _FakeSlotStatus(target_slot)
 
     # All mountpoints live under tmp_path. They start as empty dirs;
-    # SlotStager.step5 calls ensure_partition_mounted on slot-B's boot
-    # + the inactive-root, which reads ``mounts_path`` (a fake
+    # SlotStager.step5 calls ensure_partition_mounted on the inactive
+    # slot's boot + root, which reads ``mounts_path`` (a fake
     # /proc/self/mounts) and no-ops if the target is already mounted.
-    # We seed that fake mounts file with the slot-B + inactive-root
-    # entries so happy-path tests skip mount(8) entirely — there's no
-    # real device node to mount and the runner would record a phantom
-    # ``mount`` call. Tests that exercise the mount-fails-with-stderr
-    # path can swap in a runner whose `results_by_head["mount"]=N` and
-    # leave the entries out of the mounts file (rewriting mounts_file
-    # after _make_stager returns, or constructing the stager
-    # explicitly).
-    slot_a_boot = tmp_path / "boot-slot-a"
-    slot_b_boot = tmp_path / "boot-slot-b"
+    # We seed that fake mounts file with the active-boot, inactive-boot
+    # and inactive-root entries so happy-path tests skip mount(8)
+    # entirely — there's no real device node to mount and the runner
+    # would record a phantom ``mount`` call. Tests that exercise the
+    # mount-fails-with-stderr path can swap in a runner whose
+    # `results_by_head["mount"]=N` and leave the entries out of the
+    # mounts file (rewriting mounts_file after _make_stager returns,
+    # or constructing the stager explicitly).
+    active_boot = tmp_path / "active-boot"
+    inactive_boot = tmp_path / "inactive-boot"
     inactive_root = tmp_path / "inactive-root"
-    slot_a_boot.mkdir()
-    slot_b_boot.mkdir()
+    active_boot.mkdir()
+    inactive_boot.mkdir()
     inactive_root.mkdir()
 
-    mounts_file = tmp_path / "proc-mounts"
-    mounts_file.write_text(
-        f"/dev/mmcblk0p1 {slot_a_boot} vfat rw 0 0\n"
-        f"/dev/mmcblk0p2 {slot_b_boot} vfat rw 0 0\n"
-        f"/dev/mmcblk0p4 {inactive_root} ext4 rw 0 0\n"
+    # BOOT_FLEET_STATE_REQUIRED includes ``autoboot.txt`` — the
+    # boot-side fleet-state copy step at the end of every successful
+    # stage reads it from active_boot and writes to inactive_boot.
+    # Seed a stub here so happy-path tests don't trip
+    # FleetStateMissingError. Tests that want to exercise the
+    # missing-autoboot path call ``(stager.active_boot_mount /
+    # "autoboot.txt").unlink()`` after _make_stager returns.
+    (active_boot / "autoboot.txt").write_bytes(
+        b"[all]\nboot_partition=1\n[tryboot]\nboot_partition=2\n"
     )
+
     partlabel_base = tmp_path / "partlabel-base"
     partlabel_base.mkdir()
-
-    slot_a_root = tmp_path / "slot-a-root"
-    if seed_fleet_state:
-        _seed_fake_slot_a(slot_a_root)
+    mounts_file = tmp_path / "proc-mounts"
+    # The active/inactive partlabels depend on running_slot. Devices in
+    # the fake /proc/self/mounts must point at
+    # ``<partlabel_base>/<partlabel>`` because ensure_partition_mounted
+    # now verifies that the device at an already-mounted target matches
+    # the expected partlabel — Bug 2 of the v0.0.18-test brick. Touch
+    # the device files so .resolve() returns canonical paths on every
+    # platform (Windows .resolve() of a non-existent path still works
+    # because pathlib doesn't require existence in non-strict mode, but
+    # touching is harmless and keeps the fake mountspec readable).
+    #
+    # ``running_slot is None`` means the SUT can't tell which slot is
+    # live; the stager bails before step5 with
+    # ``could not determine running slot`` so the mounts file content
+    # is irrelevant. Write an empty file and skip the partlabel arith
+    # (other_slot(None) would raise an unrelated StagingError).
+    if running_slot is None:
+        mounts_file.write_text("")
     else:
-        slot_a_root.mkdir()
+        inactive_slot = other_slot(running_slot)
+        active_boot_dev = partlabel_base / boot_partlabel_for_slot(running_slot)
+        inactive_boot_dev = partlabel_base / boot_partlabel_for_slot(inactive_slot)
+        inactive_root_dev = partlabel_base / root_partlabel_for_slot(inactive_slot)
+        for dev in (active_boot_dev, inactive_boot_dev, inactive_root_dev):
+            dev.touch()
+        mounts_file.write_text(
+            f"{active_boot_dev} {active_boot} vfat rw 0 0\n"
+            f"{inactive_boot_dev} {inactive_boot} vfat rw 0 0\n"
+            f"{inactive_root_dev} {inactive_root} ext4 rw 0 0\n"
+        )
+
+    active_root = tmp_path / "active-root"
+    if seed_fleet_state:
+        _seed_fake_active_root(active_root)
+    else:
+        active_root.mkdir()
 
     return SlotStager(
         runner=runner,
         pipeline_runner=pipeline_runner,
-        boot_mount_slot_a=slot_a_boot,
-        boot_mount_slot_b=slot_b_boot,
+        active_boot_mount=active_boot,
+        inactive_boot_mount=inactive_boot,
         inactive_root_mount=inactive_root,
         slot_state_fn=fake_slot_state,
         trigger_tryboot_fn=fake_trigger_tryboot,
-        slot_a_root=slot_a_root,
+        running_root=active_root,
         mounts_path=mounts_file,
         partlabel_base=partlabel_base,
     )
@@ -1106,29 +1135,47 @@ class TestSlotStagerHappyPath:
         pipeline_subpaths = [c[0] for c in pipeline.calls]
         assert pipeline_subpaths == ["__meta__", "boot", "root"]
 
-        # Runner only saw cp calls — no zstd/tar/rsync at all.
+        # Runner only saw cp + find calls — no zstd/tar/rsync at all.
+        # ``find`` is from _wipe_inactive_partitions (Bug 3 fix:
+        # ``find <target> -mindepth 1 -delete`` runs once for the
+        # inactive boot mount and once for the inactive root mount).
+        # ``cp`` is fleet-state (Bug 4): 8 cp invocations for the
+        # rootfs identity copy (4 required literals + 2 ssh host
+        # keys + 1 wifi nmconnection + 1 home/agora/.ssh dir from
+        # _seed_fake_active_root) + 1 cp for boot fleet-state
+        # (autoboot.txt) = 9 cps. Total 11.
         heads = [c[0] for c in runner.calls]
-        assert heads, "expected cp invocations for fleet-state copy"
-        assert all(h == "cp" for h in heads), (
-            f"expected only cp calls in runner, got {heads}"
+        assert heads, "expected cp + find invocations for stage"
+        assert all(h in ("cp", "find") for h in heads), (
+            f"expected only cp + find calls in runner, got {heads}"
         )
-        # 4 required literals + 2 ssh host keys + 1 optional wifi nmconnection
-        # + 1 home/agora/.ssh dir from _seed_fake_slot_a == 8 cp invocations.
-        assert len(heads) == 8
+        assert heads.count("find") == 2, (
+            f"expected 2 find calls (boot+root wipe), got {heads}"
+        )
+        assert heads.count("cp") == 9, (
+            f"expected 9 cp calls (8 rootfs fleet-state + 1 boot "
+            f"autoboot.txt), got {heads}"
+        )
 
-        # Boot was streamed into slot-B boot mount.
+        # Boot was streamed into the inactive boot mount.
         boot_call = next(c for c in pipeline.calls if c[0] == "boot")
-        assert boot_call[2] == str(stager.boot_mount_slot_b)
+        assert boot_call[2] == str(stager.inactive_boot_mount)
 
         # Root was streamed into inactive-root mount.
         root_call = next(c for c in pipeline.calls if c[0] == "root")
         assert root_call[2] == str(stager.inactive_root_mount)
 
-        # Every cp's destination must be inside the inactive_root_mount —
-        # otherwise we're writing identity files into the running slot.
+        # Every cp's destination must be inside either the
+        # inactive_root_mount (rootfs fleet-state) or the
+        # inactive_boot_mount (boot fleet-state, autoboot.txt).
+        # Otherwise we're writing identity files into the running slot.
         cp_calls = [c for c in runner.calls if c[0] == "cp"]
         for cp in cp_calls:
-            assert str(stager.inactive_root_mount) in cp[-1]
+            dest = cp[-1]
+            assert (
+                str(stager.inactive_root_mount) in dest
+                or str(stager.inactive_boot_mount) in dest
+            ), f"cp dest outside inactive slot: {cp}"
 
         # substitute_fstab side-effect: etc/fstab now exists on slot B
         # and references boot-B (since we tryboot to slot 2).
@@ -1137,13 +1184,19 @@ class TestSlotStagerHappyPath:
         assert b"{{BOOT_PARTLABEL}}" not in fstab
 
         # rewrite_cmdline side-effect: cmdline.txt references root-B.
-        cmdline = (stager.boot_mount_slot_b / "cmdline.txt").read_text()
+        cmdline = (stager.inactive_boot_mount / "cmdline.txt").read_text()
         assert "root=PARTLABEL=root-B" in cmdline
         assert "root=PARTLABEL=root-A" not in cmdline
 
     def test_full_pipeline_running_slot_2(self, tmp_path):
         """Running slot 2 ⇒ tryboot must target slot 1 ⇒ streaming
-        writes hit the slot-A boot mount + the inactive-root mount."""
+        writes hit the inactive boot mount + the inactive-root mount.
+
+        The inactive boot mount is always at the same fstab mountpoint
+        (``/boot/firmware-b`` in production) regardless of slot number;
+        which physical partition lives there is a function of which
+        slot is currently active, but the stager just trusts the
+        configured mountpoint."""
         runner = _FakeRunner()
         tryboot_calls: list[int] = []
         staging_dir, stager, pipeline = _setup_stager_with_bundle(
@@ -1156,10 +1209,10 @@ class TestSlotStagerHappyPath:
         assert tryboot_calls == [1]
 
         boot_call = next(c for c in pipeline.calls if c[0] == "boot")
-        assert boot_call[2] == str(stager.boot_mount_slot_a)
+        assert boot_call[2] == str(stager.inactive_boot_mount)
 
         # cmdline rewritten to root-A.
-        cmdline = (stager.boot_mount_slot_a / "cmdline.txt").read_text()
+        cmdline = (stager.inactive_boot_mount / "cmdline.txt").read_text()
         assert "root=PARTLABEL=root-A" in cmdline
 
         # fstab references boot-A.
@@ -1313,15 +1366,15 @@ class TestSlotStagerErrors:
             raise RuntimeError("dbus is down")
 
         runner = _FakeRunner()
-        slot_a = tmp_path / "boot-a"
-        slot_b = tmp_path / "boot-b"
+        active_boot = tmp_path / "active-boot"
+        inactive_boot = tmp_path / "inactive-boot"
         inactive = tmp_path / "inactive"
-        slot_a.mkdir(); slot_b.mkdir(); inactive.mkdir()
+        active_boot.mkdir(); inactive_boot.mkdir(); inactive.mkdir()
         stager = SlotStager(
             runner=runner,
             pipeline_runner=pipeline,
-            boot_mount_slot_a=slot_a,
-            boot_mount_slot_b=slot_b,
+            active_boot_mount=active_boot,
+            inactive_boot_mount=inactive_boot,
             inactive_root_mount=inactive,
             slot_state_fn=boom,
             trigger_tryboot_fn=lambda s: None,
@@ -1412,7 +1465,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         runner = _FakeRunner()
 
         copy_fleet_state(slot_a, slot_b, runner=runner)
@@ -1432,7 +1485,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         # Yank one of the required literal files.
         (slot_a / "etc/agora/environment").unlink()
         runner = _FakeRunner()
@@ -1454,7 +1507,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         # Strip every ssh host key so the glob returns empty.
         import shutil
         shutil.rmtree(slot_a / "etc/ssh")
@@ -1474,7 +1527,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         # Drop the only optional file we seeded.
         (slot_a / "etc/NetworkManager/system-connections/wifi-home.nmconnection").unlink()
         runner = _FakeRunner()
@@ -1493,7 +1546,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         runner = _FakeRunner(
             results_by_head={"cp": 1},
             stderr_by_head={"cp": "permission denied"},
@@ -1509,7 +1562,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         runner = _FakeRunner(raise_timeout_for={"cp"})
 
         with pytest.raises(FleetStateWriteError) as exc_info:
@@ -1529,7 +1582,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         runner = _FakeRunner()
 
         copy_fleet_state(slot_a, slot_b, runner=runner)
@@ -1561,7 +1614,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         # Drop the seeded .ssh dir.
         _shutil.rmtree(slot_a / "home" / "agora" / ".ssh")
         runner = _FakeRunner()
@@ -1592,7 +1645,7 @@ class TestCopyFleetState:
         slot_a = tmp_path / "slot-a"
         slot_b = tmp_path / "slot-b"
         slot_b.mkdir()
-        _seed_fake_slot_a(slot_a)
+        _seed_fake_active_root(slot_a)
         # Simulate a stale .ssh directory left over from a prior
         # partial apply (e.g. apply aborted after rsync but before
         # tryboot triggered).
@@ -1792,7 +1845,7 @@ class TestSlotStagerProgressCallback:
         )
 
         assert tryboot_calls == [2]
-        cmdline = (stager.boot_mount_slot_b / "cmdline.txt").read_text()
+        cmdline = (stager.inactive_boot_mount / "cmdline.txt").read_text()
         assert "root=PARTLABEL=root-B" in cmdline
 
     def test_async_entrypoint_forwards_callback(self, tmp_path):
