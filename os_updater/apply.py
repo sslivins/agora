@@ -88,6 +88,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -216,9 +217,14 @@ FLEET_STATE_REQUIRED: tuple[str, ...] = (
 #: ``api_key`` is absent before the device has completed its first
 #: CMS handshake; ``agora-api`` re-mints it on first contact.
 #: ``wifi-*.nmconnection`` is empty for ethernet-only deployments.
+#: ``home/agora/.ssh`` is absent on production-deployed Pis that have
+#: no operator SSH access — copied as a directory entry so ``cp -a``
+#: carries the 0700 perms + ``agora:agora`` ownership that ``sshd``
+#: enforces on ``authorized_keys`` (see agora#198).
 FLEET_STATE_COPY_IF_PRESENT: tuple[str, ...] = (
     "opt/agora/persist/api_key",
     "etc/NetworkManager/system-connections/wifi-*.nmconnection",
+    "home/agora/.ssh",
 )
 
 #: Relative path inside the inactive slot's root where the bundle ships
@@ -1034,6 +1040,15 @@ def _cp_one(
     rel = src.relative_to(slot_a_root)
     dst = slot_b_root / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # If ``src`` is a directory (e.g. ``home/agora/.ssh``) and ``dst``
+    # already exists on slot B from a prior partial apply, remove it
+    # first so ``cp -a`` writes AT ``dst`` rather than INTO ``dst`` —
+    # i.e. avoids creating ``slot_b/home/agora/.ssh/.ssh``. Safe
+    # because copy_fleet_state is the sole source of truth for the
+    # fleet-state entries on slot B.
+    if src.is_dir() and dst.exists():
+        shutil.rmtree(dst)
 
     # ``rel.as_posix()`` keeps the telemetry-bound path forward-slash
     # regardless of host platform — devices are Linux but tests run
