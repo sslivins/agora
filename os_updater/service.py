@@ -160,10 +160,20 @@ class Downloader(Protocol):
     cleanup (plan §"Phase 2 — Deliverables"). Phase 2 default raises
     ``NotImplementedError`` so we fail loud if the sibling todo hasn't
     landed yet.
+
+    ``progress_callback`` (added in agora#219) is the per-dispatch
+    bytes-progress hook the service wires so each chunk fired by the
+    downloader becomes a ``download_progress`` lifecycle event.  Kwarg-
+    only and optional so non-progress-aware implementations (the test
+    stubs / Phase 2 ``_DefaultDownloader``) can ignore it.
     """
 
     async def run(
-        self, payload: DispatchPayload, staging_dir: Path
+        self,
+        payload: DispatchPayload,
+        staging_dir: Path,
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> None:  # pragma: no cover - protocol
         ...
 
@@ -238,7 +248,13 @@ def _default_unimplemented(name: str) -> Callable[..., Awaitable[None]]:
 
 @dataclass
 class _DefaultDownloader:
-    async def run(self, payload: DispatchPayload, staging_dir: Path) -> None:
+    async def run(
+        self,
+        payload: DispatchPayload,
+        staging_dir: Path,
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
         raise NotImplementedError("downloader not wired; see p2-bundle-format")
 
 
@@ -447,7 +463,39 @@ class OSUpdaterService:
 
         staging_dir = self.staging_root / payload.release_id
         try:
-            await self.downloader.run(payload, staging_dir)
+            def _on_download_progress(bytes_done: int, bytes_total: int) -> None:
+                """Forward each rate-limited chunk callback from the
+                downloader into a DOWNLOAD_PROGRESS lifecycle event so
+                the CMS badge can animate as the bundle streams down
+                (agora#219).
+
+                Closure: captures ``self.state`` / ``self.event_sink`` /
+                ``self.state_path`` at the moment this dispatch is in
+                flight, not at downloader construction time.  Bound here
+                rather than passed into ``BundleDownloader(...)`` in
+                ``main.py`` because the downloader instance is reused
+                across dispatches but ``self.state`` is dispatch-scoped.
+                ``emit_event`` swallows sink failures and the downloader
+                wraps this callback in its own safe-invoke, so any
+                failure here is logged-and-ignored — DOWNLOAD_PROGRESS
+                is advisory.
+                """
+                emit_event(
+                    self.state,
+                    LifecycleEventType.DOWNLOAD_PROGRESS,
+                    self.event_sink,
+                    payload={
+                        "bytes_done": bytes_done,
+                        "bytes_total": bytes_total,
+                    },
+                    state_path=self.state_path,
+                )
+
+            await self.downloader.run(
+                payload,
+                staging_dir,
+                progress_callback=_on_download_progress,
+            )
             await self.verifier.run(payload, staging_dir)
             transition(self.state, UpdaterFSMState.STAGED)
             save_state(self.state, path=self.state_path)
@@ -718,6 +766,18 @@ class OSUpdaterService:
         """
 
         self.recover_on_start()
+
+        # Bind the main loop on the sink so worker-thread emit sites
+        # (stage_progress, extract_progress -- both fire from
+        # ``asyncio.to_thread`` workers and the fdinfo poll thread)
+        # can schedule sends via ``run_coroutine_threadsafe``.  Pre-
+        # agora#219, the sink called ``asyncio.get_running_loop`` in
+        # its own thread which raised in worker threads, silently
+        # dropping every progress event.  Duck-typed because
+        # OutboxEventSink (Phase 2 disk-only sink) doesn't need it.
+        bind_loop = getattr(self.event_sink, "bind_loop", None)
+        if callable(bind_loop):
+            bind_loop(asyncio.get_running_loop())
 
         try:
             await self._tick_promote_handshake()

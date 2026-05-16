@@ -36,6 +36,7 @@ import asyncio
 import enum
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -318,19 +319,69 @@ class WpsEventSink:
     be built BEFORE the first connect (it doesn't hold a reference to a
     transport that might later disconnect — it asks for the current one
     every time it sends).
+
+    Cross-thread safety (agora#219): :meth:`put` is invoked from three
+    distinct call sites with different threading characteristics:
+
+    * The FSM coroutines in :mod:`os_updater.service` — these run on the
+      service's asyncio main loop, so ``put`` is on-loop.
+    * The downloader's chunk loop — also on the main loop (``_fetch`` is
+      ``async``).
+    * The stage / extract progress callbacks — these fire from a
+      ``asyncio.to_thread`` worker (because :meth:`SlotStager.stage`
+      wraps its synchronous body in ``to_thread``) AND from a sidecar
+      polling thread (``_poll_extract_progress`` ticks fdinfo every
+      ``PROGRESS_MIN_INTERVAL_S``).  Both are off-loop.
+
+    The pre-#219 implementation called ``asyncio.get_running_loop()``
+    inside :meth:`put`, which raises ``RuntimeError`` on a worker
+    thread, so EVERY stage/extract progress event was silently dropped
+    at DEBUG level — the badge showed "Staging bundle" / "Upgrading…"
+    with no granular progress.  The fix is two-pronged:
+
+    1. The service binds the main loop via :meth:`bind_loop` once it
+       enters ``run()``, so we have a known good loop to schedule sends
+       on regardless of which thread ``put`` is called from.
+    2. :meth:`put` decides between ``loop.create_task`` (on-loop) and
+       ``asyncio.run_coroutine_threadsafe`` (off-loop) at send time.
+       Both are fire-and-forget — lifecycle events are advisory.
     """
 
     def __init__(self, transport_provider: TransportProvider) -> None:
         self._transport_provider = transport_provider
+        # The asyncio loop on which lifecycle-event sends are dispatched.
+        # Bound lazily: explicitly via :meth:`bind_loop` (preferred —
+        # called by the service at run-loop entry), or implicitly on the
+        # first on-loop :meth:`put` that finds a running loop in the
+        # caller's thread.  Once set, all subsequent puts (including
+        # those from worker threads) use this loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_lock = threading.Lock()
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind the asyncio loop used to schedule background sends.
+
+        Called once by :meth:`OSUpdaterService.run` at the top of the
+        main loop so worker-thread :meth:`put` callers can schedule
+        cross-thread via ``run_coroutine_threadsafe`` without having to
+        know about the service's loop bookkeeping.
+
+        Idempotent: re-binding the same loop is a no-op; rebinding to a
+        different loop replaces the previous one (tests routinely do
+        this when running multiple ``asyncio.run`` cycles back-to-back).
+        """
+        with self._loop_lock:
+            self._loop = loop
 
     def put(self, event: LifecycleEvent) -> None:
         """Fire ``event`` over the active transport, or drop on failure.
 
-        Schedules an async send via :func:`asyncio.get_running_loop`.
-        Must therefore be called from a coroutine context (which all of
-        the FSM's emit sites are).  If no event loop is running, the
-        event is dropped — this is the test-only "called from sync
-        teardown" case where there's no transport anyway.
+        Resolves the asyncio loop to schedule the send on (see class
+        docstring): a previously-bound loop wins; otherwise we try to
+        capture the loop from the caller's thread.  Off-loop callers
+        (extract/stage progress from worker threads) use
+        ``run_coroutine_threadsafe``; on-loop callers use
+        ``create_task``.  No loop available → DEBUG-log and drop.
         """
 
         transport = self._transport_provider()
@@ -340,16 +391,70 @@ class WpsEventSink:
                 event.event_id, event.event_type.value,
             )
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+
+        loop = self._resolve_loop()
+        if loop is None:
             logger.debug(
                 "WpsEventSink: no running loop, dropping event_id=%d type=%s",
                 event.event_id, event.event_type.value,
             )
             return
+
         payload = json.dumps(event.to_jsonable())
-        loop.create_task(self._send(transport, payload, event.event_id))
+        coro = self._send(transport, payload, event.event_id)
+
+        # On-loop vs cross-thread submission.  ``get_running_loop``
+        # raises if the current thread has no running loop, which is
+        # exactly the worker-thread case we route via
+        # ``run_coroutine_threadsafe``.
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+
+        if current is loop:
+            loop.create_task(coro)
+            return
+
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            # Loop has stopped between resolve and submit — close the
+            # coroutine to suppress the "coroutine was never awaited"
+            # warning, then drop.  Same shape as the no-loop branch
+            # above: lifecycle events are advisory.
+            coro.close()
+            logger.debug(
+                "WpsEventSink: loop not running, dropping event_id=%d type=%s",
+                event.event_id, event.event_type.value,
+            )
+
+    def _resolve_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        """Return the loop to dispatch sends on, caching on first hit.
+
+        Order of preference:
+
+        1. An explicitly-bound loop (via :meth:`bind_loop`).  This is
+           the production path — the service calls ``bind_loop`` once
+           at startup so worker-thread puts have a loop ready before
+           the first stage_progress / extract_progress event fires.
+        2. The loop running in the caller's thread, if any.  Captured
+           lazily so that test code which constructs a sink and calls
+           ``put`` from an ``asyncio.run`` block Just Works without
+           plumbing through ``bind_loop``.
+        3. ``None`` — caller drops the event.
+        """
+
+        if self._loop is not None:
+            return self._loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        with self._loop_lock:
+            if self._loop is None:
+                self._loop = loop
+        return self._loop
 
     @staticmethod
     async def _send(transport: Any, payload: str, event_id: int) -> None:
