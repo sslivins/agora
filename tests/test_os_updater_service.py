@@ -128,6 +128,8 @@ def _build_service(
     stager=None,
     migrator=None,
     sink=None,
+    migration_sentinel_path=None,
+    promote_handshake_tick_sec: float = 30.0,
 ):
     """Construct an :class:`OSUpdaterService` for tests with safe defaults."""
 
@@ -143,6 +145,8 @@ def _build_service(
         migrator=migrator or _OkStub(),
         state_path=state_path,
         staging_root=staging_root,
+        migration_sentinel_path=migration_sentinel_path,
+        promote_handshake_tick_sec=promote_handshake_tick_sec,
     )
 
 
@@ -739,3 +743,350 @@ class TestHandleDispatchStageProgress:
             if e.event_type is LifecycleEventType.STAGE_PROGRESS
         ]
         assert progress_events == []
+
+
+# ── promote handshake tick (Bug B fix, issue #209) ─────────────────────────
+
+
+class TestPromoteHandshakeTick:
+    """Acceptance for the periodic promote-handshake watcher.
+
+    Closes the gap between ``slot_mgr.promote_slot()`` (which writes the
+    migration-allowed sentinel) and ``continue_after_promote()`` (which
+    drives MIGRATING -> IDLE). See ``sslivins/agora#209`` Bug B and
+    ``files/v0026-ota-postmortem.md`` option (a).
+    """
+
+    @staticmethod
+    def _patch_fence(monkeypatch, fence_or_factory):
+        """Patch ``check_migration_fence`` on the service module.
+
+        Accepts either a ``FenceStatus`` (returned verbatim on every call)
+        or a zero-arg callable producing one.
+        """
+
+        from migration_fence import FenceStatus
+
+        def _stub(**_kwargs):
+            if callable(fence_or_factory) and not isinstance(
+                fence_or_factory, FenceStatus
+            ):
+                return fence_or_factory()
+            return fence_or_factory
+
+        monkeypatch.setattr(
+            "os_updater.service.check_migration_fence", _stub
+        )
+
+    def test_tick_noop_when_fsm_not_tryboot_running(self, tmp_path, monkeypatch):
+        from migration_fence import FenceStatus
+
+        calls = {"n": 0}
+
+        def _should_not_be_called(**_kwargs):
+            calls["n"] += 1
+            return FenceStatus(
+                allowed=True,
+                reason="ok",
+                allowed_slot=2,
+                running_slot=2,
+                sentinel_present=True,
+            )
+
+        monkeypatch.setattr(
+            "os_updater.service.check_migration_fence", _should_not_be_called
+        )
+
+        sink = _ListSink()
+        s = _build_service(tmp_path, sink=sink)
+        # state.fsm defaults to IDLE; no need to force.
+        assert s.state.fsm is UpdaterFSMState.IDLE
+
+        _run(s._tick_promote_handshake())
+
+        assert calls["n"] == 0
+        assert sink.events == []
+        assert s.state.fsm is UpdaterFSMState.IDLE
+
+    def test_tick_noop_when_no_target_version(self, tmp_path, monkeypatch):
+        calls = {"n": 0}
+
+        def _should_not_be_called(**_kwargs):
+            calls["n"] += 1
+            raise AssertionError("fence must not be checked without target_version")
+
+        monkeypatch.setattr(
+            "os_updater.service.check_migration_fence", _should_not_be_called
+        )
+
+        sink = _ListSink()
+        s = _build_service(tmp_path, sink=sink)
+        _force_state(s, UpdaterFSMState.TRYBOOT_RUNNING)
+        # target_version intentionally left None.
+
+        _run(s._tick_promote_handshake())
+
+        assert calls["n"] == 0
+        assert sink.events == []
+        assert s.state.fsm is UpdaterFSMState.TRYBOOT_RUNNING
+
+    def test_tick_noop_when_fence_not_allowed(self, tmp_path, monkeypatch):
+        from migration_fence import FenceStatus
+
+        denied = FenceStatus(
+            allowed=False,
+            reason="sentinel absent",
+            allowed_slot=None,
+            running_slot=1,
+            sentinel_present=False,
+        )
+        self._patch_fence(monkeypatch, denied)
+
+        sink = _ListSink()
+        s = _build_service(tmp_path, sink=sink)
+        _force_state(s, UpdaterFSMState.TRYBOOT_RUNNING)
+        s.state.target_version = "0.0.21"
+        save_state(s.state, path=s.state_path)
+
+        _run(s._tick_promote_handshake())
+
+        assert sink.events == []
+        assert s.state.fsm is UpdaterFSMState.TRYBOOT_RUNNING
+
+    def test_tick_noop_when_version_mismatch(self, tmp_path, monkeypatch):
+        from migration_fence import FenceStatus
+
+        allowed = FenceStatus(
+            allowed=True,
+            reason="ok",
+            allowed_slot=2,
+            running_slot=2,
+            sentinel_present=True,
+        )
+        self._patch_fence(monkeypatch, allowed)
+
+        sink = _ListSink()
+        # current_version_provider returns 0.0.20 but target is 0.0.21
+        s = _build_service(tmp_path, sink=sink, current_version="0.0.20")
+        _force_state(s, UpdaterFSMState.TRYBOOT_RUNNING)
+        s.state.target_version = "0.0.21"
+        save_state(s.state, path=s.state_path)
+
+        _run(s._tick_promote_handshake())
+
+        assert sink.events == []
+        assert s.state.fsm is UpdaterFSMState.TRYBOOT_RUNNING
+
+    def test_tick_swallows_fence_exception(self, tmp_path, monkeypatch):
+        def _boom(**_kwargs):
+            raise RuntimeError("fence boom")
+
+        monkeypatch.setattr(
+            "os_updater.service.check_migration_fence", _boom
+        )
+
+        sink = _ListSink()
+        s = _build_service(tmp_path, sink=sink)
+        _force_state(s, UpdaterFSMState.TRYBOOT_RUNNING)
+        s.state.target_version = "0.0.21"
+        save_state(s.state, path=s.state_path)
+
+        # Must not raise — the tick is a periodic background watcher and
+        # operational issues should not crash the loop.
+        _run(s._tick_promote_handshake())
+
+        assert sink.events == []
+        assert s.state.fsm is UpdaterFSMState.TRYBOOT_RUNNING
+
+    def test_tick_happy_path_drives_full_transition(self, tmp_path, monkeypatch):
+        from migration_fence import FenceStatus
+
+        sentinel_path = tmp_path / "migration-allowed"
+        sentinel_path.write_text("slot=2\n")
+
+        staging_dir = tmp_path / "staging" / "rel_happy_1"
+        staging_dir.mkdir(parents=True)
+        (staging_dir / "scratch.txt").write_text("payload")
+
+        allowed = FenceStatus(
+            allowed=True,
+            reason="ok",
+            allowed_slot=2,
+            running_slot=2,
+            sentinel_present=True,
+        )
+        self._patch_fence(monkeypatch, allowed)
+
+        sink = _ListSink()
+        migrator = _RecordingMigrator()
+        s = _build_service(
+            tmp_path,
+            sink=sink,
+            migrator=migrator,
+            current_version="0.0.21",
+            migration_sentinel_path=sentinel_path,
+        )
+        _force_state(s, UpdaterFSMState.TRYBOOT_RUNNING)
+        s.state.target_version = "0.0.21"
+        s.state.staging_dir = str(staging_dir)
+        s.state.release_id = "rel_happy_1"
+        save_state(s.state, path=s.state_path)
+
+        _run(s._tick_promote_handshake())
+
+        # FSM walked TRYBOOT_RUNNING -> PROMOTED_PENDING_MIGRATION ->
+        # MIGRATING -> IDLE.
+        assert s.state.fsm is UpdaterFSMState.IDLE
+        assert migrator.calls == 1
+
+        kinds = [e.event_type for e in sink.events]
+        assert LifecycleEventType.SLOT_CONFIRMED in kinds
+        assert LifecycleEventType.PROMOTED in kinds
+        assert LifecycleEventType.MIGRATION_COMPLETE in kinds
+        # Ordering: slot_confirmed -> promoted -> migration_complete.
+        sc_idx = kinds.index(LifecycleEventType.SLOT_CONFIRMED)
+        pr_idx = kinds.index(LifecycleEventType.PROMOTED)
+        mc_idx = kinds.index(LifecycleEventType.MIGRATION_COMPLETE)
+        assert sc_idx < pr_idx < mc_idx
+
+        # Slot payload from fence.allowed_slot.
+        sc_event = sink.events[sc_idx]
+        pr_event = sink.events[pr_idx]
+        assert sc_event.payload.get("slot") == 2
+        assert pr_event.payload.get("slot") == 2
+
+        # Cleanup ran: staging dir removed, sentinel unlinked.
+        assert not staging_dir.exists()
+        assert not sentinel_path.exists()
+
+        # IDLE transition cleared dispatch-specific fields.
+        assert s.state.target_version is None
+        assert s.state.staging_dir is None
+        assert s.state.release_id is None
+
+    def test_tick_cleanup_handles_missing_staging_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """Happy path but ``state.staging_dir`` points at a path that
+        doesn't exist. ``shutil.rmtree(..., ignore_errors=True)`` must
+        swallow the FileNotFoundError so the FSM still completes."""
+        from migration_fence import FenceStatus
+
+        sentinel_path = tmp_path / "migration-allowed"
+        sentinel_path.write_text("slot=2\n")
+
+        allowed = FenceStatus(
+            allowed=True,
+            reason="ok",
+            allowed_slot=2,
+            running_slot=2,
+            sentinel_present=True,
+        )
+        self._patch_fence(monkeypatch, allowed)
+
+        sink = _ListSink()
+        s = _build_service(
+            tmp_path,
+            sink=sink,
+            migrator=_RecordingMigrator(),
+            current_version="0.0.21",
+            migration_sentinel_path=sentinel_path,
+        )
+        _force_state(s, UpdaterFSMState.TRYBOOT_RUNNING)
+        s.state.target_version = "0.0.21"
+        # Point at a path that was never created.
+        s.state.staging_dir = str(tmp_path / "staging" / "does-not-exist")
+        save_state(s.state, path=s.state_path)
+
+        _run(s._tick_promote_handshake())
+
+        assert s.state.fsm is UpdaterFSMState.IDLE
+        assert not sentinel_path.exists()
+
+    def test_continue_after_promote_cleans_up_staging_dir(self, tmp_path):
+        """Direct invocation: ``continue_after_promote`` from
+        PROMOTED_PENDING_MIGRATION must rmtree ``state.staging_dir`` before
+        the IDLE transition clears the field."""
+        staging_dir = tmp_path / "staging" / "rel_cleanup_1"
+        staging_dir.mkdir(parents=True)
+        (staging_dir / "blob.bin").write_bytes(b"x" * 32)
+
+        sink = _ListSink()
+        s = _build_service(
+            tmp_path,
+            sink=sink,
+            migrator=_RecordingMigrator(),
+            migration_sentinel_path=tmp_path / "sentinel-absent",
+        )
+        _force_state(s, UpdaterFSMState.PROMOTED_PENDING_MIGRATION)
+        s.state.staging_dir = str(staging_dir)
+        save_state(s.state, path=s.state_path)
+
+        _run(s.continue_after_promote())
+
+        assert s.state.fsm is UpdaterFSMState.IDLE
+        assert not staging_dir.exists()
+
+    def test_continue_after_promote_unlinks_sentinel(self, tmp_path):
+        """Direct invocation: ``continue_after_promote`` must remove the
+        migration-allowed sentinel before the IDLE transition. Otherwise
+        a stale sentinel would let the next tryboot fence-pass without
+        slot-mgr ever re-confirming."""
+        sentinel_path = tmp_path / "migration-allowed"
+        sentinel_path.write_text("slot=2\n")
+
+        sink = _ListSink()
+        s = _build_service(
+            tmp_path,
+            sink=sink,
+            migrator=_RecordingMigrator(),
+            migration_sentinel_path=sentinel_path,
+        )
+        _force_state(s, UpdaterFSMState.PROMOTED_PENDING_MIGRATION)
+
+        _run(s.continue_after_promote())
+
+        assert s.state.fsm is UpdaterFSMState.IDLE
+        assert not sentinel_path.exists()
+
+    def test_promote_handshake_loop_cancellable(self, tmp_path, monkeypatch):
+        """Spawning the loop, awaiting one tick, then cancelling must
+        exit cleanly without raising past the cancellation."""
+        from migration_fence import FenceStatus
+
+        # Fence denied → tick is a fast no-op. Lets us spin the loop a
+        # couple of times without driving any FSM state.
+        denied = FenceStatus(
+            allowed=False,
+            reason="sentinel absent",
+            allowed_slot=None,
+            running_slot=1,
+            sentinel_present=False,
+        )
+        self._patch_fence(monkeypatch, denied)
+
+        sink = _ListSink()
+        s = _build_service(
+            tmp_path,
+            sink=sink,
+            promote_handshake_tick_sec=0.01,
+        )
+        _force_state(s, UpdaterFSMState.TRYBOOT_RUNNING)
+        s.state.target_version = "0.0.21"
+        save_state(s.state, path=s.state_path)
+
+        async def _spin_and_cancel():
+            task = asyncio.create_task(s._promote_handshake_loop())
+            # Give the loop a couple of ticks.
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return "cancelled"
+            return "exited"
+
+        result = asyncio.run(_spin_and_cancel())
+        assert result == "cancelled"
+        # No spurious lifecycle events from the no-op ticks.
+        assert sink.events == []

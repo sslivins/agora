@@ -51,10 +51,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
 
+from migration_fence import (
+    DEFAULT_SENTINEL_PATH,
+    FenceStatus,
+    check_migration_fence,
+)
 from os_updater.dispatch import (
     DispatchPayload,
     DispatchPayloadError,
@@ -86,6 +92,13 @@ DEFAULT_STAGING_ROOT = Path("/data/.update/staging")
 #: Mirrors the existing cms_client transport behavior.
 _RECONNECT_INITIAL_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
+
+#: Cadence (seconds) for the promote-handshake watcher tick. The watcher
+#: polls ``migration_fence`` while the FSM is in ``tryboot_running`` and
+#: drives the SLOT_CONFIRMED -> PROMOTED -> MIGRATION_COMPLETE chain once
+#: slot-mgr writes the migration-allowed sentinel. See issue
+#: ``sslivins/agora#209`` Bug B and ``files/v0026-ota-postmortem.md``.
+_PROMOTE_HANDSHAKE_TICK_SEC = 30.0
 
 #: Same regex as dispatch._VERSION_RE — kept local to avoid importing a
 #: private symbol. Used by the version-floor check.
@@ -289,6 +302,8 @@ class OSUpdaterService:
         migrator: Optional[Migrator] = None,
         state_path: Path = DEFAULT_STATE_PATH,
         staging_root: Path = DEFAULT_STAGING_ROOT,
+        migration_sentinel_path: Optional[Path] = None,
+        promote_handshake_tick_sec: float = _PROMOTE_HANDSHAKE_TICK_SEC,
     ) -> None:
         self.transport_factory = transport_factory
         self.event_sink: EventSink = event_sink or OutboxEventSink()
@@ -299,6 +314,8 @@ class OSUpdaterService:
         self.migrator: Migrator = migrator or ForwardMigrator()
         self.state_path = state_path
         self.staging_root = staging_root
+        self.migration_sentinel_path = migration_sentinel_path
+        self._promote_handshake_tick_sec = promote_handshake_tick_sec
         self.state: UpdaterState = load_state(self.state_path)
 
     # -- public API used by tests and the run loop --------------------------
@@ -531,6 +548,19 @@ class OSUpdaterService:
             )
             raise UpdaterError(reason) from exc
 
+        staging_dir = self.state.staging_dir
+        if staging_dir:
+            try:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("failed to clean staging dir %s", staging_dir)
+
+        sentinel_path = Path(self.migration_sentinel_path or DEFAULT_SENTINEL_PATH)
+        try:
+            sentinel_path.unlink(missing_ok=True)
+        except Exception:  # pragma: no cover - defensive
+            log.exception("failed to remove migration sentinel %s", sentinel_path)
+
         transition(self.state, UpdaterFSMState.IDLE)
         save_state(self.state, path=self.state_path)
         emit_event(
@@ -540,44 +570,159 @@ class OSUpdaterService:
             state_path=self.state_path,
         )
 
+    async def _tick_promote_handshake(self) -> None:
+        """Check the migration fence and advance the FSM if slot-mgr has promoted.
+
+        Idempotent: a no-op unless ``state.fsm`` is ``TRYBOOT_RUNNING``,
+        ``state.target_version`` is set, the fence reports ``allowed``,
+        and the currently-running version matches the dispatch target.
+
+        Closes the gap between ``slot_mgr.promote_slot()`` (which writes
+        the migration-allowed sentinel) and ``continue_after_promote()``
+        (which drives MIGRATING -> IDLE). See issue ``sslivins/agora#209``
+        Bug B and ``files/v0026-ota-postmortem.md`` option (a).
+        """
+
+        state = self.state
+        if state.fsm is not UpdaterFSMState.TRYBOOT_RUNNING:
+            return
+        if state.target_version is None:
+            log.debug("promote-handshake tick skipped: no target_version on state")
+            return
+
+        try:
+            fence: FenceStatus = check_migration_fence(
+                sentinel_path=self.migration_sentinel_path
+            )
+        except Exception:
+            log.exception("promote-handshake tick: check_migration_fence raised")
+            return
+
+        if not fence.allowed:
+            log.debug(
+                "promote-handshake tick: fence not allowed (%s)", fence.reason
+            )
+            return
+
+        try:
+            current = self.current_version_provider()
+        except Exception:
+            log.exception("promote-handshake tick: current_version_provider raised")
+            return
+
+        if current != state.target_version:
+            log.info(
+                "promote-handshake tick: version mismatch current=%r target=%r; "
+                "treating as stale sentinel and waiting",
+                current,
+                state.target_version,
+            )
+            return
+
+        log.info(
+            "promote-handshake tick: fence allowed and version matches; "
+            "advancing FSM (slot=%s target=%s)",
+            fence.allowed_slot,
+            state.target_version,
+        )
+
+        emit_event(
+            state,
+            LifecycleEventType.SLOT_CONFIRMED,
+            self.event_sink,
+            payload={"slot": fence.allowed_slot},
+            state_path=self.state_path,
+        )
+
+        transition(state, UpdaterFSMState.PROMOTED_PENDING_MIGRATION)
+        save_state(state, path=self.state_path)
+
+        emit_event(
+            state,
+            LifecycleEventType.PROMOTED,
+            self.event_sink,
+            payload={"slot": fence.allowed_slot},
+            state_path=self.state_path,
+        )
+
+        try:
+            await self.continue_after_promote()
+        except UpdaterError:
+            # continue_after_promote already emitted FAILED + logged; the
+            # FSM is now in FAILED so subsequent ticks will no-op.
+            pass
+
+    async def _promote_handshake_loop(self) -> None:
+        """Periodically drive ``_tick_promote_handshake`` until cancelled."""
+
+        while True:
+            try:
+                await self._tick_promote_handshake()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("promote-handshake tick failed; will retry")
+            await asyncio.sleep(self._promote_handshake_tick_sec)
+
     async def run(self) -> None:
         """Main async run loop.
 
         Connects to WPS with exponential backoff (2s -> 60s), receives
-        messages, dispatches them. Returns only on cancellation.
+        messages, dispatches them. Also spawns a background watcher task
+        that periodically polls the migration fence to advance the FSM
+        out of ``tryboot_running`` once slot-mgr has promoted the slot.
+        Returns only on cancellation.
         """
 
         self.recover_on_start()
-        delay = _RECONNECT_INITIAL_DELAY
-        while True:
-            transport = self.transport_factory()
-            try:
-                await transport.connect()
-                log.info("WPS connected; awaiting dispatch messages")
-                delay = _RECONNECT_INITIAL_DELAY
-                while True:
-                    msg = await transport.recv()
-                    msg_type = msg.get("type") if isinstance(msg, dict) else None
-                    if msg_type != "os_update_dispatch":
-                        log.debug("ignoring non-dispatch message type=%r", msg_type)
-                        continue
-                    try:
-                        await self.handle_dispatch(msg)
-                    except UpdaterError:
-                        # Already emitted; loop continues so we can accept
-                        # the next dispatch once we're back to FAILED.
-                        pass
-            except asyncio.CancelledError:
-                await transport.close()
-                raise
-            except Exception:
-                log.exception("WPS loop crashed; reconnecting in %.1fs", delay)
+
+        try:
+            await self._tick_promote_handshake()
+        except Exception:
+            log.exception("startup promote-handshake tick failed; loop will retry")
+
+        handshake_task = asyncio.create_task(
+            self._promote_handshake_loop(),
+            name="os-updater-promote-handshake",
+        )
+
+        try:
+            delay = _RECONNECT_INITIAL_DELAY
+            while True:
+                transport = self.transport_factory()
                 try:
+                    await transport.connect()
+                    log.info("WPS connected; awaiting dispatch messages")
+                    delay = _RECONNECT_INITIAL_DELAY
+                    while True:
+                        msg = await transport.recv()
+                        msg_type = msg.get("type") if isinstance(msg, dict) else None
+                        if msg_type != "os_update_dispatch":
+                            log.debug("ignoring non-dispatch message type=%r", msg_type)
+                            continue
+                        try:
+                            await self.handle_dispatch(msg)
+                        except UpdaterError:
+                            # Already emitted; loop continues so we can accept
+                            # the next dispatch once we're back to FAILED.
+                            pass
+                except asyncio.CancelledError:
                     await transport.close()
-                except Exception:  # pragma: no cover - defensive
-                    pass
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, _RECONNECT_MAX_DELAY)
+                    raise
+                except Exception:
+                    log.exception("WPS loop crashed; reconnecting in %.1fs", delay)
+                    try:
+                        await transport.close()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _RECONNECT_MAX_DELAY)
+        finally:
+            handshake_task.cancel()
+            try:
+                await handshake_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # -- internals ----------------------------------------------------------
 
