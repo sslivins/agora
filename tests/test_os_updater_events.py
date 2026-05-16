@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -508,3 +509,144 @@ class TestWpsEventSink:
         assert len(transport.sent) == 1
         decoded = json.loads(transport.sent[0])
         assert decoded["event_id"] == 2
+
+
+class TestWpsEventSinkCrossThread:
+    """Regression coverage for agora#219: ``WpsEventSink.put`` must work
+    when called from a worker thread (not just the asyncio main loop).
+
+    The original implementation called ``asyncio.get_running_loop`` in
+    ``put`` itself, which raises ``RuntimeError`` on a worker thread.
+    Result: every ``extract_progress`` / ``stage_progress`` event was
+    silently dropped at DEBUG level because those callbacks fire from
+    the ``asyncio.to_thread`` worker that runs ``SlotStager._stage_sync``
+    and the sidecar fdinfo poll thread.  See ``WpsEventSink.put`` for
+    the cross-thread scheduling fix.
+    """
+
+    def test_bind_loop_then_put_from_worker_thread(self):
+        transport = _FakeTransport()
+        sink = WpsEventSink(transport_provider=lambda: transport)
+
+        async def go():
+            sink.bind_loop(asyncio.get_running_loop())
+
+            done = threading.Event()
+
+            def worker():
+                # Off-loop call site -- mirrors the extract-poller
+                # thread.  Must not raise and must schedule the send
+                # via run_coroutine_threadsafe.
+                sink.put(_make_event(event_id=42))
+                done.set()
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join(timeout=2.0)
+            assert done.is_set()
+            # Yield enough times for the threadsafe-scheduled task to
+            # actually run through ``await transport.send``.
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(go())
+
+        assert len(transport.sent) == 1
+        decoded = json.loads(transport.sent[0])
+        assert decoded["event_id"] == 42
+
+    def test_put_from_worker_thread_without_explicit_bind_loop(self):
+        """If the caller never calls ``bind_loop`` but DOES call ``put``
+        from the main loop at least once before any worker-thread call,
+        the lazy capture in ``_resolve_loop`` should kick in and make
+        subsequent worker-thread puts work.
+        """
+        transport = _FakeTransport()
+        sink = WpsEventSink(transport_provider=lambda: transport)
+
+        async def go():
+            # First put: on-loop, captures the loop lazily.
+            sink.put(_make_event(event_id=1))
+            await asyncio.sleep(0)
+
+            # Second put: from a worker thread.  Must use the loop
+            # captured in the first call.
+            done = threading.Event()
+
+            def worker():
+                sink.put(_make_event(event_id=2))
+                done.set()
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join(timeout=2.0)
+            assert done.is_set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(go())
+
+        assert len(transport.sent) == 2
+        ids = sorted(json.loads(p)["event_id"] for p in transport.sent)
+        assert ids == [1, 2]
+
+    def test_worker_thread_put_with_no_bound_loop_drops(self):
+        """If the sink has never seen a loop AND the worker thread
+        doesn't have a running loop, the event is dropped (DEBUG log)
+        without raising.  This is the same defensive behavior as the
+        pre-#219 ``put`` -- we just guarantee it for worker-thread
+        callers too.
+        """
+        transport = _FakeTransport()
+        sink = WpsEventSink(transport_provider=lambda: transport)
+
+        done = threading.Event()
+        err: list[BaseException] = []
+
+        def worker():
+            try:
+                sink.put(_make_event(event_id=99))
+            except BaseException as exc:  # pragma: no cover - defensive
+                err.append(exc)
+            done.set()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=2.0)
+        assert done.is_set()
+        assert err == []
+        assert transport.sent == []
+
+    def test_bind_loop_idempotent_for_same_loop(self):
+        sink = WpsEventSink(transport_provider=lambda: None)
+
+        async def go():
+            loop = asyncio.get_running_loop()
+            sink.bind_loop(loop)
+            sink.bind_loop(loop)  # second bind same loop -- no-op
+            return sink._loop is loop
+
+        assert asyncio.run(go()) is True
+
+    def test_rebind_to_new_loop_replaces_previous(self):
+        """Tests that run multiple ``asyncio.run`` cycles back-to-back
+        get a fresh loop each time.  ``bind_loop`` MUST accept the new
+        loop; otherwise a stale-loop-pointer would cause every
+        subsequent run-cycle's worker-thread puts to drop.
+        """
+        sink = WpsEventSink(transport_provider=lambda: None)
+
+        async def first():
+            sink.bind_loop(asyncio.get_running_loop())
+            return id(asyncio.get_running_loop())
+
+        async def second():
+            sink.bind_loop(asyncio.get_running_loop())
+            return id(asyncio.get_running_loop())
+
+        first_id = asyncio.run(first())
+        second_id = asyncio.run(second())
+        # Sanity: two ``asyncio.run`` cycles -> two distinct loops.
+        assert first_id != second_id
+        # And bind_loop tracked the rebind.
+        assert id(sink._loop) == second_id

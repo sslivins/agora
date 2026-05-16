@@ -70,7 +70,7 @@ class _OkStub:
 
 
 class _BoomDownloader:
-    async def run(self, payload, staging_dir):
+    async def run(self, payload, staging_dir, *, progress_callback=None):
         raise RuntimeError("network is on fire")
 
 
@@ -1160,3 +1160,175 @@ class TestHandleDispatchExtractProgress:
 
         ids = [e.event_id for e in sink.events]
         assert ids == sorted(ids)
+
+
+# -- handle_dispatch wires DOWNLOAD_PROGRESS (agora#219) -----------------------
+
+
+class _ProgressEmittingDownloader:
+    """Downloader stub that fires the ``progress_callback`` kwarg so
+    the test can assert the service's ``_on_download_progress`` closure
+    forwards the bytes_done/bytes_total into a DOWNLOAD_PROGRESS event.
+
+    Mirrors ``_ProgressEmittingStager`` -- separate class so the
+    captured-callback assertions stay local to each test.
+    """
+
+    def __init__(self) -> None:
+        self.captured_progress_callback = None
+        self.calls: list[tuple] = []
+
+    async def run(self, payload, staging_dir, *, progress_callback=None):
+        self.calls.append(("run", payload, staging_dir))
+        self.captured_progress_callback = progress_callback
+        if progress_callback is not None:
+            # Simulate two rate-limited chunks plus the final 100% emit
+            # so the test asserts on the last (terminal) event the same
+            # way the real downloader does.
+            progress_callback(0, 1_000_000)
+            progress_callback(500_000, 1_000_000)
+            progress_callback(1_000_000, 1_000_000)
+
+
+class TestHandleDispatchDownloadProgress:
+    """The service-side ``_on_download_progress`` closure forwards each
+    rate-limited chunk emit from the downloader into a DOWNLOAD_PROGRESS
+    lifecycle event (agora#219).  Pre-#219 the service never bound a
+    download callback, so the BundleDownloader's ``progress_callback``
+    field stayed ``None`` and zero download_progress events ever fired
+    on production -- the CMS badge stayed empty during the whole
+    download phase.
+    """
+
+    def test_downloader_progress_callback_emits_lifecycle_events(self, tmp_path):
+        sink = _ListSink()
+        downloader = _ProgressEmittingDownloader()
+        s = _build_service(
+            tmp_path,
+            current_version="1.0.0",
+            sink=sink,
+            downloader=downloader,
+        )
+
+        asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-dl")))
+
+        # Service handed the downloader a non-None progress callback.
+        assert downloader.captured_progress_callback is not None
+
+        progress = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.DOWNLOAD_PROGRESS
+        ]
+        assert len(progress) == 3
+        assert progress[0].payload == {"bytes_done": 0, "bytes_total": 1_000_000}
+        assert progress[-1].payload == {
+            "bytes_done": 1_000_000, "bytes_total": 1_000_000,
+        }
+        # Every event must carry the dispatch's release / target metadata.
+        for evt in progress:
+            assert evt.release_id == "rel-dl"
+            assert evt.target_version == "1.1.0"
+
+    def test_download_progress_lands_between_download_started_and_staged(self, tmp_path):
+        """DOWNLOAD_PROGRESS is mid-download and must sit between
+        DOWNLOAD_STARTED and SIGNATURE_VERIFIED / STAGED so CMS
+        timeline rollups stay ordered.  Mirrors the same constraint
+        the existing EXTRACT_PROGRESS test enforces.
+        """
+        sink = _ListSink()
+        downloader = _ProgressEmittingDownloader()
+        s = _build_service(
+            tmp_path,
+            current_version="1.0.0",
+            sink=sink,
+            downloader=downloader,
+        )
+
+        asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-dl-ord")))
+
+        kinds = [e.event_type for e in sink.events]
+        assert LifecycleEventType.DOWNLOAD_PROGRESS in kinds
+        started_idx = kinds.index(LifecycleEventType.DOWNLOAD_STARTED)
+        first_progress_idx = kinds.index(LifecycleEventType.DOWNLOAD_PROGRESS)
+        staged_idx = kinds.index(LifecycleEventType.STAGED)
+        assert started_idx < first_progress_idx < staged_idx
+
+        ids = [e.event_id for e in sink.events]
+        assert ids == sorted(ids)
+
+
+# -- service.run binds the asyncio loop on the sink (agora#219) ---------------
+
+
+class TestServiceRunBindsLoop:
+    """``OSUpdaterService.run`` MUST bind the running asyncio loop on
+    the sink at startup so worker-thread emit sites (stage/extract
+    progress) can schedule sends via ``run_coroutine_threadsafe``.
+    Pre-#219 the sink's ``put`` called ``asyncio.get_running_loop`` in
+    the calling thread itself, which raised in worker threads, so
+    every off-loop progress event was silently dropped.
+
+    This is a regression guard against someone removing the
+    ``bind_loop`` call in a future refactor.  Duck-typed: sinks that
+    don't expose ``bind_loop`` (OutboxEventSink) MUST still work.
+    """
+
+    def test_run_calls_bind_loop_when_sink_supports_it(self, tmp_path):
+        bound: list = []
+
+        class _BindCapturingSink:
+            def __init__(self):
+                self.events = []
+
+            def bind_loop(self, loop):
+                bound.append(loop)
+
+            def put(self, event):
+                self.events.append(event)
+
+        sink = _BindCapturingSink()
+        s = _build_service(tmp_path, current_version="1.0.0", sink=sink)
+
+        async def runner():
+            task = asyncio.create_task(s.run())
+            # Yield enough for run() to reach the bind_loop call before
+            # the first long await (transport.connect()).
+            for _ in range(5):
+                await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            return asyncio.get_running_loop()
+
+        loop_used = asyncio.run(runner())
+        assert len(bound) == 1
+        assert bound[0] is loop_used
+
+    def test_run_works_when_sink_has_no_bind_loop_method(self, tmp_path):
+        """OutboxEventSink doesn't have ``bind_loop`` -- the service
+        must duck-type the call and skip it without raising."""
+
+        class _NoBindSink:
+            def __init__(self):
+                self.events = []
+
+            def put(self, event):
+                self.events.append(event)
+
+        sink = _NoBindSink()
+        s = _build_service(tmp_path, current_version="1.0.0", sink=sink)
+
+        async def runner():
+            task = asyncio.create_task(s.run())
+            for _ in range(5):
+                await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Must not raise.
+        asyncio.run(runner())

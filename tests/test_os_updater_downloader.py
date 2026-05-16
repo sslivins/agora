@@ -452,3 +452,68 @@ class TestBundleDownloaderProgress:
 
         assert (staging / DEFAULT_BUNDLE_FILENAME).read_bytes() == b"bundle"
         assert (staging / DEFAULT_SIGNATURE_FILENAME).read_bytes() == b"sig"
+
+    def test_run_kwarg_progress_callback_used(self, tmp_path):
+        """agora#219: the service binds a per-dispatch progress
+        callback via the ``run(progress_callback=...)`` kwarg rather
+        than mutating the downloader instance.  Pre-fix the downloader
+        only honored its dataclass field, so the wiring in
+        ``OSUpdaterService.handle_dispatch`` never reached the chunk
+        loop and every ``download_progress`` event was lost.
+        """
+        staging = tmp_path / "stage"
+        recorder = _RecordingProgress()
+        # Note: dataclass field intentionally left None -- the kwarg is
+        # the seam under test.
+        downloader = BundleDownloader()
+
+        mock_aiohttp, mock_cls, mock_session = _mock_aiohttp_session()
+        bodies = iter([
+            _AsyncIterChunks([b"xxxxx", b"yyyyy"]),
+            _AsyncIterChunks([b"sig"]),
+        ])
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content.iter_chunked.side_effect = lambda _n: next(bodies)
+        mock_resp.headers = {"Content-Length": "10"}
+        mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            asyncio.run(downloader.run(
+                _payload(), staging, progress_callback=recorder,
+            ))
+
+        assert recorder.calls, "kwarg progress_callback should have fired"
+        assert recorder.calls[-1] == (10, 10)
+
+    def test_run_kwarg_overrides_dataclass_field(self, tmp_path):
+        """If both the dataclass field AND the run kwarg are set, the
+        kwarg wins.  Matters because the production wiring in
+        ``main.py`` constructs ``BundleDownloader()`` once (no field)
+        but the service binds a per-dispatch kwarg; if a future
+        refactor sets both, the dispatch-scoped one must take priority
+        so the lifecycle ``release_id`` is correct.
+        """
+        staging = tmp_path / "stage"
+        field_recorder = _RecordingProgress()
+        kwarg_recorder = _RecordingProgress()
+        downloader = BundleDownloader(progress_callback=field_recorder)
+
+        mock_aiohttp, mock_cls, mock_session = _mock_aiohttp_session()
+        bodies = iter([
+            _AsyncIterChunks([b"abc"]),
+            _AsyncIterChunks([b"sig"]),
+        ])
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content.iter_chunked.side_effect = lambda _n: next(bodies)
+        mock_resp.headers = {"Content-Length": "3"}
+        mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            asyncio.run(downloader.run(
+                _payload(), staging, progress_callback=kwarg_recorder,
+            ))
+
+        assert kwarg_recorder.calls, "kwarg should win when both are set"
+        assert field_recorder.calls == [], "field should be ignored when kwarg given"

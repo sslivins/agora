@@ -99,7 +99,11 @@ class BundleDownloader:
     progress_callback: Optional[ProgressCallback] = None
 
     async def run(
-        self, payload: DispatchPayload, staging_dir: Path
+        self,
+        payload: DispatchPayload,
+        staging_dir: Path,
+        *,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> None:
         """Download the bundle + signature into ``staging_dir``.
 
@@ -107,12 +111,23 @@ class BundleDownloader:
         responsible for cleaning up partial state from a prior aborted
         attempt before invoking us. We just create the dir if missing and
         write the two artifacts.
+
+        ``progress_callback`` (added in agora#219) overrides the
+        dataclass field of the same name for this invocation.  This is
+        the seam the service uses to bind a per-dispatch callback
+        without mutating shared downloader state.  If both are unset,
+        download progress is not reported.
         """
 
         staging_dir.mkdir(parents=True, exist_ok=True)
 
         bundle_target = staging_dir / self.bundle_filename
         sig_target = staging_dir / self.signature_filename
+
+        # Per-call callback wins over the dataclass field so the service
+        # can bind a dispatch-scoped emitter without us needing to know
+        # about lifecycle state.
+        active_callback = progress_callback or self.progress_callback
 
         logger.info(
             "downloading bundle: release_id=%s target_version=%s url=%s -> %s",
@@ -121,7 +136,12 @@ class BundleDownloader:
             payload.bundle_url,
             bundle_target,
         )
-        await self._fetch(payload.bundle_url, bundle_target, with_progress=True)
+        await self._fetch(
+            payload.bundle_url,
+            bundle_target,
+            with_progress=True,
+            progress_callback=active_callback,
+        )
 
         logger.info(
             "downloading signature: release_id=%s url=%s -> %s",
@@ -138,7 +158,12 @@ class BundleDownloader:
         )
 
     async def _fetch(
-        self, url: str, target: Path, *, with_progress: bool = False,
+        self,
+        url: str,
+        target: Path,
+        *,
+        with_progress: bool = False,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> None:
         """Stream ``url`` into ``target`` via a ``.tmp`` sibling + rename.
 
@@ -147,15 +172,17 @@ class BundleDownloader:
         first reaches for it. Same trick the cms_client downloader uses.
 
         When ``with_progress`` is true and a ``progress_callback`` is
-        configured, fires ``(bytes_done, bytes_total)`` callbacks
-        throughout the streaming GET.
+        provided (or the dataclass field is set as a fallback), fires
+        ``(bytes_done, bytes_total)`` callbacks throughout the
+        streaming GET.
         """
 
         import aiohttp
 
         rate_limited: Optional[RateLimitedProgress] = None
-        if with_progress and self.progress_callback is not None:
-            rate_limited = RateLimitedProgress(self.progress_callback)
+        active_callback = progress_callback or self.progress_callback
+        if with_progress and active_callback is not None:
+            rate_limited = RateLimitedProgress(active_callback)
 
         tmp = target.with_suffix(target.suffix + ".tmp")
         try:
