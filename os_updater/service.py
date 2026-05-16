@@ -716,6 +716,7 @@ class OSUpdaterService:
             TrybootError,
         )
         from os_updater.bundle import BundleIntegrityError, BundleSignatureError
+        from os_updater.downloader import BundleDownloadError
         from os_updater.migrate import (
             MigrationDiscoveryError,
             MigrationError,
@@ -724,6 +725,12 @@ class OSUpdaterService:
             SchemaVersionError,
         )
 
+        # Order: BundleDownloadError, BundleSignatureError, BundleIntegrityError
+        # all subclass BundleError but each has a distinct wire code. They
+        # don't share a hierarchy beyond BundleError, so order within this
+        # block is documentation-only.
+        if isinstance(exc, BundleDownloadError):
+            return "download_failed"
         if isinstance(exc, BundleSignatureError):
             return "signature_invalid"
         if isinstance(exc, BundleIntegrityError):
