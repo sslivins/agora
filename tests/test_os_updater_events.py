@@ -8,17 +8,31 @@ Acceptance hooks (plan §"Phase 2 — Deliverables" + plan #33):
 * ``iter_events`` round-trips events that were written.
 * Malformed lines are skipped, not raised on.
 * ``emit_event`` stamps release_id / target_version from state.
+
+Plus agora#215 additions (download/extract progress, live WPS sink):
+
+* :class:`WpsEventSink` drops when no transport, swallows send errors.
+* :class:`RateLimitedProgress` first-call fires, rate-limits, force bypass.
+* :class:`LifecycleEventType.DOWNLOAD_PROGRESS` / ``EXTRACT_PROGRESS``
+  wire values are stable.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from os_updater.events import (
+    PROGRESS_MIN_INTERVAL_S,
     LifecycleEvent,
     LifecycleEventType,
     OutboxEventSink,
+    RateLimitedProgress,
+    WpsEventSink,
     emit_event,
     next_event_id,
 )
@@ -304,3 +318,193 @@ class TestStageProgressEnum:
         assert event.event_type is LifecycleEventType.STAGE_PROGRESS
         assert event.payload == {"phase": "extracting_rootfs"}
         assert sink.events == [event]
+
+
+# --- agora#215: progress events + WPS live sink -----------------------------
+
+
+class TestProgressEnumValues:
+    """Wire-format pinning for the two new progress event types
+    (agora#215). The CMS-side parser in ``cms/services/device_inbound.py``
+    switches on these string values; any rename here is a coordinated
+    schema migration."""
+
+    def test_download_progress_value(self):
+        assert LifecycleEventType.DOWNLOAD_PROGRESS.value == "download_progress"
+
+    def test_extract_progress_value(self):
+        assert LifecycleEventType.EXTRACT_PROGRESS.value == "extract_progress"
+
+    def test_progress_min_interval_is_2_seconds(self):
+        # Test pins the default cadence the CMS UX was designed against.
+        assert PROGRESS_MIN_INTERVAL_S == 2.0
+
+
+class _FakeClock:
+    """Manually advanceable monotonic-time source for RateLimitedProgress."""
+
+    def __init__(self) -> None:
+        self.now: float = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, dt: float) -> None:
+        self.now += dt
+
+
+class TestRateLimitedProgress:
+    def test_first_call_always_fires(self):
+        calls: list[tuple] = []
+        rl = RateLimitedProgress(lambda *a: calls.append(a), time_source=_FakeClock())
+        rl(10, 100)
+        assert calls == [(10, 100)]
+
+    def test_second_call_within_interval_drops(self):
+        calls: list[tuple] = []
+        clock = _FakeClock()
+        rl = RateLimitedProgress(lambda *a: calls.append(a), time_source=clock)
+        rl(10, 100)
+        clock.advance(0.5)
+        rl(20, 100)
+        assert calls == [(10, 100)]
+
+    def test_call_after_interval_fires(self):
+        calls: list[tuple] = []
+        clock = _FakeClock()
+        rl = RateLimitedProgress(lambda *a: calls.append(a), time_source=clock)
+        rl(10, 100)
+        clock.advance(PROGRESS_MIN_INTERVAL_S + 0.01)
+        rl(20, 100)
+        assert calls == [(10, 100), (20, 100)]
+
+    def test_force_bypasses_rate_limit(self):
+        calls: list[tuple] = []
+        clock = _FakeClock()
+        rl = RateLimitedProgress(lambda *a: calls.append(a), time_source=clock)
+        rl(10, 100)
+        clock.advance(0.1)
+        rl(100, 100, force=True)
+        assert calls == [(10, 100), (100, 100)]
+
+    def test_force_resets_clock_for_subsequent_calls(self):
+        """After a force call, the rate-limit window restarts from that
+        emit so the next non-force still has to wait PROGRESS_MIN_INTERVAL_S."""
+        calls: list[tuple] = []
+        clock = _FakeClock()
+        rl = RateLimitedProgress(lambda *a: calls.append(a), time_source=clock)
+        rl(50, 100, force=True)
+        clock.advance(0.1)
+        rl(60, 100)
+        assert calls == [(50, 100)]
+
+    def test_callback_exception_is_swallowed(self):
+        def boom(*a, **kw):
+            raise RuntimeError("intentional")
+
+        rl = RateLimitedProgress(boom, time_source=_FakeClock())
+        rl(10, 100)  # must not raise
+
+
+class _FakeTransport:
+    """Captures every payload sent over the transport."""
+
+    def __init__(self, raise_on_send: bool = False) -> None:
+        self.sent: list[str] = []
+        self.raise_on_send = raise_on_send
+
+    async def send(self, payload: str) -> None:
+        if self.raise_on_send:
+            raise RuntimeError("transport-dead")
+        self.sent.append(payload)
+
+
+def _drain_pending(loop: asyncio.AbstractEventLoop) -> None:
+    """Run the loop briefly so any pending ``create_task`` calls complete."""
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.run_until_complete(asyncio.sleep(0))
+
+
+def _make_event(event_id: int = 1, event_type=LifecycleEventType.DOWNLOAD_PROGRESS) -> LifecycleEvent:
+    return LifecycleEvent(
+        event_id=event_id,
+        event_type=event_type,
+        release_id="rel-1",
+        target_version="1.0.0",
+        occurred_at="2026-05-07T03:30:00Z",
+        payload={"bytes_done": 10, "bytes_total": 100},
+    )
+
+
+class TestWpsEventSink:
+    def test_drops_when_no_transport(self):
+        sink = WpsEventSink(transport_provider=lambda: None)
+        # Should NOT raise even though there is no loop and no transport.
+        sink.put(_make_event())
+
+    def test_drops_when_no_running_loop(self):
+        # Transport is present but no loop is running — must not raise.
+        sink = WpsEventSink(transport_provider=lambda: _FakeTransport())
+        sink.put(_make_event())
+
+    def test_fires_send_on_active_transport(self):
+        transport = _FakeTransport()
+        sink = WpsEventSink(transport_provider=lambda: transport)
+
+        async def go():
+            sink.put(_make_event())
+            # Yield so the create_task'd send actually runs.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        asyncio.run(go())
+
+        assert len(transport.sent) == 1
+        decoded = json.loads(transport.sent[0])
+        assert decoded["type"] == "lifecycle_event"
+        assert decoded["event_type"] == "download_progress"
+        assert decoded["event_id"] == 1
+        assert decoded["release_id"] == "rel-1"
+        assert decoded["payload"] == {"bytes_done": 10, "bytes_total": 100}
+
+    def test_swallows_send_exception(self):
+        transport = _FakeTransport(raise_on_send=True)
+        sink = WpsEventSink(transport_provider=lambda: transport)
+
+        async def go():
+            sink.put(_make_event())
+            # Two yields so the failing send task actually runs through
+            # its except branch.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        # Must not propagate — lifecycle events are advisory.
+        asyncio.run(go())
+
+    def test_reads_transport_lazily_each_put(self):
+        """The sink must re-query the provider on every put so a
+        post-reconnect transport replacement Just Works."""
+        # State: current transport, mutated between puts to simulate
+        # a reconnect cycle (first put sees None -> drops; second put
+        # sees a live transport -> sends).
+        current: dict[str, Any] = {"t": None}
+
+        def provider():
+            return current["t"]
+
+        sink = WpsEventSink(transport_provider=provider)
+
+        async def go():
+            sink.put(_make_event(1))
+            await asyncio.sleep(0)
+            current["t"] = _FakeTransport()
+            sink.put(_make_event(2))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        asyncio.run(go())
+
+        transport = current["t"]
+        assert len(transport.sent) == 1
+        decoded = json.loads(transport.sent[0])
+        assert decoded["event_id"] == 2

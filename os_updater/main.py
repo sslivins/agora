@@ -44,6 +44,7 @@ from typing import Any, Optional, Sequence
 from os_updater import __version__
 from os_updater.apply import SlotStager
 from os_updater.downloader import BundleDownloader
+from os_updater.events import WpsEventSink
 from os_updater.service import (
     DEFAULT_STAGING_ROOT,
     OSUpdaterService,
@@ -340,8 +341,26 @@ async def _run(args: argparse.Namespace) -> int:
     current_version = _read_current_version(args.current_version_file)
     log.info("agora-os-updater starting; current_version=%s", current_version)
 
+    # Forward-reference dance: the WpsEventSink needs a callable that
+    # returns the *currently-live* transport, but the transport itself
+    # only exists per-reconnect inside the service's run loop. The
+    # service exposes ``_active_transport`` (Optional[WPSTransport])
+    # which is set on connect and cleared on disconnect; the
+    # transport_provider lambda below closes over the freshly-built
+    # service instance and reads the attribute lazily on each event
+    # send. agora#215.
+    service: Optional[OSUpdaterService] = None
+
+    def _transport_provider() -> Optional[WPSTransport]:
+        if service is None:  # pragma: no cover — defensive, only window is <100us
+            return None
+        return service._active_transport
+
+    event_sink = WpsEventSink(transport_provider=_transport_provider)
+
     service = OSUpdaterService(
         transport_factory=_build_transport_factory(settings),
+        event_sink=event_sink,
         current_version_provider=lambda: current_version,
         downloader=BundleDownloader(),
         verifier=SignatureVerifier(),

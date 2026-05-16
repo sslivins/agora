@@ -17,19 +17,30 @@ This module ships the scaffold:
   consume.  No WPS send is performed in Phase 2 — that's wired up in
   Phase 4 along with the buffer FIFO eviction policy (1000 events / 10
   MB cap).
+* :class:`WpsEventSink` — live-send sink used in production from
+  agora#215 onward.  Fires events as ``{"type": "lifecycle_event", ...}``
+  over the currently-active WPS transport.  Best-effort: logs and drops
+  on send failure (Phase 4 replayer will eventually take over the
+  durability story).
 * :func:`emit_event` — convenience that stamps the next event-id from a
   passed-in :class:`UpdaterState`, builds the event, persists state, and
   forwards to the sink.
+* :class:`RateLimitedProgress` — helper for any sub-system that wants to
+  emit bytes-progress callbacks without flooding the wire.  Used by the
+  bundle downloader and the streaming-extract polling loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
+import logging
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Optional, Protocol
+from typing import Any, Awaitable, Callable, Iterator, Mapping, Optional, Protocol
 
 from shared.state import atomic_write
 
@@ -41,9 +52,24 @@ from os_updater.state import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 #: Directory where pending lifecycle events buffer when the WPS connection
 #: is down. Lives under ``/data`` so the queue survives reboot.
 DEFAULT_OUTBOX_DIR = Path("/data/agora/event-buffer")
+
+#: Minimum interval between rate-limited progress emissions, per
+#: callback instance.  2 seconds is a conservative trade-off:
+#:
+#: * Worst-case event count for a 10-minute OTA is ~300 — trivial for
+#:   the CMS to ingest.
+#: * Slow enough that the device doesn't backpressure the WPS connection
+#:   under sustained throughput.
+#: * Fast enough that the CMS progress bar feels live (humans can't
+#:   distinguish 2 s updates from continuous on a 30-90 s download).
+#:
+#: Final-state emissions bypass the rate limiter by passing ``force=True``.
+PROGRESS_MIN_INTERVAL_S: float = 2.0
 
 
 class LifecycleEventType(str, enum.Enum):
@@ -55,6 +81,13 @@ class LifecycleEventType(str, enum.Enum):
     """
 
     DOWNLOAD_STARTED = "download_started"
+    #: Bytes-progress milestone emitted from :class:`BundleDownloader`
+    #: while the streaming HTTP GET is in flight.  Carries
+    #: ``payload = {"bytes_done": int, "bytes_total": int}`` so the CMS
+    #: progress badge can render a live percentage.  Emitted at most
+    #: every :data:`PROGRESS_MIN_INTERVAL_S` seconds; the final
+    #: ``(bytes_total, bytes_total)`` call is always forced through.
+    DOWNLOAD_PROGRESS = "download_progress"
     SIGNATURE_VERIFIED = "signature_verified"
     STAGED = "staged"
     #: Sub-phase milestone emitted from within :meth:`SlotStager.stage`
@@ -67,6 +100,15 @@ class LifecycleEventType(str, enum.Enum):
     #: never desynchronizes the CMS-side state machine. Tracked as
     #: ``sslivins/agora#202``.
     STAGE_PROGRESS = "stage_progress"
+    #: Bytes-progress milestone emitted from :func:`stream_extract_subtree`
+    #: while a ``zstd | tar`` pipeline is in flight.  Distinct from
+    #: ``STAGE_PROGRESS`` (which fires at phase BOUNDARIES) — this
+    #: fires DURING the two long extract phases (``extracting_boot``
+    #: and ``extracting_rootfs``) with byte counts polled from
+    #: ``/proc/<zstd_pid>/fdinfo/0``.  Carries
+    #: ``payload = {"phase": "extracting_boot" | "extracting_rootfs",
+    #: "bytes_done": int, "bytes_total": int}``.
+    EXTRACT_PROGRESS = "extract_progress"
     TRYBOOT_INITIATED = "tryboot_initiated"
     SLOT_CONFIRMED = "slot_confirmed"
     PROMOTED = "promoted"
@@ -242,3 +284,132 @@ def emit_event(
     save_state(state, path=state_path or DEFAULT_STATE_PATH)
     sink.put(event)
     return event
+
+
+# A callable that returns the currently-active WPS transport (or ``None``
+# if the device is offline / mid-reconnect).  Used by :class:`WpsEventSink`
+# so the sink doesn't have to know about the service's reconnect lifecycle.
+TransportProvider = Callable[[], Optional[Any]]
+
+
+class WpsEventSink:
+    """Send each lifecycle event live over the active WPS transport.
+
+    The sink is intentionally fire-and-forget:
+
+    * If no transport is currently connected, the event is dropped with a
+      DEBUG log.  (Phase 4 will replace this with a disk-backed replayer
+      that drains on reconnect — out of scope for v1, tracked in
+      ``sslivins/agora#215``.)
+    * If the underlying ``transport.send`` raises, the failure is logged
+      at WARNING but never propagates back to the caller.  Lifecycle
+      events are advisory — a failed send must not abort the OTA FSM.
+
+    The wire shape matches what ``cms.services.device_inbound`` dispatches
+    on:
+
+        {"type": "lifecycle_event",
+         "event_id": <int>, "event_type": <str>,
+         "release_id": <str|None>, "target_version": <str|None>,
+         "occurred_at": <ISO-8601>, "reason": <str|None>,
+         "payload": {...}}
+
+    Construction takes a ``transport_provider`` callable so the sink can
+    be built BEFORE the first connect (it doesn't hold a reference to a
+    transport that might later disconnect — it asks for the current one
+    every time it sends).
+    """
+
+    def __init__(self, transport_provider: TransportProvider) -> None:
+        self._transport_provider = transport_provider
+
+    def put(self, event: LifecycleEvent) -> None:
+        """Fire ``event`` over the active transport, or drop on failure.
+
+        Schedules an async send via :func:`asyncio.get_running_loop`.
+        Must therefore be called from a coroutine context (which all of
+        the FSM's emit sites are).  If no event loop is running, the
+        event is dropped — this is the test-only "called from sync
+        teardown" case where there's no transport anyway.
+        """
+
+        transport = self._transport_provider()
+        if transport is None:
+            logger.debug(
+                "WpsEventSink: no active transport, dropping event_id=%d type=%s",
+                event.event_id, event.event_type.value,
+            )
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "WpsEventSink: no running loop, dropping event_id=%d type=%s",
+                event.event_id, event.event_type.value,
+            )
+            return
+        payload = json.dumps(event.to_jsonable())
+        loop.create_task(self._send(transport, payload, event.event_id))
+
+    @staticmethod
+    async def _send(transport: Any, payload: str, event_id: int) -> None:
+        try:
+            await transport.send(payload)
+        except Exception:
+            # Lifecycle events are advisory; a stale transport / network
+            # blip must not abort the OTA FSM.  Log at WARNING so a
+            # systematic failure shows up in ops, but swallow.
+            logger.warning(
+                "WpsEventSink: send failed for event_id=%d", event_id,
+                exc_info=True,
+            )
+
+
+class RateLimitedProgress:
+    """Rate-limited wrapper for a bytes-progress callback.
+
+    Use case: download / extract progress fires hundreds of times per
+    OTA on a fast network.  We don't want to flood the wire with
+    ``download_progress`` events at chunk-level granularity — the CMS
+    badge can't usefully render >1 update per second anyway, and every
+    event costs a WPS round trip.
+
+    Each instance maintains its own ``last-emit`` clock.  The first
+    call always fires (so the badge appears immediately when the OTA
+    starts).  Subsequent calls fire only if at least
+    :data:`PROGRESS_MIN_INTERVAL_S` has elapsed since the last fire,
+    OR the caller passes ``force=True`` (used for the terminal
+    ``(bytes_total, bytes_total)`` call so the bar always reaches 100%
+    before the next FSM event lands).
+
+    Exceptions from the wrapped callback are logged and swallowed —
+    progress is advisory and a buggy callback must not crash the
+    download/extract loop.
+    """
+
+    def __init__(
+        self,
+        callback: Callable[..., None],
+        *,
+        min_interval_s: float = PROGRESS_MIN_INTERVAL_S,
+        time_source: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._callback = callback
+        self._min_interval_s = min_interval_s
+        self._time_source = time_source
+        # None = "never fired", so the first call goes through immediately.
+        self._last_emit: Optional[float] = None
+
+    def __call__(self, *args: Any, force: bool = False, **kwargs: Any) -> None:
+        now = self._time_source()
+        if not force and self._last_emit is not None \
+                and (now - self._last_emit) < self._min_interval_s:
+            return
+        self._last_emit = now
+        try:
+            self._callback(*args, **kwargs)
+        except Exception:
+            logger.warning(
+                "RateLimitedProgress callback raised; continuing",
+                exc_info=True,
+            )
