@@ -327,3 +327,128 @@ class TestBundleDownloaderFailures:
         assert isinstance(exc_info.value.__cause__, OSError)
         if staging.exists():
             assert not any(p.name.endswith(".tmp") for p in staging.iterdir())
+
+# --- agora#215: progress callback ------------------------------------------
+
+
+class _RecordingProgress:
+    """Records each (bytes_done, bytes_total) pair handed in."""
+
+    def __init__(self):
+        self.calls: list[tuple[int, int]] = []
+
+    def __call__(self, done: int, total: int) -> None:
+        self.calls.append((done, total))
+
+
+class TestBundleDownloaderProgress:
+    def test_progress_callback_fires_during_bundle_fetch(self, tmp_path):
+        """Two chunks of 5 bytes each -> first call always fires;
+        subsequent intermediate calls are rate-limited (so we may see
+        only the first + the final forced 10/10)."""
+        staging = tmp_path / "stage"
+        recorder = _RecordingProgress()
+        downloader = BundleDownloader(progress_callback=recorder)
+
+        mock_aiohttp, mock_cls, mock_session = _mock_aiohttp_session()
+        bodies = iter([
+            _AsyncIterChunks([b"xxxxx", b"yyyyy"]),  # bundle: 10 bytes
+            _AsyncIterChunks([b"sig-bytes"]),         # signature
+        ])
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content.iter_chunked.side_effect = lambda _n: next(bodies)
+        mock_resp.headers = {"Content-Length": "10"}
+        mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            asyncio.run(downloader.run(_payload(), staging))
+
+        # First chunk fires (RateLimitedProgress first-call rule), final
+        # 10/10 force-emit always fires. Middle chunks may rate-limit.
+        assert recorder.calls, "progress callback should have fired at least once"
+        # Final emit must be the 10/10 force.
+        assert recorder.calls[-1] == (10, 10)
+        # No emit should report bytes_done > bytes_total.
+        for done, total in recorder.calls:
+            assert done <= total
+
+    def test_progress_callback_not_called_for_signature_fetch(self, tmp_path):
+        """Signature is tiny + advisory; we deliberately don't emit
+        progress events for it (would just flood the wire with one
+        100% pulse per OTA)."""
+        staging = tmp_path / "stage"
+        recorder = _RecordingProgress()
+        downloader = BundleDownloader(progress_callback=recorder)
+
+        mock_aiohttp, mock_cls, mock_session = _mock_aiohttp_session()
+        bodies = iter([
+            _AsyncIterChunks([b"b"]),    # bundle: 1 byte
+            _AsyncIterChunks([b"sig"]),  # signature: 3 bytes
+        ])
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content.iter_chunked.side_effect = lambda _n: next(bodies)
+        mock_resp.headers = {"Content-Length": "1"}
+        mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            asyncio.run(downloader.run(_payload(), staging))
+
+        # Every recorded call must have total<=1 (bundle's Content-Length).
+        # Any call with total>1 would mean we counted signature bytes too.
+        assert recorder.calls, "expected at least one progress emit"
+        for done, total in recorder.calls:
+            assert total <= 1, f"unexpected progress total={total} (signature leak?)"
+
+    def test_progress_with_no_content_length_emits_total_zero(self, tmp_path):
+        """Some servers omit Content-Length on chunked responses. The
+        downloader should still emit progress with total=0 so the CMS
+        side can show an indeterminate badge instead of crashing."""
+        staging = tmp_path / "stage"
+        recorder = _RecordingProgress()
+        downloader = BundleDownloader(progress_callback=recorder)
+
+        mock_aiohttp, mock_cls, mock_session = _mock_aiohttp_session()
+        bodies = iter([
+            _AsyncIterChunks([b"abc"]),
+            _AsyncIterChunks([b"sig"]),
+        ])
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content.iter_chunked.side_effect = lambda _n: next(bodies)
+        mock_resp.headers = {}  # No Content-Length.
+        mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            asyncio.run(downloader.run(_payload(), staging))
+
+        # At least the first call fires; final emit force-fires too.
+        assert recorder.calls
+        # Final emit reports done=total=actual-bytes (3) since
+        # Content-Length was 0 -> we use bytes_done as the floor.
+        done, total = recorder.calls[-1]
+        assert done == 3
+        assert total == 3
+
+    def test_no_progress_callback_works_normally(self, tmp_path):
+        """Backwards-compat: omitting the callback must not change behavior."""
+        staging = tmp_path / "stage"
+        downloader = BundleDownloader()
+
+        mock_aiohttp, mock_cls, mock_session = _mock_aiohttp_session()
+        bodies = iter([
+            _AsyncIterChunks([b"bundle"]),
+            _AsyncIterChunks([b"sig"]),
+        ])
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.content.iter_chunked.side_effect = lambda _n: next(bodies)
+        mock_resp.headers = {"Content-Length": "6"}
+        mock_session.get.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+
+        with patch.dict(sys.modules, {"aiohttp": mock_aiohttp}):
+            asyncio.run(downloader.run(_payload(), staging))
+
+        assert (staging / DEFAULT_BUNDLE_FILENAME).read_bytes() == b"bundle"
+        assert (staging / DEFAULT_SIGNATURE_FILENAME).read_bytes() == b"sig"

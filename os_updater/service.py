@@ -186,6 +186,9 @@ class Stager(Protocol):
         staging_dir: Path,
         *,
         progress_callback: Optional[Callable[[str], None]] = None,
+        extract_progress_callback: Optional[
+            Callable[[str, int, int], None]
+        ] = None,
     ) -> None:  # pragma: no cover - protocol
         ...
 
@@ -317,6 +320,16 @@ class OSUpdaterService:
         self.migration_sentinel_path = migration_sentinel_path
         self._promote_handshake_tick_sec = promote_handshake_tick_sec
         self.state: UpdaterState = load_state(self.state_path)
+        # Phase 2 / agora#215: the per-reconnect WPS transport, set by
+        # :meth:`run` after every successful ``transport_factory()`` +
+        # ``connect()``, cleared on any disconnect/exception in the loop.
+        # ``WpsEventSink`` reads this lazily via the
+        # ``transport_provider`` it was constructed with so that
+        # lifecycle events (including the high-rate
+        # ``download_progress`` / ``extract_progress`` events) can be
+        # fire-and-forgot over the live transport without the sink
+        # needing to know about reconnect bookkeeping.
+        self._active_transport: Optional[WPSTransport] = None
 
     # -- public API used by tests and the run loop --------------------------
 
@@ -474,8 +487,38 @@ class OSUpdaterService:
                     state_path=self.state_path,
                 )
 
+            def _on_extract_progress(
+                phase: str, bytes_done: int, bytes_total: int
+            ) -> None:
+                """Wired into :meth:`Stager.stage` so each fdinfo poll
+                of the boot/rootfs extract emits an EXTRACT_PROGRESS
+                lifecycle event with compressed-bytes-consumed
+                (agora#215).
+
+                ``phase`` is one of ``"extracting_boot"`` or
+                ``"extracting_rootfs"`` so the CMS progress bar can
+                weight the two passes correctly. The CMS-side parser
+                clamps the percentage at 100% even when zstd's pos:
+                lands slightly past the file size (zstd reads in
+                window-sized chunks).
+                """
+                emit_event(
+                    self.state,
+                    LifecycleEventType.EXTRACT_PROGRESS,
+                    self.event_sink,
+                    payload={
+                        "phase": phase,
+                        "bytes_done": bytes_done,
+                        "bytes_total": bytes_total,
+                    },
+                    state_path=self.state_path,
+                )
+
             await self.stager.stage(
-                payload, staging_dir, progress_callback=_on_stage_progress
+                payload,
+                staging_dir,
+                progress_callback=_on_stage_progress,
+                extract_progress_callback=_on_extract_progress,
             )
 
             transition(self.state, UpdaterFSMState.TRYBOOT_RUNNING)
@@ -692,6 +735,7 @@ class OSUpdaterService:
                 transport = self.transport_factory()
                 try:
                     await transport.connect()
+                    self._active_transport = transport
                     log.info("WPS connected; awaiting dispatch messages")
                     delay = _RECONNECT_INITIAL_DELAY
                     while True:
@@ -707,9 +751,11 @@ class OSUpdaterService:
                             # the next dispatch once we're back to FAILED.
                             pass
                 except asyncio.CancelledError:
+                    self._active_transport = None
                     await transport.close()
                     raise
                 except Exception:
+                    self._active_transport = None
                     log.exception("WPS loop crashed; reconnecting in %.1fs", delay)
                     try:
                         await transport.close()
@@ -718,6 +764,7 @@ class OSUpdaterService:
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, _RECONNECT_MAX_DELAY)
         finally:
+            self._active_transport = None
             handshake_task.cancel()
             try:
                 await handshake_task

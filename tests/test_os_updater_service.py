@@ -658,12 +658,25 @@ class _ProgressEmittingStager:
         self.phase = phase
         self.calls: list[tuple] = []
         self.captured_callback = None
+        self.captured_extract_callback = None
 
-    async def stage(self, payload, staging_dir, *, progress_callback=None):
+    async def stage(
+        self,
+        payload,
+        staging_dir,
+        *,
+        progress_callback=None,
+        extract_progress_callback=None,
+    ):
         self.calls.append(("stage", payload, staging_dir))
         self.captured_callback = progress_callback
+        self.captured_extract_callback = extract_progress_callback
         if progress_callback is not None:
             progress_callback(self.phase)
+        if extract_progress_callback is not None:
+            # Simulate one mid-pass byte-progress emit so the service-
+            # side closure has something to forward to the outbox.
+            extract_progress_callback("extracting_rootfs", 500_000, 1_000_000)
 
 
 class TestHandleDispatchStageProgress:
@@ -1090,3 +1103,60 @@ class TestPromoteHandshakeTick:
         assert result == "cancelled"
         # No spurious lifecycle events from the no-op ticks.
         assert sink.events == []
+
+
+# -- handle_dispatch wires EXTRACT_PROGRESS (agora#215) -------------------------
+
+
+class TestHandleDispatchExtractProgress:
+    """The service-side ``_on_extract_progress`` closure forwards each
+    byte-progress emit from the stager into an EXTRACT_PROGRESS
+    lifecycle event on the outbox (agora#215)."""
+
+    def test_stager_extract_callback_emits_extract_progress_event(self, tmp_path):
+        sink = _ListSink()
+        stager = _ProgressEmittingStager(phase="extracting_rootfs")
+        s = _build_service(
+            tmp_path,
+            current_version="1.0.0",
+            sink=sink,
+            stager=stager,
+        )
+
+        asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-extract")))
+
+        # Service handed the stager a non-None extract callback.
+        assert stager.captured_extract_callback is not None
+
+        extract_events = [
+            e for e in sink.events
+            if e.event_type is LifecycleEventType.EXTRACT_PROGRESS
+        ]
+        assert len(extract_events) == 1
+        assert extract_events[0].payload == {
+            "phase": "extracting_rootfs",
+            "bytes_done": 500_000,
+            "bytes_total": 1_000_000,
+        }
+        assert extract_events[0].release_id == "rel-extract"
+        assert extract_events[0].target_version == "1.1.0"
+
+    def test_extract_progress_lands_between_staged_and_tryboot_initiated(self, tmp_path):
+        """Like STAGE_PROGRESS, EXTRACT_PROGRESS is mid-stage and must
+        sit between STAGED and TRYBOOT_INITIATED so CMS rollups are
+        sane."""
+        sink = _ListSink()
+        stager = _ProgressEmittingStager(phase="extracting_rootfs")
+        s = _build_service(tmp_path, current_version="1.0.0", sink=sink, stager=stager)
+
+        asyncio.run(s.handle_dispatch(_ok_dispatch(release_id="rel-extract-ord")))
+
+        kinds = [e.event_type for e in sink.events]
+        assert LifecycleEventType.EXTRACT_PROGRESS in kinds
+        ext_idx = kinds.index(LifecycleEventType.EXTRACT_PROGRESS)
+        staged_idx = kinds.index(LifecycleEventType.STAGED)
+        tryboot_idx = kinds.index(LifecycleEventType.TRYBOOT_INITIATED)
+        assert staged_idx < ext_idx < tryboot_idx
+
+        ids = [e.event_id for e in sink.events]
+        assert ids == sorted(ids)

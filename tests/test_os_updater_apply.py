@@ -155,7 +155,19 @@ class _FakePipelineRunner:
         *,
         tar_stdout_path=None,
         timeout_s,
+        pid_observer=None,
     ):
+        # Honor pid_observer if provided so the extract-progress poller
+        # in stream_extract_subtree sees a PID land in its pid_holder
+        # and exercises its happy path during tests that flip on
+        # progress_callback. Real subprocesses don't exist here, so we
+        # synthesize a PID of 0; tests that drive the poller swap in a
+        # fdinfo_reader fake that ignores the value anyway.
+        if pid_observer is not None:
+            try:
+                pid_observer(0)
+            except Exception:  # noqa: BLE001 — observer is advisory
+                pass
         if self.raise_file_not_found:
             raise FileNotFoundError("zstd")
         if self.raise_timeout:
@@ -1863,3 +1875,254 @@ class TestSlotStagerProgressCallback:
             )
         )
         assert tuple(phases) == STAGE_PROGRESS_PHASES
+
+# --- agora#215: extract progress (fdinfo poller + stream_extract wiring) ----
+
+
+import threading as _threading
+from os_updater.apply import (
+    _poll_extract_progress,
+    _read_fdinfo_pos,
+    stream_extract_subtree,
+)
+
+
+class TestReadFdinfoPos:
+    """The /proc/<pid>/fdinfo/0 reader is the hot inner loop of the
+    extract-progress poller; it must never raise (always return None
+    on any error)."""
+
+    def test_returns_none_on_missing_proc_entry(self):
+        # PID 1 fdinfo/0 exists on linux but is not readable as
+        # a non-root user; on Windows the path doesn't exist. Either
+        # outcome -> None.
+        result = _read_fdinfo_pos(1)
+        assert result is None or isinstance(result, int)
+
+    def test_returns_none_on_garbage_pid(self):
+        assert _read_fdinfo_pos(999_999_999) is None
+
+
+class TestPollExtractProgress:
+    def test_emits_callback_with_fake_fdinfo_reader(self):
+        """Stop event is set after the first emit; poller exits cleanly
+        and the callback receives (bytes_read, compressed_size)."""
+        calls: list[tuple[int, int]] = []
+        stop = _threading.Event()
+        pid_holder: dict[str, int] = {"pid": 1234}
+        reads = iter([100, 200, 300])
+
+        def fake_reader(_pid: int):
+            try:
+                v = next(reads)
+            except StopIteration:
+                return None
+            # Stop after the third emit so the test terminates.
+            if v == 300:
+                stop.set()
+            return v
+
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=1000,
+            callback=lambda d, t: calls.append((d, t)),
+            interval_s=0.001,
+            pid_wait_deadline_s=0.5,
+            fdinfo_reader=fake_reader,
+        )
+
+        assert calls == [(100, 1000), (200, 1000), (300, 1000)]
+
+    def test_exits_when_fdinfo_returns_none(self):
+        """zstd exiting mid-poll surfaces as fdinfo None -> poller stops."""
+        calls: list[tuple[int, int]] = []
+        stop = _threading.Event()
+        pid_holder: dict[str, int] = {"pid": 1234}
+        reads = iter([42, None])
+
+        def fake_reader(_pid):
+            return next(reads)
+
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=1000,
+            callback=lambda d, t: calls.append((d, t)),
+            interval_s=0.001,
+            pid_wait_deadline_s=0.5,
+            fdinfo_reader=fake_reader,
+        )
+
+        assert calls == [(42, 1000)]
+        # Stop event was NOT set by the test; the poller stopped on
+        # its own when the reader returned None.
+        assert not stop.is_set()
+
+    def test_exits_quickly_when_pid_never_arrives(self):
+        """If the pipeline runner never publishes a PID, poller bails
+        without spinning forever."""
+        calls: list[tuple[int, int]] = []
+        stop = _threading.Event()
+        pid_holder: dict[str, int | None] = {"pid": None}
+
+        # Fake reader never gets called because PID never arrives.
+        def fake_reader(_pid):  # pragma: no cover
+            raise AssertionError("reader should never be invoked")
+
+        import time as _time
+        t0 = _time.monotonic()
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=1000,
+            callback=lambda d, t: calls.append((d, t)),
+            interval_s=0.01,
+            pid_wait_deadline_s=0.1,
+            fdinfo_reader=fake_reader,
+        )
+        elapsed = _time.monotonic() - t0
+        assert calls == []
+        assert elapsed < 1.0
+
+    def test_callback_exception_does_not_break_poll(self):
+        """Buggy callback must not bring down the polling thread."""
+        calls: list[tuple[int, int]] = []
+        stop = _threading.Event()
+        pid_holder: dict[str, int] = {"pid": 1234}
+        reads = iter([10, 20, None])
+
+        def boom(d, t):
+            calls.append((d, t))
+            if d == 10:
+                raise RuntimeError("intentional")
+
+        def fake_reader(_pid):
+            return next(reads)
+
+        # Must not raise.
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=100,
+            callback=boom,
+            interval_s=0.001,
+            pid_wait_deadline_s=0.5,
+            fdinfo_reader=fake_reader,
+        )
+        # Both emits ran (second one despite first one throwing).
+        assert calls == [(10, 100), (20, 100)]
+
+    def test_stop_event_set_before_pid_arrives_returns_immediately(self):
+        """Caller can cancel the poller during the wait-for-PID phase."""
+        stop = _threading.Event()
+        stop.set()
+        pid_holder: dict[str, int | None] = {"pid": None}
+
+        # Reader should never be called.
+        def fake_reader(_pid):  # pragma: no cover
+            raise AssertionError("reader should not run after stop")
+
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=1000,
+            callback=lambda d, t: None,
+            interval_s=0.01,
+            pid_wait_deadline_s=5.0,
+            fdinfo_reader=fake_reader,
+        )
+
+
+class TestStreamExtractSubtreeProgressIntegration:
+    """End-to-end glue between stream_extract_subtree, the pipeline
+    runner's pid_observer hook, and the poller thread."""
+
+    def test_progress_callback_receives_final_force_emit(self, tmp_path):
+        """Even if the poller fires zero intermediate callbacks (PID
+        showed up but fdinfo read returned None immediately because
+        the fake pipeline returned instantly), stream_extract_subtree
+        still fires a final (compressed_size, compressed_size) emit."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.write_bytes(b"x" * 500)
+        dst = tmp_path / "boot"
+        calls: list[tuple[int, int]] = []
+
+        observed_pids: list[int] = []
+
+        def fake_pipeline(zstd_argv, tar_argv, *, tar_stdout_path=None, timeout_s, pid_observer=None):
+            if pid_observer is not None:
+                observed_pids.append(99)
+                pid_observer(99)
+            # Return immediately as success.
+            return (0, "", 0, "")
+
+        # Skip the poller (it spins on real /proc which isn't available
+        # on Windows); the final-emit code path is what we're pinning.
+        def no_op_poller(*args, **kwargs):
+            return None
+
+        stream_extract_subtree(
+            bundle,
+            "boot",
+            dst,
+            pipeline_runner=fake_pipeline,
+            progress_callback=lambda d, t: calls.append((d, t)),
+            compressed_size=500,
+            poller=no_op_poller,
+        )
+
+        # pid_observer fired once.
+        assert observed_pids == [99]
+        # Final 100% emit fired.
+        assert calls[-1] == (500, 500)
+
+    def test_no_progress_when_callback_omitted(self, tmp_path):
+        """Backwards-compat: no callback -> no pid_observer wired
+        through to the pipeline runner (the size-zero case)."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.write_bytes(b"x" * 50)
+        dst = tmp_path / "boot"
+
+        observed_pids: list[int] = []
+
+        def fake_pipeline(zstd_argv, tar_argv, *, tar_stdout_path=None, timeout_s, pid_observer=None):
+            if pid_observer is not None:
+                observed_pids.append(0)
+            return (0, "", 0, "")
+
+        stream_extract_subtree(
+            bundle,
+            "boot",
+            dst,
+            pipeline_runner=fake_pipeline,
+            # No progress_callback, no compressed_size.
+        )
+        assert observed_pids == []
+
+    def test_zero_compressed_size_disables_progress(self, tmp_path):
+        """compressed_size=0 also disables progress (defensive against
+        a stale-stat race producing zero)."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.write_bytes(b"x" * 50)
+        dst = tmp_path / "boot"
+        calls: list[tuple[int, int]] = []
+
+        observed_pids: list[int] = []
+
+        def fake_pipeline(zstd_argv, tar_argv, *, tar_stdout_path=None, timeout_s, pid_observer=None):
+            if pid_observer is not None:
+                observed_pids.append(0)
+            return (0, "", 0, "")
+
+        stream_extract_subtree(
+            bundle,
+            "boot",
+            dst,
+            pipeline_runner=fake_pipeline,
+            progress_callback=lambda d, t: calls.append((d, t)),
+            compressed_size=0,
+        )
+
+        assert observed_pids == []
+        assert calls == []

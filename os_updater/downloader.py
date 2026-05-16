@@ -29,17 +29,26 @@ Implementation notes (Phase 2):
   the GitHub-release ``browser_download_url`` directly, and GitHub's
   release-asset endpoint is unauthenticated for public repos. If the
   release ever moves to a private bucket, this is the seam to extend.
+* Bytes-progress is reported via an optional ``progress_callback``
+  signature ``(bytes_done: int, bytes_total: int) -> None``.  The
+  downloader calls back at most every ``PROGRESS_MIN_INTERVAL_S``
+  seconds during the streaming GET, plus a final forced call at
+  completion so a stuck callback never lands at 99% in the UI.  The
+  service wraps this into a ``download_progress`` lifecycle event so
+  the CMS progress badge can animate live (agora#215).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 from os_updater.bundle import BundleError
 from os_updater.dispatch import DispatchPayload
+from os_updater.events import PROGRESS_MIN_INTERVAL_S, RateLimitedProgress
 from os_updater.verifier import (
     DEFAULT_BUNDLE_FILENAME,
     DEFAULT_SIGNATURE_FILENAME,
@@ -53,6 +62,10 @@ logger = logging.getLogger(__name__)
 #: overhead against memory pressure on the Pi 5 (1 GiB bundle / 64 KiB =
 #: ~16k iterations -- nothing).
 DEFAULT_CHUNK_SIZE = 65536
+
+
+#: Type alias for the bytes-progress callback shape.
+ProgressCallback = Callable[[int, int], None]
 
 
 class BundleDownloadError(BundleError):
@@ -74,11 +87,16 @@ class BundleDownloader:
     * ``bundle_filename`` / ``signature_filename`` -- on-disk filenames
       that the verifier + stager expect.  Default to the canonical values
       from :mod:`os_updater.verifier`.
+    * ``progress_callback`` -- if set, invoked with ``(bytes_done,
+      bytes_total)`` during the bundle download (NOT the much-smaller
+      signature download).  Rate-limited internally via
+      :class:`RateLimitedProgress`; final call is always forced.
     """
 
     chunk_size: int = DEFAULT_CHUNK_SIZE
     bundle_filename: str = DEFAULT_BUNDLE_FILENAME
     signature_filename: str = DEFAULT_SIGNATURE_FILENAME
+    progress_callback: Optional[ProgressCallback] = None
 
     async def run(
         self, payload: DispatchPayload, staging_dir: Path
@@ -103,7 +121,7 @@ class BundleDownloader:
             payload.bundle_url,
             bundle_target,
         )
-        await self._fetch(payload.bundle_url, bundle_target)
+        await self._fetch(payload.bundle_url, bundle_target, with_progress=True)
 
         logger.info(
             "downloading signature: release_id=%s url=%s -> %s",
@@ -111,7 +129,7 @@ class BundleDownloader:
             payload.signature_url,
             sig_target,
         )
-        await self._fetch(payload.signature_url, sig_target)
+        await self._fetch(payload.signature_url, sig_target, with_progress=False)
 
         logger.info(
             "bundle download complete: release_id=%s target_version=%s",
@@ -119,15 +137,25 @@ class BundleDownloader:
             payload.target_version,
         )
 
-    async def _fetch(self, url: str, target: Path) -> None:
+    async def _fetch(
+        self, url: str, target: Path, *, with_progress: bool = False,
+    ) -> None:
         """Stream ``url`` into ``target`` via a ``.tmp`` sibling + rename.
 
         ``aiohttp`` is imported lazily so test runs that patch
         ``sys.modules["aiohttp"]`` see the mock when the production code
         first reaches for it. Same trick the cms_client downloader uses.
+
+        When ``with_progress`` is true and a ``progress_callback`` is
+        configured, fires ``(bytes_done, bytes_total)`` callbacks
+        throughout the streaming GET.
         """
 
         import aiohttp
+
+        rate_limited: Optional[RateLimitedProgress] = None
+        if with_progress and self.progress_callback is not None:
+            rate_limited = RateLimitedProgress(self.progress_callback)
 
         tmp = target.with_suffix(target.suffix + ".tmp")
         try:
@@ -137,13 +165,31 @@ class BundleDownloader:
                         raise BundleDownloadError(
                             f"HTTP {resp.status} fetching {url}"
                         )
+                    # ``Content-Length`` is the only available total here
+                    # because the bundle is served as a single GitHub
+                    # release asset (no chunked-transfer-encoding).
+                    # Missing/garbled header -> emit progress with
+                    # total=0 so the UI falls back to the "Downloading
+                    # bundle" label-only badge.
+                    try:
+                        total = int(resp.headers.get("Content-Length") or 0)
+                    except (TypeError, ValueError):
+                        total = 0
+                    bytes_done = 0
                     with open(tmp, "wb") as f:
                         async for chunk in resp.content.iter_chunked(
                             self.chunk_size
                         ):
                             f.write(chunk)
+                            bytes_done += len(chunk)
+                            if rate_limited is not None:
+                                rate_limited(bytes_done, total)
                         f.flush()
                         os.fsync(f.fileno())
+                    # Final forced emit so the badge always reaches
+                    # 100% before the next FSM event clears it.
+                    if rate_limited is not None:
+                        rate_limited(bytes_done, total or bytes_done, force=True)
             os.replace(tmp, target)
         except BundleDownloadError:
             # Already a typed failure -- still want to drop the tmp so a

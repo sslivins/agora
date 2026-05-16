@@ -90,6 +90,8 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -102,6 +104,7 @@ from os_updater.bundle import (
     verify_bundle_manifest,
 )
 from os_updater.dispatch import DispatchPayload
+from os_updater.events import PROGRESS_MIN_INTERVAL_S
 
 
 logger = logging.getLogger(__name__)
@@ -243,6 +246,94 @@ def _safe_emit_progress(
         logger.exception(
             "progress_callback raised on phase=%s; continuing stage", phase
         )
+
+
+#: Soft deadline for the zstd PID to materialize after the pipeline runner
+#: starts. The default subprocess.Popen child shows up in /proc within
+#: microseconds; 5 s is a comfortably large ceiling even on a thrashing Pi.
+#: If the poll never sees a PID by this deadline it just exits quietly —
+#: progress is advisory and we'd rather lose progress than introduce a
+#: spurious timeout.
+_PID_OBSERVER_WAIT_S = 5.0
+
+
+def _read_fdinfo_pos(pid: int) -> Optional[int]:
+    """Return the byte position of ``/proc/<pid>/fdinfo/0`` (zstd's stdin).
+
+    Returns ``None`` if the file is unreadable for any reason (PID gone,
+    not on Linux, malformed contents). The poller treats every ``None``
+    as "stop polling" — there's nothing to recover from at this layer.
+    """
+
+    try:
+        with open(f"/proc/{pid}/fdinfo/0", "rt") as f:
+            for line in f:
+                if line.startswith("pos:"):
+                    try:
+                        return int(line.split(":", 1)[1].strip())
+                    except (ValueError, IndexError):
+                        return None
+        return None
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def _poll_extract_progress(
+    pid_holder: dict[str, Optional[int]],
+    stop_event: threading.Event,
+    compressed_size: int,
+    callback: Callable[[int, int], None],
+    *,
+    interval_s: float = PROGRESS_MIN_INTERVAL_S,
+    pid_wait_deadline_s: float = _PID_OBSERVER_WAIT_S,
+    fdinfo_reader: Callable[[int], Optional[int]] = _read_fdinfo_pos,
+) -> None:
+    """Poll ``/proc/<zstd_pid>/fdinfo/0`` and emit bytes-progress.
+
+    Runs in a worker thread spawned by :func:`stream_extract_subtree`.
+    Reads the ``pos:`` field of zstd's stdin fdinfo (== compressed
+    bytes consumed from the .tar.zst on disk) at most every
+    ``interval_s`` seconds, then calls ``callback(bytes_read,
+    compressed_size)``.
+
+    Exits cleanly when any of these happens, in order of likelihood:
+
+    * ``stop_event`` is set by the caller (pipeline completed).
+    * fdinfo read returns ``None`` (zstd exited; ``/proc/<pid>/...`` gone).
+    * ``pid_holder["pid"]`` is still ``None`` after ``pid_wait_deadline_s``.
+
+    Callback exceptions are caught — progress is advisory, must not
+    take down the extract. Test-only knobs (``interval_s``,
+    ``pid_wait_deadline_s``, ``fdinfo_reader``) are explicit kwargs so
+    unit tests can drive the poller without touching ``/proc``.
+    """
+
+    # Wait for the pipeline runner to capture and publish zstd's PID.
+    wait_deadline = time.monotonic() + pid_wait_deadline_s
+    while pid_holder["pid"] is None:
+        if stop_event.wait(0.05):
+            return
+        if time.monotonic() > wait_deadline:
+            logger.debug(
+                "extract progress poller gave up waiting for zstd PID after %.2fs",
+                pid_wait_deadline_s,
+            )
+            return
+
+    pid = pid_holder["pid"]
+    assert pid is not None  # for type narrowing
+    while not stop_event.is_set():
+        pos = fdinfo_reader(pid)
+        if pos is None:
+            return
+        try:
+            callback(pos, compressed_size)
+        except Exception:  # noqa: BLE001 — advisory; never brick the extract
+            logger.exception(
+                "extract progress callback raised; continuing poll"
+            )
+        if stop_event.wait(interval_s):
+            return
 
 #: Root of the currently-running rootfs from which
 #: :func:`copy_fleet_state` reads per-device identity files. Path is
@@ -653,6 +744,7 @@ def _default_pipeline_runner(
     *,
     tar_stdout_path: Optional[Path] = None,
     timeout_s: float,
+    pid_observer: Optional[Callable[[int], None]] = None,
 ) -> tuple[int, str, int, str]:
     """Run ``zstd_argv | tar_argv`` as a streaming pipeline.
 
@@ -665,6 +757,13 @@ def _default_pipeline_runner(
     If ``tar_stdout_path`` is set, ``tar``'s stdout is redirected to that
     file (used by ``tar -O`` for meta-only extract — the manifest member
     is written to stdout instead of disk).
+
+    If ``pid_observer`` is set, it's invoked exactly once with zstd's
+    PID immediately after :func:`subprocess.Popen` returns. The bytes-
+    progress poller (:func:`_poll_extract_progress`) uses this to look
+    up ``/proc/<pid>/fdinfo/0`` for the compressed-bytes-consumed
+    counter. Observer exceptions are caught so a buggy observer cannot
+    bring down an OTA.
 
     Always returns ``(zstd_rc, zstd_stderr, tar_rc, tar_stderr)`` so the
     caller decides how to classify failure (zstd-side ⇒ corrupted bytes
@@ -685,6 +784,13 @@ def _default_pipeline_runner(
             stderr=subprocess.PIPE,
             text=True,
         )
+        if pid_observer is not None:
+            try:
+                pid_observer(zstd_proc.pid)
+            except Exception:  # noqa: BLE001 — observer is advisory
+                logger.exception(
+                    "pid_observer raised; continuing pipeline"
+                )
         try:
             if tar_stdout_path is not None:
                 stdout_fp = open(tar_stdout_path, "wb")
@@ -755,6 +861,9 @@ def stream_extract_subtree(
     pipeline_runner: Callable[..., tuple[int, str, int, str]] = _default_pipeline_runner,
     zstd_long: int = DEFAULT_ZSTD_LONG,
     timeout_s: float = DEFAULT_STREAM_TIMEOUT_S,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    compressed_size: Optional[int] = None,
+    poller: Callable[..., None] = _poll_extract_progress,
 ) -> None:
     """Stream-extract ``<subpath>/`` from ``bundle.tar.zst`` directly into ``dst_dir``.
 
@@ -768,6 +877,17 @@ def stream_extract_subtree(
     :class:`BundleIntegrityError` on any zstd or tar failure (corrupted
     bytes, missing binary, timeout). Bundle bytes → unusable, same wire-code
     rationale as for the meta-only extractor.
+
+    When both ``progress_callback`` and ``compressed_size`` are
+    provided, a sidecar thread polls ``/proc/<zstd_pid>/fdinfo/0`` at
+    most every ``PROGRESS_MIN_INTERVAL_S`` seconds and emits
+    ``(bytes_done, compressed_size)`` callbacks throughout the pass.
+    The poller exits as soon as the pipeline returns (success OR
+    failure) so a failed extract never leaks a thread. After a
+    successful return the caller's callback is fired one last time with
+    ``(compressed_size, compressed_size)`` so the badge always reaches
+    100% before the next FSM event clears it. ``poller`` is overridable
+    for tests; default points at :func:`_poll_extract_progress`.
     """
     bundle_path = Path(bundle_path)
     dst_dir = Path(dst_dir)
@@ -800,9 +920,42 @@ def stream_extract_subtree(
         dst_dir,
         zstd_long,
     )
+
+    # Optional bytes-progress polling: only active when the caller wants
+    # progress AND has handed us a non-zero compressed size to anchor
+    # the percentage against. The sidecar thread reads
+    # /proc/<zstd_pid>/fdinfo/0 'pos:' field, so it's a no-op outside
+    # Linux (test fakes that swap pipeline_runner won't see polling).
+    poll_thread: Optional[threading.Thread] = None
+    stop_event: Optional[threading.Event] = None
+    pid_holder: Optional[dict[str, Optional[int]]] = None
+    pipeline_kwargs: dict[str, Any] = {"timeout_s": timeout_s}
+    want_progress = (
+        progress_callback is not None
+        and compressed_size is not None
+        and compressed_size > 0
+    )
+    if want_progress:
+        assert progress_callback is not None  # for type narrowing
+        assert compressed_size is not None
+        stop_event = threading.Event()
+        pid_holder = {"pid": None}
+
+        def _pid_observer(p: int) -> None:
+            pid_holder["pid"] = p  # type: ignore[index]
+
+        pipeline_kwargs["pid_observer"] = _pid_observer
+        poll_thread = threading.Thread(
+            target=poller,
+            args=(pid_holder, stop_event, compressed_size, progress_callback),
+            name=f"extract-progress-{subpath}",
+            daemon=True,
+        )
+        poll_thread.start()
+
     try:
         zstd_rc, zstd_stderr, tar_rc, tar_stderr = pipeline_runner(
-            zstd_argv, tar_argv, timeout_s=timeout_s
+            zstd_argv, tar_argv, **pipeline_kwargs
         )
     except FileNotFoundError as exc:
         # We don't know which binary was missing from the OSError alone;
@@ -815,6 +968,14 @@ def stream_extract_subtree(
             f"stream extract timed out after {timeout_s}s: bundle={bundle_path} "
             f"subpath={subpath}"
         ) from exc
+    finally:
+        # Always tear down the polling thread before returning — a stuck
+        # poller (e.g. PID never showed up, fdinfo unreadable on a
+        # non-Linux test box) would otherwise leak across passes.
+        if stop_event is not None:
+            stop_event.set()
+        if poll_thread is not None:
+            poll_thread.join(timeout=5.0)
 
     if zstd_rc != 0:
         raise BundleIntegrityError(
@@ -825,6 +986,16 @@ def stream_extract_subtree(
             f"tar extract failed (rc={tar_rc}): subpath={subpath} "
             f"stderr={_tail(tar_stderr)!r}"
         )
+
+    # Final 100% emit so the badge always lands at the end of the pass
+    # rather than wherever the last fdinfo poll happened to catch zstd.
+    if want_progress and progress_callback is not None and compressed_size is not None:
+        try:
+            progress_callback(compressed_size, compressed_size)
+        except Exception:  # noqa: BLE001 — advisory
+            logger.exception(
+                "extract progress final-emit raised; ignoring"
+            )
 
 
 def extract_meta_only(
@@ -1332,6 +1503,9 @@ class SlotStager:
         staging_dir: Path,
         *,
         progress_callback: Optional[Callable[[str], None]] = None,
+        extract_progress_callback: Optional[
+            Callable[[str, int, int], None]
+        ] = None,
     ) -> None:
         """Run the full stage-and-tryboot pipeline (10-step streaming orchestration).
 
@@ -1343,12 +1517,22 @@ class SlotStager:
         name from :data:`STAGE_PROGRESS_PHASES` at that phase's
         boundary (before the phase's work begins). Callback exceptions
         are caught and logged — they do not interrupt the stage.
+
+        ``extract_progress_callback``, if provided, is invoked during
+        the two long ``stream_extract_subtree`` passes with
+        ``(phase, bytes_done, compressed_size)`` where ``phase`` is
+        either ``"extracting_boot"`` or ``"extracting_rootfs"``. Rate-
+        limited to ``PROGRESS_MIN_INTERVAL_S`` cadence by the polling
+        thread. Final ``(compressed_size, compressed_size)`` is fired
+        at the end of each pass so the badge always lands at 100%.
+        Callback exceptions are caught and logged.
         """
         await asyncio.to_thread(
             self._stage_sync,
             payload,
             staging_dir,
             progress_callback=progress_callback,
+            extract_progress_callback=extract_progress_callback,
         )
 
     def _stage_sync(
@@ -1357,6 +1541,9 @@ class SlotStager:
         staging_dir: Path,
         *,
         progress_callback: Optional[Callable[[str], None]] = None,
+        extract_progress_callback: Optional[
+            Callable[[str, int, int], None]
+        ] = None,
     ) -> None:
         staging_dir = Path(staging_dir)
         bundle_path = staging_dir / self.bundle_filename
@@ -1478,6 +1665,35 @@ class SlotStager:
         # --strip-components=1 turns "boot/foo" into "<boot_target>/foo" and
         # naturally filters anything not under boot/.
         _safe_emit_progress(progress_callback, "extracting_boot")
+        try:
+            compressed_size = bundle_path.stat().st_size
+        except OSError:
+            # Bundle disappeared between meta-extract and now — let the
+            # real pipeline runner surface the failure; the size lookup
+            # is only used to anchor progress and is purely advisory.
+            compressed_size = 0
+        boot_progress: Optional[Callable[[int, int], None]] = None
+        root_progress: Optional[Callable[[int, int], None]] = None
+        if extract_progress_callback is not None and compressed_size > 0:
+            def _on_boot_bytes(done: int, total: int) -> None:
+                try:
+                    extract_progress_callback("extracting_boot", done, total)
+                except Exception:  # noqa: BLE001 — advisory
+                    logger.exception(
+                        "extract_progress_callback raised; continuing extract"
+                    )
+
+            def _on_root_bytes(done: int, total: int) -> None:
+                try:
+                    extract_progress_callback("extracting_rootfs", done, total)
+                except Exception:  # noqa: BLE001 — advisory
+                    logger.exception(
+                        "extract_progress_callback raised; continuing extract"
+                    )
+
+            boot_progress = _on_boot_bytes
+            root_progress = _on_root_bytes
+
         stream_extract_subtree(
             bundle_path,
             self.boot_subdir,
@@ -1485,6 +1701,8 @@ class SlotStager:
             pipeline_runner=self.pipeline_runner,
             zstd_long=self.zstd_long,
             timeout_s=self.stream_timeout_s,
+            progress_callback=boot_progress,
+            compressed_size=compressed_size if boot_progress else None,
         )
 
         # 7. Stream root/ subtree straight onto the inactive root partition.
@@ -1496,6 +1714,8 @@ class SlotStager:
             pipeline_runner=self.pipeline_runner,
             zstd_long=self.zstd_long,
             timeout_s=self.stream_timeout_s,
+            progress_callback=root_progress,
+            compressed_size=compressed_size if root_progress else None,
         )
 
         # 8. Manifest sha256 verification — hash the bytes that actually
