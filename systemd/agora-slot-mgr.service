@@ -30,25 +30,44 @@ StartLimitIntervalSec=600
 [Service]
 # `oneshot` so the unit runs once after boot and exits; the gate's job
 # is a single decision, not a long-running daemon. Combined with
-# `Restart=on-failure` below, this gives us a bounded retry budget when
-# `slot_state()` or one of the checks raises transiently.
+# `Restart=on-failure` below, this gives us a bounded retry budget for
+# the one case in `--auto` where the right answer really is "try again
+# in a moment": services not yet aged (bug #209).
 Type=oneshot
 ExecStart=/usr/bin/python3 -m slot_confirm --auto
 WorkingDirectory=/opt/agora/src
 Environment=PYTHONPATH=/opt/agora/src
 Environment=AGORA_BASE=/opt/agora
 
-# Retry transient failures (e.g. systemctl-show RPC timeout, status
-# file briefly missing) up to ~5 minutes total. `next_action="error"`
-# from --auto exits 2 which counts as failure; `strike` exits 0, so
-# the unit stops on its own as soon as a non-error decision has been
-# recorded.
+# `--auto` has three terminal exit codes:
+#   0  → promote OR strike OR skipped. The gate ran to completion and
+#        recorded a decision. systemd sees success, unit stops, no
+#        retry. This is what we want when the slot has been judged
+#        good *or* bad — striking burns one of the three attempts and
+#        is itself a "decision". (Skipped means not tentative; nothing
+#        to do.)
+#   75 → deferred (EX_TEMPFAIL). The agora-* services are up and
+#        healthy but haven't reached the ≥5 min Active threshold yet
+#        — the normal boot race, see bug #209. NOT a strike: this is
+#        an *expected* transient that the retry budget below covers.
+#        systemd sees failure, sleeps RestartSec, retries; eventually
+#        the services age past the threshold and we exit 0 with a
+#        promote or strike, OR StartLimitBurst runs out and the unit
+#        stops with a real failure.
+#   2  → error (slot_state() raised, etc.). systemd retries the same
+#        way as 75 — also a transient condition (e.g. systemctl-show
+#        RPC timeout, status file briefly missing) — until the burst
+#        budget runs out.
+#
+# `--check` exits 1 on a "gate-failed" result; the unit does not run
+# --check so that branch never reaches systemd.
+#
+# Budget math: RestartSec=45s × StartLimitBurst=10 = 450s ≈ 7.5 min,
+# which covers the 5-min service-age window with margin. StartLimit*
+# live in [Unit] above; see the comment there for why.
 Restart=on-failure
-RestartSec=30
+RestartSec=45
 
-# Both `--auto` exit codes that mean "ran to completion" are 0 or 1,
-# and we already filter exit 1 via `--auto` (which always exits 0 or 2).
-# Keep SuccessExitStatus minimal; let the retry budget handle failures.
 StandardOutput=journal
 StandardError=journal
 

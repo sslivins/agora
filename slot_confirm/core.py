@@ -91,9 +91,14 @@ class ConfirmStatus:
         nothing to confirm.
     next_action
         One of ``"promote"`` (tentative + all checks passed),
-        ``"strike"`` (tentative + ≥1 check failed), or ``"skipped"``
-        (not tentative). The CLI's ``--auto`` mode uses this to
-        decide which :mod:`slot_mgr` verb to invoke.
+        ``"deferred"`` (tentative + the *only* failure is the
+        agora-* services not having reached the ≥5 min Active
+        threshold yet — caller should retry rather than strike,
+        see bug #209), ``"strike"`` (tentative + any other
+        failure), or ``"skipped"`` (not tentative). The CLI's
+        ``--auto`` mode uses this to decide which :mod:`slot_mgr`
+        verb to invoke (and ``"deferred"`` triggers a clean retry
+        via systemd ``Restart=on-failure``).
     checks
         Tuple of all :class:`CheckResult` instances, in the order they
         were run. Empty when ``next_action == "skipped"``.
@@ -377,6 +382,13 @@ def check_agora_services_active(
                     "min_active_seconds": min_active_seconds,
                     "entered_at": entered.isoformat(),
                     "clock_source": clock_source,
+                    # ``not_yet_aged`` is the discriminator the aggregator
+                    # uses to distinguish "this service is up but hasn't
+                    # met the ≥5min bar yet — try me again in a moment"
+                    # from "this service is broken — strike me". See
+                    # :func:`_only_services_not_yet_aged` and bug #209
+                    # for the failure that motivated this split.
+                    "reason": "not_yet_aged",
                 },
             )
 
@@ -754,6 +766,15 @@ def slot_confirm(
     if all_ok:
         next_action = "promote"
         ok = True
+    elif _only_services_not_yet_aged(results):
+        # The agora-* services are up and healthy, they just haven't
+        # been Active for the required ≥5 min yet (see bug #209). We
+        # MUST NOT strike — striking burns the slot's strike budget
+        # for a transient, expected condition. Recommend the caller
+        # try again in a few seconds; the systemd unit's Restart=
+        # policy does exactly that.
+        next_action = "deferred"
+        ok = False
     else:
         next_action = "strike"
         ok = False
@@ -766,3 +787,28 @@ def slot_confirm(
         tentative=tentative,
         error="",
     )
+
+
+def _only_services_not_yet_aged(results: Sequence[CheckResult]) -> bool:
+    """True iff the only failing check is ``agora_services_active`` with reason ``not_yet_aged``.
+
+    The discriminator is :func:`check_agora_services_active`'s
+    ``measurement["reason"] == "not_yet_aged"`` tag, which is emitted
+    only on the "service is Active but hasn't met the ≥5 min
+    threshold" branch. Other failure modes of the services check
+    (inactive/failed unit, missing timestamp, negative-age clock
+    bug) have a different reason or no reason and therefore still
+    strike — they are genuine red flags, not the boot-timing race
+    that bug #209 fixes.
+    """
+    saw_not_yet_aged = False
+    for result in results:
+        if result.ok:
+            continue
+        if result.name != "agora_services_active":
+            return False
+        reason = (result.measurement or {}).get("reason")
+        if reason != "not_yet_aged":
+            return False
+        saw_not_yet_aged = True
+    return saw_not_yet_aged

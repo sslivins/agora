@@ -11,10 +11,11 @@ Modes (these may be combined):
                        ``next_action`` by invoking the corresponding
                        :mod:`slot_mgr` verb:
 
-                         next_action="promote" → slot_mgr.promote_slot(running_slot)
-                         next_action="strike"  → slot_mgr.record_tryboot_strike(running_slot)
-                         next_action="skipped" → no-op
-                         next_action="error"   → no action, exit 2
+                         next_action="promote"  → slot_mgr.promote_slot(running_slot)
+                         next_action="strike"   → slot_mgr.record_tryboot_strike(running_slot)
+                         next_action="deferred" → no-op (services not yet aged)
+                         next_action="skipped"  → no-op
+                         next_action="error"    → no action, exit 2
 
                        The emitted JSON adds ``action_taken`` and any
                        ``action_error``.
@@ -35,11 +36,17 @@ JSON shape (without ``--auto``)::
 
 Exit codes:
 
-* 0 — checks ran (default), or checks ran + acted (--auto), or
-      ``--check`` and ``ok=True``.
-* 1 — ``--check`` and ``ok=False``.
-* 2 — couldn't even run the gate (slot_mgr import failed, or
-      ``next_action=="error"`` under ``--auto``).
+* 0  — checks ran (default), or checks ran + acted (--auto), or
+       ``--check`` and ``ok=True``.
+* 1  — ``--check`` and ``ok=False``.
+* 2  — couldn't even run the gate (slot_mgr import failed, or
+       ``next_action=="error"`` under ``--auto``).
+* 75 — ``--auto`` and ``next_action=="deferred"``. The agora-*
+       services aren't yet aged (≥5 min Active) but everything
+       else is healthy; the strike counter MUST NOT advance for
+       this transient condition. Exit 75 (``EX_TEMPFAIL``) is a
+       signal to systemd's ``Restart=on-failure`` to retry the
+       unit after ``RestartSec``. See bug #209.
 """
 
 from __future__ import annotations
@@ -86,12 +93,21 @@ def _act(status: ConfirmStatus) -> tuple[str, str]:
     """Carry out ``status.next_action`` via slot_mgr.
 
     Returns a ``(action_taken, action_error)`` tuple. ``action_taken``
-    is one of ``"promote"``, ``"strike"``, ``"skipped"``, or
-    ``"none"`` (when ``next_action == "error"``). ``action_error`` is
-    a free-form message on failure, ``""`` otherwise.
+    is one of ``"promote"``, ``"strike"``, ``"deferred"``,
+    ``"skipped"``, or ``"none"`` (when ``next_action == "error"``).
+    ``action_error`` is a free-form message on failure, ``""``
+    otherwise.
     """
     if status.next_action == "skipped":
         return "skipped", ""
+
+    if status.next_action == "deferred":
+        # agora-* services are up but haven't met the ≥5min Active
+        # bar yet (bug #209). No on-device side effect — the CLI
+        # caller (systemd unit) is expected to retry via
+        # Restart=on-failure on the EX_TEMPFAIL exit code emitted by
+        # main().
+        return "deferred", ""
 
     if status.next_action == "error":
         return "none", status.error or "slot_state() failed"
@@ -158,6 +174,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.auto and status.next_action == "error":
         return 2
+    if args.auto and status.next_action == "deferred":
+        # EX_TEMPFAIL — signals systemd's Restart=on-failure to retry
+        # this unit after RestartSec. See bug #209 and the deferred
+        # branch in slot_confirm.core.slot_confirm().
+        return 75
     if args.check and not status.ok:
         return 1
     return 0
