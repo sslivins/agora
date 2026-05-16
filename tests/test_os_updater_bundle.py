@@ -497,12 +497,27 @@ class TestServiceFailureClassification:
             == "stage_failed"
         )
 
+    def test_bundle_download_error_maps_to_short_code(self):
+        """Network / HTTP / local-write failures during bundle fetch get
+        their own wire code so the CMS can distinguish "couldn't even
+        get the bytes" from "got them but they were bad."
+        """
+        from os_updater.downloader import BundleDownloadError
+        from os_updater.service import OSUpdaterService
+
+        assert (
+            OSUpdaterService._classify_failure(BundleDownloadError("net down"))
+            == "download_failed"
+        )
+
     def test_subclass_arms_take_precedence_over_base(self):
         """``RsyncError``, ``TrybootError``, ``FleetStateMissingError``,
-        and ``FleetStateWriteError`` all subclass ``StagingError``. If
-        the arm order ever drifted so the base arm fired first, all of
-        them would collapse to ``stage_failed`` and the CMS would lose
-        the wire-code distinction. Pin every subclass.
+        and ``FleetStateWriteError`` all subclass ``StagingError``;
+        ``BundleDownloadError`` / ``BundleSignatureError`` /
+        ``BundleIntegrityError`` all subclass ``BundleError``. If the
+        arm order ever drifted so a base arm fired first, the concrete
+        subclasses would collapse to the base wire code and the CMS
+        would lose the distinction. Pin every subclass.
         """
         from os_updater.apply import (
             FleetStateMissingError,
@@ -511,6 +526,7 @@ class TestServiceFailureClassification:
             StagingError,
             TrybootError,
         )
+        from os_updater.downloader import BundleDownloadError
         from os_updater.service import OSUpdaterService
 
         assert issubclass(RsyncError, StagingError)
@@ -526,6 +542,24 @@ class TestServiceFailureClassification:
         assert (
             OSUpdaterService._classify_failure(FleetStateWriteError("d", path="p"))
             == "slot_b_write_failed"
+        )
+
+        # Bundle hierarchy: the three concrete arms must all win over
+        # the base BundleError fallback ("error_BundleError").
+        assert issubclass(BundleDownloadError, BundleError)
+        assert issubclass(BundleSignatureError, BundleError)
+        assert issubclass(BundleIntegrityError, BundleError)
+        assert (
+            OSUpdaterService._classify_failure(BundleDownloadError("e"))
+            == "download_failed"
+        )
+        assert (
+            OSUpdaterService._classify_failure(BundleSignatureError("f"))
+            == "signature_invalid"
+        )
+        assert (
+            OSUpdaterService._classify_failure(BundleIntegrityError("g"))
+            == "bundle_invalid"
         )
 
 

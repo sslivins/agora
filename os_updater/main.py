@@ -17,12 +17,16 @@ of the daemon's behavior lives in :class:`os_updater.service.OSUpdaterService`
 4. Installs a SIGTERM/SIGINT handler that cancels the run loop cleanly so
    systemd can restart us without a forced kill.
 
-The actual download / verify / stage / migrate hooks are injected by
-sibling Phase 2 todos via the protocols on :class:`OSUpdaterService`.
-Until those land, ``main()`` wires in the default ``NotImplementedError``
-stubs — the daemon will still start, accept a WPS connection, and reject
-any dispatch with ``failed:error_NotImplementedError`` so the CMS sees
-the daemon is alive but the rest of Phase 2 isn't done.
+``main()`` injects the production collaborators for all three of the
+service's hot-path protocols:
+
+* :class:`os_updater.downloader.BundleDownloader` (Downloader)
+* :class:`os_updater.verifier.SignatureVerifier` (Verifier)
+* :class:`os_updater.apply.SlotStager` (Stager)
+
+The Migrator hook is still the service default (no-op fence + script
+runner is exercised by :class:`OSUpdaterService` itself); future PRs may
+inject an override if the migration story grows configurable bits.
 """
 
 from __future__ import annotations
@@ -38,12 +42,15 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from os_updater import __version__
+from os_updater.apply import SlotStager
+from os_updater.downloader import BundleDownloader
 from os_updater.service import (
     DEFAULT_STAGING_ROOT,
     OSUpdaterService,
     WPSTransport,
 )
 from os_updater.state import DEFAULT_STATE_PATH
+from os_updater.verifier import SignatureVerifier
 
 
 log = logging.getLogger("agora.os_updater")
@@ -336,6 +343,9 @@ async def _run(args: argparse.Namespace) -> int:
     service = OSUpdaterService(
         transport_factory=_build_transport_factory(settings),
         current_version_provider=lambda: current_version,
+        downloader=BundleDownloader(),
+        verifier=SignatureVerifier(),
+        stager=SlotStager(),
         state_path=args.state_path,
         staging_root=args.staging_root,
     )

@@ -12,8 +12,10 @@ at the bottom of the file.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import sys
 import types
 
 import pytest
@@ -265,3 +267,93 @@ class TestBuildTransportFactory:
         setattr(settings, missing_field, "")
         with pytest.raises(RuntimeError, match=expected_msg):
             _build_transport_factory(settings)
+
+
+# ---------------------------------------------------------------------------
+# _run — wires production collaborators into OSUpdaterService
+# ---------------------------------------------------------------------------
+
+
+class TestServiceWiring:
+    """Pins that ``_run`` constructs ``OSUpdaterService`` with the real
+    ``BundleDownloader``/``SignatureVerifier``/``SlotStager`` instances.
+
+    The pre-M7 bug was that ``main.py`` constructed the service without
+    those kwargs, leaving the ``_Default*`` stubs in place; the first
+    dispatch then died with ``NotImplementedError`` deep inside the FSM.
+    This test guards against that regression by intercepting the
+    ``OSUpdaterService.__init__`` call and inspecting the captured
+    kwargs.
+    """
+
+    def _drive_run(self, monkeypatch, tmp_path):
+        from os_updater import main as main_mod
+        from os_updater.apply import SlotStager
+        from os_updater.downloader import BundleDownloader
+        from os_updater.verifier import SignatureVerifier
+
+        captured: dict = {}
+
+        class _FakeService:
+            def __init__(self, **kwargs):
+                captured["kwargs"] = kwargs
+
+            async def run(self):
+                # Return immediately so the wait() in _run resolves on
+                # the runner side, no need to fire the stop event.
+                return None
+
+        monkeypatch.setattr(main_mod, "OSUpdaterService", _FakeService)
+        monkeypatch.setattr(
+            main_mod,
+            "_read_current_version",
+            lambda _p: "0.0.22-test",
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_build_transport_factory",
+            lambda _settings: (lambda: None),
+        )
+
+        # api.config.load_settings is lazy-imported inside _run; install
+        # a stand-in into sys.modules so the import resolves to it.
+        fake_api_config = types.ModuleType("api.config")
+        fake_api_config.load_settings = lambda: _stub_settings(
+            tmp_path, bootstrap_v2=True
+        )
+        monkeypatch.setitem(sys.modules, "api.config", fake_api_config)
+
+        args = argparse.Namespace(
+            state_path=tmp_path / "updater-state.json",
+            staging_root=tmp_path / "staging",
+            current_version_file=tmp_path / "version",
+        )
+        asyncio.run(main_mod._run(args))
+
+        return captured["kwargs"], BundleDownloader, SignatureVerifier, SlotStager
+
+    def test_wires_real_downloader_verifier_stager(self, tmp_path, monkeypatch):
+        kwargs, BundleDownloader, SignatureVerifier, SlotStager = self._drive_run(
+            monkeypatch, tmp_path
+        )
+
+        assert isinstance(kwargs["downloader"], BundleDownloader)
+        assert isinstance(kwargs["verifier"], SignatureVerifier)
+        assert isinstance(kwargs["stager"], SlotStager)
+
+    def test_passes_state_path_and_staging_root_from_args(self, tmp_path, monkeypatch):
+        kwargs, *_ = self._drive_run(monkeypatch, tmp_path)
+
+        assert kwargs["state_path"] == tmp_path / "updater-state.json"
+        assert kwargs["staging_root"] == tmp_path / "staging"
+
+    def test_current_version_provider_returns_parsed_version(self, tmp_path, monkeypatch):
+        kwargs, *_ = self._drive_run(monkeypatch, tmp_path)
+
+        assert kwargs["current_version_provider"]() == "0.0.22-test"
+
+    def test_transport_factory_is_passed_through(self, tmp_path, monkeypatch):
+        kwargs, *_ = self._drive_run(monkeypatch, tmp_path)
+
+        # _build_transport_factory was stubbed to return a callable.
+        assert callable(kwargs["transport_factory"])
