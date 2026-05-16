@@ -20,7 +20,7 @@ import types
 
 import pytest
 
-from os_updater.main import _read_current_version, _build_transport_factory
+from os_updater.main import _read_current_version, _build_transport_factory, _CMSWPSTransportAdapter
 
 
 def _write(tmp_path, content: str):
@@ -267,6 +267,36 @@ class TestBuildTransportFactory:
         setattr(settings, missing_field, "")
         with pytest.raises(RuntimeError, match=expected_msg):
             _build_transport_factory(settings)
+
+
+class TestCMSWPSTransportAdapterSend:
+    """Pins that the adapter exposes ``send()`` for outbound traffic.
+
+    The pre-agora#216 bug was that the adapter only implemented
+    ``connect()``/``recv()``/``close()`` (what ``OSUpdaterService``
+    consumes), but :class:`os_updater.events.WpsEventSink` also needs
+    to push lifecycle events back to the CMS over the same transport.
+    The missing ``send()`` made every progress event log
+    ``AttributeError: '_CMSWPSTransportAdapter' object has no attribute 'send'``
+    and silently dropped the entire OTA-progress badge feed.
+    """
+
+    def test_send_delegates_to_underlying_transport(self):
+        sent: list = []
+
+        class _FakeInner:
+            async def send(self, data):
+                sent.append(data)
+
+        adapter = _CMSWPSTransportAdapter(lambda: None)
+        adapter._t = _FakeInner()  # bypass connect()
+        asyncio.run(adapter.send('{"hello":"world"}'))
+        assert sent == ['{"hello":"world"}']
+
+    def test_send_before_connect_raises(self):
+        adapter = _CMSWPSTransportAdapter(lambda: None)
+        with pytest.raises(RuntimeError, match="before connect"):
+            asyncio.run(adapter.send("anything"))
 
 
 # ---------------------------------------------------------------------------
