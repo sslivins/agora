@@ -268,4 +268,9 @@ if [ "$1" = "configure" ]; then
     systemctl restart agora-player || true
     systemctl restart agora-api || true
     systemctl restart agora-cms-client || true
+    # OTA / slot services must restart so hotfixes shipped through APT
+    # actually take effect without a full reboot (see issue #212).
+    # slot-mgr first so os-updater can talk to it on reconnect.
+    systemctl restart agora-slot-mgr || true
+    systemctl restart agora-os-updater || true
 fi
