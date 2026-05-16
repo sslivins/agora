@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -257,16 +258,22 @@ def _safe_emit_progress(
 _PID_OBSERVER_WAIT_S = 5.0
 
 
-def _read_fdinfo_pos(pid: int) -> Optional[int]:
-    """Return the byte position of ``/proc/<pid>/fdinfo/0`` (zstd's stdin).
+def _read_fdinfo_pos(pid: int, fd: int = 0) -> Optional[int]:
+    """Return the byte position of ``/proc/<pid>/fdinfo/<fd>``.
 
     Returns ``None`` if the file is unreadable for any reason (PID gone,
     not on Linux, malformed contents). The poller treats every ``None``
     as "stop polling" — there's nothing to recover from at this layer.
+
+    ``fd`` defaults to 0 (stdin) for back-compat with the original
+    signature, but in practice every caller resolves the real bundle fd
+    via :func:`_resolve_bundle_fd` first and passes it explicitly: zstd
+    invoked with a positional file argument reads from that fd, not
+    stdin, so polling fd 0 never advances (agora#220).
     """
 
     try:
-        with open(f"/proc/{pid}/fdinfo/0", "rt") as f:
+        with open(f"/proc/{pid}/fdinfo/{fd}", "rt") as f:
             for line in f:
                 if line.startswith("pos:"):
                     try:
@@ -278,6 +285,57 @@ def _read_fdinfo_pos(pid: int) -> Optional[int]:
         return None
 
 
+def _resolve_bundle_fd(pid: int, bundle_path: Path) -> Optional[int]:
+    """Find the file descriptor in ``/proc/<pid>/fd/`` that points to ``bundle_path``.
+
+    zstd is invoked as ``zstd -dc -f <bundle_path>`` from
+    :func:`stream_extract_subtree`, so it opens the bundle as a regular
+    fd (≥ 3), **not** stdin. The bytes-progress poller needs that fd's
+    ``pos:`` field to anchor percentage against ``compressed_size``;
+    fd 0 (stdin) is inherited from the python service and never read,
+    so its ``pos:`` stays at 0 for the entire extract — which is why
+    the badge sat at 0% through agora#219's deploy and motivated this
+    fix (agora#220).
+
+    Returns the numeric fd, or ``None`` if:
+
+    * ``/proc/<pid>/fd/`` is unreadable (process gone, non-Linux, denied),
+    * no fd's symlink target matches ``bundle_path`` yet (zstd may not
+      have called ``open()`` at the instant we have its PID — caller
+      retries within ``_PID_OBSERVER_WAIT_S``).
+
+    Match is by string equality between ``os.readlink`` and the
+    absolute (realpath) form of ``bundle_path``. ``/proc/<pid>/fd/N``
+    always shows the canonical path regardless of what relative string
+    zstd was given on argv, so we normalize bundle_path the same way
+    before comparing. Linux appends ``" (deleted)"`` to fd targets
+    after an unlink; we strip that defensively so a mid-extract unlink
+    (only seen in pathological tests) doesn't break resolution.
+    """
+    try:
+        target_str = os.path.realpath(str(bundle_path))
+    except OSError:
+        target_str = str(bundle_path)
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        entries = os.listdir(fd_dir)
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    for fd_name in entries:
+        try:
+            link = os.readlink(f"{fd_dir}/{fd_name}")
+        except OSError:
+            continue
+        if link.endswith(" (deleted)"):
+            link = link[: -len(" (deleted)")]
+        if link == target_str:
+            try:
+                return int(fd_name)
+            except ValueError:
+                continue
+    return None
+
+
 def _poll_extract_progress(
     pid_holder: dict[str, Optional[int]],
     stop_event: threading.Event,
@@ -286,26 +344,40 @@ def _poll_extract_progress(
     *,
     interval_s: float = PROGRESS_MIN_INTERVAL_S,
     pid_wait_deadline_s: float = _PID_OBSERVER_WAIT_S,
-    fdinfo_reader: Callable[[int], Optional[int]] = _read_fdinfo_pos,
+    fdinfo_reader: Optional[Callable[[int], Optional[int]]] = None,
+    bundle_path: Optional[Path] = None,
+    bundle_fd_resolver: Callable[[int, Path], Optional[int]] = _resolve_bundle_fd,
 ) -> None:
-    """Poll ``/proc/<zstd_pid>/fdinfo/0`` and emit bytes-progress.
+    """Poll the fd zstd has open on the bundle and emit bytes-progress.
 
     Runs in a worker thread spawned by :func:`stream_extract_subtree`.
-    Reads the ``pos:`` field of zstd's stdin fdinfo (== compressed
-    bytes consumed from the .tar.zst on disk) at most every
-    ``interval_s`` seconds, then calls ``callback(bytes_read,
-    compressed_size)``.
+    Reads the ``pos:`` field of the zstd fdinfo that corresponds to the
+    bundle file (== compressed bytes consumed from the .tar.zst on
+    disk) at most every ``interval_s`` seconds, then calls
+    ``callback(bytes_read, compressed_size)``.
 
     Exits cleanly when any of these happens, in order of likelihood:
 
     * ``stop_event`` is set by the caller (pipeline completed).
     * fdinfo read returns ``None`` (zstd exited; ``/proc/<pid>/...`` gone).
     * ``pid_holder["pid"]`` is still ``None`` after ``pid_wait_deadline_s``.
+    * No fd matching ``bundle_path`` appears in ``/proc/<pid>/fd/``
+      within ``pid_wait_deadline_s`` after the PID lands (zstd hasn't
+      opened the bundle yet, or the test pipeline_runner synthesized
+      a fake PID — the latter is why every existing unit test injects
+      ``fdinfo_reader`` and bypasses this path).
+
+    When ``fdinfo_reader`` is explicitly passed, the poller uses it
+    directly and skips bundle-fd resolution — that's the test seam.
+    When ``fdinfo_reader`` is ``None`` (production default), the poller
+    resolves the bundle fd lazily via ``bundle_fd_resolver`` and binds
+    a per-fd reader internally.
 
     Callback exceptions are caught — progress is advisory, must not
     take down the extract. Test-only knobs (``interval_s``,
-    ``pid_wait_deadline_s``, ``fdinfo_reader``) are explicit kwargs so
-    unit tests can drive the poller without touching ``/proc``.
+    ``pid_wait_deadline_s``, ``fdinfo_reader``, ``bundle_fd_resolver``)
+    are explicit kwargs so unit tests can drive the poller without
+    touching ``/proc``.
     """
 
     # Wait for the pipeline runner to capture and publish zstd's PID.
@@ -322,8 +394,44 @@ def _poll_extract_progress(
 
     pid = pid_holder["pid"]
     assert pid is not None  # for type narrowing
+
+    # Resolve the reader. Explicit fdinfo_reader (tests) wins. Otherwise
+    # in production wait briefly for zstd to open the bundle and bind a
+    # reader pinned to that fd.
+    reader: Callable[[int], Optional[int]]
+    if fdinfo_reader is not None:
+        reader = fdinfo_reader
+    elif bundle_path is None:
+        # No way to find the right fd — better to emit nothing than to
+        # spam zeros from fd 0 (the bug this rewrite exists to fix).
+        logger.debug(
+            "extract progress poller: no bundle_path supplied; "
+            "skipping (caller will still emit final 100%% on success)"
+        )
+        return
+    else:
+        bundle_fd: Optional[int] = None
+        fd_deadline = time.monotonic() + pid_wait_deadline_s
+        while bundle_fd is None:
+            bundle_fd = bundle_fd_resolver(pid, bundle_path)
+            if bundle_fd is not None:
+                break
+            if stop_event.wait(0.05):
+                return
+            if time.monotonic() > fd_deadline:
+                logger.debug(
+                    "extract progress poller: bundle fd for %s never "
+                    "appeared in /proc/%d/fd within %.2fs",
+                    bundle_path, pid, pid_wait_deadline_s,
+                )
+                return
+        # Late-bind so the lambda captures the resolved fd, not the
+        # name (which would re-resolve through globals on each call).
+        resolved_fd = bundle_fd
+        reader = lambda p: _read_fdinfo_pos(p, resolved_fd)
+
     while not stop_event.is_set():
-        pos = fdinfo_reader(pid)
+        pos = reader(pid)
         if pos is None:
             return
         try:
@@ -948,6 +1056,7 @@ def stream_extract_subtree(
         poll_thread = threading.Thread(
             target=poller,
             args=(pid_holder, stop_event, compressed_size, progress_callback),
+            kwargs={"bundle_path": bundle_path},
             name=f"extract-progress-{subpath}",
             daemon=True,
         )

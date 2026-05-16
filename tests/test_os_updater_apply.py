@@ -1883,6 +1883,7 @@ import threading as _threading
 from os_updater.apply import (
     _poll_extract_progress,
     _read_fdinfo_pos,
+    _resolve_bundle_fd,
     stream_extract_subtree,
 )
 
@@ -2032,6 +2033,300 @@ class TestPollExtractProgress:
             pid_wait_deadline_s=5.0,
             fdinfo_reader=fake_reader,
         )
+
+
+class TestResolveBundleFd:
+    """zstd opens the bundle as a regular fd (not stdin) so the poller
+    has to scan /proc/<pid>/fd/ for the symlink that points back at
+    the bundle path. Real /proc is Linux-only; tests inject fakes
+    only by monkeypatching os.listdir / os.readlink for full coverage
+    of the matching logic."""
+
+    def test_finds_matching_fd(self, tmp_path, monkeypatch):
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.touch()
+
+        monkeypatch.setattr(
+            "os_updater.apply.os.listdir",
+            lambda p: ["0", "1", "2", "3", "4"],
+        )
+
+        def fake_readlink(p: str) -> str:
+            # /proc/<pid>/fd/3 points at the bundle. Others are noise.
+            return {
+                "0": "/dev/null",
+                "1": "pipe:[123]",
+                "2": "pipe:[124]",
+                "3": str(bundle),
+                "4": "/tmp/something-else",
+            }[p.rsplit("/", 1)[-1]]
+
+        monkeypatch.setattr("os_updater.apply.os.readlink", fake_readlink)
+
+        assert _resolve_bundle_fd(1234, bundle) == 3
+
+    def test_returns_none_when_no_fd_matches(self, tmp_path, monkeypatch):
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.touch()
+        monkeypatch.setattr(
+            "os_updater.apply.os.listdir",
+            lambda p: ["0", "1", "2"],
+        )
+        monkeypatch.setattr(
+            "os_updater.apply.os.readlink",
+            lambda p: "/dev/null",
+        )
+        assert _resolve_bundle_fd(1234, bundle) is None
+
+    def test_returns_none_when_proc_unreadable(self, tmp_path, monkeypatch):
+        bundle = tmp_path / "bundle.tar.zst"
+
+        def boom(_p):
+            raise FileNotFoundError("/proc/1234/fd")
+
+        monkeypatch.setattr("os_updater.apply.os.listdir", boom)
+        assert _resolve_bundle_fd(1234, bundle) is None
+
+    def test_strips_deleted_suffix(self, tmp_path, monkeypatch):
+        """Linux appends ``" (deleted)"`` after the underlying file is
+        unlinked while still open. Defensive: still match."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.touch()
+        monkeypatch.setattr(
+            "os_updater.apply.os.listdir",
+            lambda p: ["3"],
+        )
+        monkeypatch.setattr(
+            "os_updater.apply.os.readlink",
+            lambda p: f"{bundle} (deleted)",
+        )
+        assert _resolve_bundle_fd(1234, bundle) == 3
+
+    def test_skips_unreadable_individual_fd(self, tmp_path, monkeypatch):
+        """One bad readlink shouldn't abort the whole scan."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.touch()
+        monkeypatch.setattr(
+            "os_updater.apply.os.listdir",
+            lambda p: ["3", "4"],
+        )
+
+        def fake_readlink(p: str) -> str:
+            if p.endswith("/3"):
+                raise OSError("permission denied on this one")
+            return str(bundle)
+
+        monkeypatch.setattr("os_updater.apply.os.readlink", fake_readlink)
+        assert _resolve_bundle_fd(1234, bundle) == 4
+
+    def test_matches_via_realpath_when_bundle_path_relative(
+        self, tmp_path, monkeypatch
+    ):
+        """``/proc/<pid>/fd/N`` always reports the absolute canonical
+        path, even if zstd was invoked with a relative path. The
+        resolver must normalize the caller's bundle_path the same way
+        before comparing or the match silently fails on disk layouts
+        where the working dir != the bundle's dir."""
+        from pathlib import Path as _P
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.touch()
+        # Pretend the caller passed a relative path (zstd would
+        # internally resolve to absolute; /proc reports the absolute).
+        rel_view = _P(bundle.name)
+        abs_view = str(bundle)
+
+        monkeypatch.setattr(
+            "os_updater.apply.os.path.realpath",
+            lambda p: abs_view if str(p) == str(rel_view) else os.path.realpath(p),
+        )
+        monkeypatch.setattr(
+            "os_updater.apply.os.listdir",
+            lambda p: ["3"],
+        )
+        monkeypatch.setattr(
+            "os_updater.apply.os.readlink",
+            lambda p: abs_view,
+        )
+        assert _resolve_bundle_fd(1234, rel_view) == 3
+
+
+class TestPollExtractProgressBundleFdResolution:
+    """When no explicit ``fdinfo_reader`` is supplied (the production
+    code path since agora#220), the poller resolves which fd zstd is
+    reading the bundle from before it starts polling. These tests drive
+    that resolution via the ``bundle_fd_resolver`` test seam."""
+
+    def test_uses_resolver_to_pick_fd_and_reads_that_fdinfo(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: resolver returns fd 5, then the poller reads
+        /proc/<pid>/fdinfo/5 (not /fdinfo/0 — the bug)."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.touch()
+        calls: list[tuple[int, int]] = []
+
+        # Intercept what fd _read_fdinfo_pos is called with by faking
+        # the open() that it does.
+        opens_seen: list[str] = []
+
+        class FakeFile:
+            def __init__(self, content: str) -> None:
+                self._content = content
+            def __iter__(self):
+                return iter(self._content.splitlines(keepends=True))
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+
+        reads_by_fd: dict[int, list[int]] = {5: [100, 200]}
+
+        def fake_open(path: str, *args, **kwargs):
+            opens_seen.append(path)
+            # parse fd out of /proc/<pid>/fdinfo/<fd>
+            fd_num = int(path.rsplit("/", 1)[-1])
+            try:
+                pos = reads_by_fd[fd_num].pop(0)
+            except (KeyError, IndexError):
+                raise FileNotFoundError(path)
+            return FakeFile(f"pos:\t{pos}\nflags:\t0\n")
+
+        monkeypatch.setattr("builtins.open", fake_open)
+
+        stop = _threading.Event()
+        pid_holder: dict[str, int] = {"pid": 1234}
+
+        def resolver(_pid: int, _bundle: "Path") -> int:
+            return 5
+
+        def cb(d: int, t: int) -> None:
+            calls.append((d, t))
+            if len(calls) == 2:
+                stop.set()
+
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=1000,
+            callback=cb,
+            interval_s=0.001,
+            pid_wait_deadline_s=0.5,
+            bundle_path=bundle,
+            bundle_fd_resolver=resolver,
+        )
+
+        assert calls == [(100, 1000), (200, 1000)]
+        # CRITICAL: fdinfo/5 was read, NOT fdinfo/0. That's the
+        # regression guard for the agora#220 fix.
+        assert all(p.endswith("/fdinfo/5") for p in opens_seen)
+        assert not any(p.endswith("/fdinfo/0") for p in opens_seen)
+
+    def test_returns_immediately_when_no_bundle_path(self):
+        """In production we'd never hit this (stream_extract_subtree
+        always passes bundle_path), but if a caller does forget, the
+        poller emits NOTHING rather than falling back to the buggy
+        fd-0 read."""
+        calls: list[tuple[int, int]] = []
+        stop = _threading.Event()
+        pid_holder: dict[str, int] = {"pid": 1234}
+
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=1000,
+            callback=lambda d, t: calls.append((d, t)),
+            interval_s=0.001,
+            pid_wait_deadline_s=0.1,
+            # No fdinfo_reader, no bundle_path.
+        )
+
+        assert calls == []
+
+    def test_bails_when_bundle_fd_never_appears(self, tmp_path):
+        """zstd had its PID published but never actually opened the
+        bundle (test pipeline_runner with a synthetic PID, or zstd
+        died on argv parse before open() — either way the resolver
+        keeps returning None). Bail within deadline, no callbacks."""
+        bundle = tmp_path / "bundle.tar.zst"
+        calls: list[tuple[int, int]] = []
+        stop = _threading.Event()
+        pid_holder: dict[str, int] = {"pid": 1234}
+
+        def resolver(_pid, _bundle):
+            return None  # never resolves
+
+        import time as _time
+        t0 = _time.monotonic()
+        _poll_extract_progress(
+            pid_holder,
+            stop,
+            compressed_size=1000,
+            callback=lambda d, t: calls.append((d, t)),
+            interval_s=0.01,
+            pid_wait_deadline_s=0.15,
+            bundle_path=bundle,
+            bundle_fd_resolver=resolver,
+        )
+        elapsed = _time.monotonic() - t0
+        assert calls == []
+        assert elapsed < 1.0
+
+    def test_resolver_lazy_retry_until_fd_appears(self, tmp_path):
+        """zstd may not have called open() yet at the instant we have
+        its PID. The resolver should be polled until the fd materializes
+        (or the deadline expires)."""
+        bundle = tmp_path / "bundle.tar.zst"
+        bundle.touch()
+        calls: list[tuple[int, int]] = []
+        stop = _threading.Event()
+        pid_holder: dict[str, int] = {"pid": 1234}
+
+        attempts = {"n": 0}
+
+        def slow_resolver(_pid, _bundle):
+            attempts["n"] += 1
+            return 7 if attempts["n"] >= 3 else None
+
+        # We don't care about real fdinfo reads here — patch the reader
+        # by going through the explicit fdinfo_reader seam is not what
+        # we want (it bypasses resolution). Instead, monkeypatch the
+        # module-level _read_fdinfo_pos via a wrapping reader.
+        # Trick: hook through bundle_fd_resolver returning a known fd,
+        # then patch __builtins__.open inside the poller via... easier
+        # to drive end-to-end with builtins.open monkeypatch.
+        import builtins as _b
+        real_open = _b.open
+
+        class FakeFile:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def __iter__(self): return iter(["pos:\t999\n"])
+
+        def fake_open(path, *args, **kwargs):
+            if isinstance(path, str) and path.startswith("/proc/"):
+                if path.endswith("/fdinfo/7"):
+                    stop.set()  # one emit is enough
+                    return FakeFile()
+                raise FileNotFoundError(path)
+            return real_open(path, *args, **kwargs)
+
+        _b.open = fake_open
+        try:
+            _poll_extract_progress(
+                pid_holder,
+                stop,
+                compressed_size=1000,
+                callback=lambda d, t: calls.append((d, t)),
+                interval_s=0.001,
+                pid_wait_deadline_s=0.5,
+                bundle_path=bundle,
+                bundle_fd_resolver=slow_resolver,
+            )
+        finally:
+            _b.open = real_open
+
+        assert attempts["n"] >= 3, f"resolver retried only {attempts['n']}x"
+        assert calls == [(999, 1000)]
 
 
 class TestStreamExtractSubtreeProgressIntegration:
