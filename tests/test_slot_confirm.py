@@ -167,6 +167,24 @@ class TestCheckAgoraServicesActive:
         assert "60s" in result.detail
         assert result.measurement["active_for_seconds"] == pytest.approx(60.0)
 
+    def test_too_young_emits_not_yet_aged_reason(self) -> None:
+        # Bug #209: the "services are up but haven't reached the ≥5 min
+        # threshold yet" branch must tag its measurement with
+        # ``reason="not_yet_aged"`` so the aggregator can defer (retry)
+        # rather than strike a slot during the normal boot race. Other
+        # failure modes (inactive unit, missing timestamp, negative age)
+        # do NOT carry this reason and continue to strike.
+        now = _fixed_now(0)
+        entered = (now - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S UTC")
+        runner = _systemctl_runner(
+            {svc: ("active", entered) for svc in DEFAULT_AGORA_SERVICES}
+        )
+        result = check_agora_services_active(
+            runner=runner, now_fn=lambda: now, min_active_seconds=300
+        )
+        assert result.ok is False
+        assert result.measurement.get("reason") == "not_yet_aged"
+
     def test_missing_timestamp_fails(self) -> None:
         now = _fixed_now(0)
         runner = _systemctl_runner(
@@ -610,6 +628,19 @@ def _fail_check(name: str) -> CheckResult:
     return CheckResult(name=name, ok=False, detail="bad")
 
 
+def _services_not_yet_aged_check() -> CheckResult:
+    # Mirrors the shape produced by check_agora_services_active when
+    # an agora-* unit is Active but hasn't met the ≥5 min threshold
+    # yet. The aggregator branches on measurement["reason"], so the
+    # rest of the fields are illustrative only.
+    return CheckResult(
+        name="agora_services_active",
+        ok=False,
+        detail="agora-api has been active for 120s, need ≥300s",
+        measurement={"reason": "not_yet_aged", "active_for_seconds": 120.0},
+    )
+
+
 class TestSlotConfirm:
     def test_skipped_when_not_tentative(self) -> None:
         status = slot_confirm(
@@ -678,6 +709,39 @@ class TestSlotConfirm:
         assert status.ok is False
         assert status.next_action == "strike"
         assert sum(1 for c in status.checks if not c.ok) == 2
+
+    def test_not_yet_aged_defers_aggregator(self) -> None:
+        # Bug #209: when the *only* failing check is agora-* services
+        # not having met their ≥5 min Active threshold yet, the gate
+        # must defer (retry) rather than strike. The other 3 checks
+        # all pass so the discriminator is unambiguous.
+        status = slot_confirm(
+            slot_state_fn=lambda: FakeStatus(running_slot=2, default_slot=1, tentative=True),
+            agora_service_fn=_services_not_yet_aged_check,
+            framebuffer_fn=lambda: _ok_check("framebuffer"),
+            data_writable_fn=lambda: _ok_check("data_writable"),
+            wps_connected_fn=lambda: _ok_check("wps_connected"),
+        )
+        assert status.ok is False
+        assert status.next_action == "deferred"
+        assert status.running_slot == 2
+        assert status.tentative is True
+
+    def test_not_yet_aged_plus_other_failure_strikes(self) -> None:
+        # "Only failure is services-not-yet-aged" is the *only* case
+        # that defers. If anything else is failing alongside it, that
+        # other failure is a real red flag and we strike. Pairs with
+        # ``_only_services_not_yet_aged``'s "every failing check must
+        # match" semantics.
+        status = slot_confirm(
+            slot_state_fn=lambda: FakeStatus(running_slot=2, default_slot=1, tentative=True),
+            agora_service_fn=_services_not_yet_aged_check,
+            framebuffer_fn=lambda: _fail_check("framebuffer"),
+            data_writable_fn=lambda: _ok_check("data_writable"),
+            wps_connected_fn=lambda: _ok_check("wps_connected"),
+        )
+        assert status.ok is False
+        assert status.next_action == "strike"
 
     def test_runs_all_4_checks_in_order(self) -> None:
         order: list[str] = []
@@ -840,6 +904,29 @@ class TestCli:
             rc, payload = self._capture(["--auto"])
         assert rc == 0
         assert payload["action_taken"] == "skipped"
+        assert payload["action_error"] == ""
+
+    def test_auto_deferred_exits_75(self) -> None:
+        # Bug #209: ``--auto`` must exit 75 (EX_TEMPFAIL) when the
+        # gate defers, so systemd's ``Restart=on-failure`` retries
+        # the unit rather than treating the deferral as a clean
+        # one-shot success. Neither promote nor strike may be
+        # called: a deferred slot is one we have not yet decided
+        # about, and burning a strike on a transient boot-race
+        # condition is exactly the bug this fix prevents.
+        deferred_status = ConfirmStatus(
+            ok=False, next_action="deferred", running_slot=2, tentative=True
+        )
+        fake_mgr = SimpleNamespace(
+            promote_slot=lambda slot: pytest.fail("noop"),
+            record_tryboot_strike=lambda slot, *, reason: pytest.fail("noop"),
+        )
+        with patch.object(cli, "slot_confirm", return_value=deferred_status), patch.dict(
+            sys.modules, {"slot_mgr": fake_mgr}
+        ):
+            rc, payload = self._capture(["--auto"])
+        assert rc == 75
+        assert payload["action_taken"] == "deferred"
         assert payload["action_error"] == ""
 
     def test_auto_error_exits_2(self) -> None:
