@@ -190,6 +190,19 @@ class _CMSWPSTransportAdapter:
             )
         return obj
 
+    async def send(self, data) -> None:
+        """Forward outbound payloads to the underlying cms_client transport.
+
+        Used by :class:`os_updater.events.WpsEventSink` to emit lifecycle
+        events back to the CMS over the same websocket the service uses
+        to receive dispatch messages.  Delegates to ``self._t.send`` which
+        is the live :class:`cms_client.transport._Transport` (Direct or
+        WPS-enveloped). agora#216.
+        """
+        if self._t is None:
+            raise RuntimeError("transport.send() called before connect()")
+        await self._t.send(data)
+
     async def close(self) -> None:
         if self._t is not None:
             try:
