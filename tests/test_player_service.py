@@ -1,8 +1,9 @@
 """Tests for player service — pipeline selection logic."""
 
 import sys
+import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock, call
+from unittest.mock import ANY, MagicMock, patch, PropertyMock, call
 
 import pytest
 
@@ -24,7 +25,8 @@ def player():
         p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
         p.pipeline = None
         p._mpv_process = None
-        p._cage_process = None
+        p._sway_process = None
+        p._sway_scope_unit = None
         p.current_desired = None
         p._plymouth_quit = False
         p._current_path = None
@@ -56,7 +58,8 @@ def mpv_player():
         p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
         p.pipeline = None
         p._mpv_process = None
-        p._cage_process = None
+        p._sway_process = None
+        p._sway_scope_unit = None
         p.current_desired = None
         p._plymouth_quit = False
         p._current_path = None
@@ -1420,7 +1423,7 @@ class TestDisplayDetection:
         )
         write_state(state_file, initial)
 
-        # Splash: no GStreamer pipeline, no mpv or cage process.
+        # Splash: no GStreamer pipeline, no mpv or sway process.
         player.pipeline = None
         player.current_desired = DesiredState(mode=PlaybackMode.SPLASH)
         self._mock_probe(player, [("HDMI-0", True)])
@@ -2799,7 +2802,7 @@ class TestMutePolicy:
              patch.object(mpv_player, "_update_current"), \
              patch.object(mpv_player, "_teardown"), \
              patch.object(mpv_player, "_quit_plymouth"), \
-             patch.object(mpv_player, "_stop_cage"), \
+             patch.object(mpv_player, "_stop_sway"), \
              patch("player.service.subprocess") as mock_subprocess:
             mock_popen = MagicMock()
             mock_popen.pid = 999
@@ -2988,42 +2991,251 @@ class TestChromiumLowMemFlags:
         assert any(f.startswith("--js-flags=") and "max-old-space-size" in f for f in flags)
         assert any(f.startswith("--disable-features=") and "site-per-process" in f for f in flags)
 
-    def test_start_cage_applies_flags_on_zero2w(self, player, svc_module):
-        """On Zero 2 W the low-mem flag set is injected into the cage command."""
+    def test_start_sway_applies_flags_on_zero2w(self, player, svc_module, tmp_path):
+        """On Zero 2 W the low-mem flag set is injected into the sway config."""
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
         with patch.object(svc_module, "get_board", return_value=svc_module.Board.ZERO_2W), \
-             patch.object(player, "_stop_cage"), \
+             patch.object(player, "_stop_sway"), \
              patch.object(player, "_teardown"), \
              patch.object(player, "_update_current"), \
-             patch("player.service.subprocess.Popen") as mock_popen, \
-             patch("player.service.os.makedirs"):
+             patch.object(type(player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen") as mock_popen:
             mock_popen.return_value = MagicMock()
-            player._start_cage("https://example.com")
+            player._start_sway("https://example.com")
 
-        args, _ = mock_popen.call_args
-        cmd = args[0]
-        assert "--no-memcheck" in cmd
-        assert "--process-per-site" in cmd
-        assert "--disable-gpu" in cmd
+        body = conf_path.read_text()
+        assert "--no-memcheck" in body
+        assert "--process-per-site" in body
+        assert "--disable-gpu" in body
 
-    def test_start_cage_omits_flags_on_pi5(self, mpv_player, svc_module):
-        """On Pi 5 the low-mem flag set is NOT applied."""
+    def test_start_sway_omits_flags_on_pi5(self, mpv_player, svc_module, tmp_path):
+        """On Pi 5 the low-mem flag set is NOT applied to the sway config."""
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
         with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
-             patch.object(mpv_player, "_stop_cage"), \
+             patch.object(mpv_player, "_stop_sway"), \
              patch.object(mpv_player, "_teardown"), \
              patch.object(mpv_player, "_update_current"), \
-             patch("player.service.subprocess.Popen") as mock_popen, \
-             patch("player.service.os.makedirs"):
+             patch.object(type(mpv_player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(mpv_player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen") as mock_popen:
             mock_popen.return_value = MagicMock()
-            mpv_player._start_cage("https://example.com")
+            mpv_player._start_sway("https://example.com")
+
+        body = conf_path.read_text()
+        assert "--no-memcheck" not in body
+        assert "--process-per-site" not in body
+        assert "--disable-gpu" not in body
+        # Baseline flags still present
+        assert "--kiosk" in body
+        assert "https://example.com" in body
+
+
+class TestSwayRenderer:
+    """Tests for the sway+chromium webpage-rendering path.
+
+    Covers config rendering, the systemd-run scope wrapping (so the
+    cgroup tears down double-forked chromium grandchildren), the
+    teardown contract, and the lifecycle edge cases (idempotent stop,
+    stop-old-on-start, Popen-exception splash fallback).
+    """
+
+    @pytest.fixture
+    def svc_module(self):
+        with patch.dict("sys.modules", {
+            "gi": MagicMock(),
+            "gi.repository": MagicMock(),
+        }):
+            import importlib
+            import player.service as svc
+            importlib.reload(svc)
+            yield svc
+
+    def test_start_sway_writes_config_with_url(self, mpv_player, svc_module, tmp_path):
+        """Rendered config contains the URL, kiosk flags, and hide_cursor."""
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
+             patch.object(mpv_player, "_stop_sway"), \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(type(mpv_player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(mpv_player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = MagicMock()
+            mpv_player._start_sway("https://example.com/page")
+
+        body = conf_path.read_text()
+        assert "https://example.com/page" in body
+        assert "--kiosk" in body
+        assert "seat * hide_cursor 1" in body
+        assert 'for_window [shell=".*"] fullscreen enable, border none' in body
+
+    def test_start_sway_shell_quotes_url(self, mpv_player, svc_module, tmp_path):
+        """URLs with sh metacharacters must be properly quoted in the exec line.
+
+        Sway runs ``exec`` lines through ``/bin/sh -c``, so unquoted ``&``,
+        ``;``, ``#``, ``$``, ``"`` or ``'`` in a URL would break parsing
+        and could detach a background process or comment out the URL.
+        """
+        import shlex as _shlex
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
+        tricky = "https://example.com/p?a=1&b=2;c=3#frag&q=$x\"y'z"
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
+             patch.object(mpv_player, "_stop_sway"), \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(type(mpv_player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(mpv_player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = MagicMock()
+            mpv_player._start_sway(tricky)
+
+        body = conf_path.read_text()
+        exec_line = [ln for ln in body.splitlines() if ln.startswith("exec ")][0]
+        assert _shlex.quote(tricky) in exec_line
+
+    def test_start_sway_sets_xdg_runtime_dir(self, mpv_player, svc_module, tmp_path):
+        """XDG_RUNTIME_DIR points at the 0o700 runtime dir; dir is created at 0o700."""
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
+             patch.object(mpv_player, "_stop_sway"), \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(type(mpv_player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(mpv_player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = MagicMock()
+            mpv_player._start_sway("https://example.com")
+
+        _, kwargs = mock_popen.call_args
+        assert kwargs["env"]["XDG_RUNTIME_DIR"] == str(runtime_dir)
+        assert runtime_dir.is_dir()
+        # Mode check is best-effort: Windows mkdir doesn't honor mode bits.
+        if sys.platform != "win32":
+            assert (runtime_dir.stat().st_mode & 0o777) == 0o700
+
+    def test_start_sway_uses_systemd_run_scope(self, mpv_player, svc_module, tmp_path):
+        """Popen argv must wrap sway in a transient systemd scope (M1 cgroup fix).
+
+        The cgroup-tracking scope is what reaches double-forked chromium
+        grandchildren that escape sway's own pgrp; a regression here would
+        leak chromium to init on hung-renderer cleanup.
+        """
+        import re
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
+             patch.object(mpv_player, "_stop_sway"), \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(type(mpv_player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(mpv_player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = MagicMock()
+            mpv_player._start_sway("https://example.com")
 
         args, _ = mock_popen.call_args
         cmd = args[0]
-        assert "--no-memcheck" not in cmd
-        assert "--process-per-site" not in cmd
-        assert "--disable-gpu" not in cmd
-        # Baseline flags still present
-        assert "--kiosk" in cmd
-        assert "https://example.com" in cmd
+        assert cmd[0:4] == ["systemd-run", "--scope", "--quiet", "--unit"]
+        assert re.fullmatch(r"agora-sway-[0-9a-f]{8}\.scope", cmd[4])
+        assert cmd[5:9] == ["--collect", "sway", "-c", str(conf_path)]
+        assert mpv_player._sway_scope_unit == cmd[4]
+
+    def test_stop_sway_uses_systemctl_stop(self, mpv_player, svc_module):
+        """_stop_sway must call systemctl stop on the scope unit."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = None
+        mock_proc.wait.return_value = 0
+        mpv_player._sway_process = mock_proc
+        mpv_player._sway_scope_unit = "agora-sway-abcdef01.scope"
+
+        with patch("player.service.subprocess.run") as mock_run:
+            mpv_player._stop_sway()
+
+        mock_run.assert_any_call(
+            ["systemctl", "stop", "agora-sway-abcdef01.scope"],
+            timeout=8, check=False,
+            stdout=ANY, stderr=ANY,
+        )
+        assert mpv_player._sway_process is None
+        assert mpv_player._sway_scope_unit is None
+
+    def test_stop_sway_kills_on_systemctl_stop_timeout(self, mpv_player, svc_module):
+        """When proc.wait times out after systemctl stop, fall back to systemctl kill."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.poll.return_value = None
+        # First wait times out (forcing the kill path), second wait returns.
+        mock_proc.wait.side_effect = [subprocess.TimeoutExpired("sway", 5), 0]
+        mpv_player._sway_process = mock_proc
+        mpv_player._sway_scope_unit = "agora-sway-deadbeef.scope"
+
+        with patch("player.service.subprocess.run") as mock_run:
+            mpv_player._stop_sway()
+
+        kill_calls = [
+            c for c in mock_run.call_args_list
+            if c.args and c.args[0][:2] == ["systemctl", "kill"]
+        ]
+        assert kill_calls, "expected systemctl kill -s SIGKILL fallback"
+        assert kill_calls[0].args[0] == [
+            "systemctl", "kill", "-s", "SIGKILL", "agora-sway-deadbeef.scope",
+        ]
+
+    def test_stop_sway_is_noop_when_not_running(self, mpv_player, svc_module):
+        """Calling _stop_sway with no live process must not call systemctl."""
+        mpv_player._sway_process = None
+        mpv_player._sway_scope_unit = None
+        with patch("player.service.subprocess.run") as mock_run:
+            mpv_player._stop_sway()  # must not raise
+        mock_run.assert_not_called()
+        assert mpv_player._sway_process is None
+        assert mpv_player._sway_scope_unit is None
+
+    def test_start_sway_stops_previous_instance(self, mpv_player, svc_module, tmp_path):
+        """Each _start_sway must tear down a prior instance first."""
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
+             patch.object(mpv_player, "_stop_sway") as mock_stop, \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_update_current"), \
+             patch.object(type(mpv_player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(mpv_player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = MagicMock()
+            mpv_player._start_sway("https://example.com/a")
+            mpv_player._start_sway("https://example.com/b")
+        assert mock_stop.call_count == 2
+
+    def test_start_sway_popen_exception_shows_splash(self, mpv_player, svc_module, tmp_path):
+        """When systemd-run Popen raises, fall back to splash and clear state."""
+        runtime_dir = tmp_path / "run"
+        conf_path = runtime_dir / "sway.conf"
+        with patch.object(svc_module, "get_board", return_value=svc_module.Board.PI_5), \
+             patch.object(mpv_player, "_stop_sway"), \
+             patch.object(mpv_player, "_teardown"), \
+             patch.object(mpv_player, "_update_current") as mock_update, \
+             patch.object(mpv_player, "_show_splash") as mock_splash, \
+             patch.object(type(mpv_player), "_SWAY_RUNTIME_DIR", str(runtime_dir)), \
+             patch.object(type(mpv_player), "_SWAY_CONFIG_PATH", str(conf_path)), \
+             patch("player.service.subprocess.Popen", side_effect=OSError("nope")):
+            mpv_player._start_sway("https://example.com")
+
+        mock_splash.assert_called_once()
+        assert mpv_player._sway_process is None
+        assert mpv_player._sway_scope_unit is None
+        error_calls = [
+            c for c in mock_update.call_args_list
+            if c.kwargs.get("error") and "Sway startup failed" in c.kwargs["error"]
+        ]
+        assert error_calls, "expected an error-bearing _update_current call"
 
 
 class TestSplashConfigWatch:

@@ -33,7 +33,8 @@ def mpv_player(tmp_path):
         p = svc.AgoraPlayer.__new__(svc.AgoraPlayer)
         p.pipeline = None
         p._mpv_process = None
-        p._cage_process = None
+        p._sway_process = None
+        p._sway_scope_unit = None
         p.current_desired = None
         p._plymouth_quit = False
         p._current_path = None
@@ -509,7 +510,7 @@ class TestScheduledLoopCountIpcDriven:
             "entry_id": 1, "generation": 1, "asset_name": "a.mp4",
             "target_count": 5, "completed_count": 2,
         }
-        player._stop_cage = MagicMock()
+        player._stop_sway = MagicMock()
         player._find_splash = MagicMock(return_value=None)
         svc.AgoraPlayer._show_splash(player)
         assert player._scheduled_pending is None

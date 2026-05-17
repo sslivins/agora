@@ -24,7 +24,7 @@ Depends: python3 (>= 3.11),
  dnsmasq,
  avahi-daemon,
  mpv,
- cage,
+ sway,
  chromium
 Recommends: gstreamer1.0-v4l2
 Maintainer: sslivins

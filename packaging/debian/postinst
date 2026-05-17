@@ -107,21 +107,14 @@ if command -v plymouth-set-default-theme &>/dev/null; then
     plymouth-set-default-theme splash 2>/dev/null || true
 fi
 
-# ── Transparent cursor for Cage (webpage rendering) ──
-# Cage/wlroots renders its own compositor cursor using Adwaita theme files.
-# Overwrite them with a pre-built transparent cursor shipped in the package.
-ADWAITA_DIR="/usr/share/icons/Adwaita/cursors"
-BLANK_CURSOR="${AGORA_BASE}/src/player/extensions/hide-cursor/blank_cursor"
-if [ -d "${ADWAITA_DIR}" ] && [ -f "${BLANK_CURSOR}" ]; then
-    if [ ! -f "${ADWAITA_DIR}/.agora-backup-done" ]; then
-        cp -a "${ADWAITA_DIR}" "${ADWAITA_DIR}.bak" 2>/dev/null || true
-        touch "${ADWAITA_DIR}/.agora-backup-done"
-    fi
-    for cursor_file in "${ADWAITA_DIR}"/*; do
-        [ -f "${cursor_file}" ] && [ "$(basename "${cursor_file}")" != ".agora-backup-done" ] && \
-            cp "${BLANK_CURSOR}" "${cursor_file}"
-    done
-    echo "Agora: installed transparent cursors for Cage/Wayland kiosk mode"
+# ── Mark legacy cage as auto-installed so apt autoremove can drop it ──
+# Cage was replaced by sway as the webpage-rendering compositor; existing
+# devices keep cage installed forever otherwise. Flipping the auto/manual
+# bit lets the next `apt autoremove` clean it up without forcing the
+# removal here. Held packages are unaffected — `apt-mark hold` and
+# `apt-mark auto` are orthogonal.
+if dpkg -s cage >/dev/null 2>&1; then
+    apt-mark auto cage >/dev/null 2>&1 || true
 fi
 
 # ── Kernel command line: quiet boot + splash ──
