@@ -17,9 +17,10 @@ Implementation notes (Phase 2):
   atomic rename onto the final path.
 * No HTTP Range / resume in v1. A partial download from a previous crash
   is reaped by the service's 24h on-boot staging sweeper (see
-  :mod:`os_updater.service`). The Range-resume contract in the
-  ``Downloader`` protocol docstring is aspirational; revisit if real
-  bandwidth-constrained installs start failing repeatedly.
+  :meth:`os_updater.service.OSUpdaterService.sweep_stale_staging`). The
+  Range-resume contract in the ``Downloader`` protocol docstring is
+  aspirational; revisit if real bandwidth-constrained installs start
+  failing repeatedly.
 * HTTP errors (non-200), aiohttp ``ClientError``, and local ``OSError``
   are all wrapped in :class:`BundleDownloadError` (a :class:`BundleError`
   subclass) so the service's :meth:`OSUpdaterService._classify_failure`

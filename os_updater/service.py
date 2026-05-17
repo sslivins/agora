@@ -52,6 +52,7 @@ import asyncio
 import logging
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
@@ -87,6 +88,21 @@ from os_updater.state import (
 #: subdirectory named after ``release_id``. Lives on ``/data`` so it
 #: survives slot switches.
 DEFAULT_STAGING_ROOT = Path("/data/.update/staging")
+
+#: TTL for stale per-dispatch staging dirs reaped on daemon start.
+#: The happy-path cleanup in :meth:`OSUpdaterService.continue_after_promote`
+#: removes the staging dir as soon as forward migrations succeed; this
+#: sweep is the safety net that mops up everything else (failed
+#: updates, crashes mid-download, abandoned tryboot dirs) so ``/data``
+#: doesn't accumulate orphaned bundles forever.
+STAGING_SWEEP_TTL_SECONDS: float = 24 * 60 * 60
+
+#: Allowed prefix for the resolved staging root. The sweep refuses to
+#: operate if :attr:`staging_root` resolves outside this prefix, which
+#: blocks a symlink-based attack that would otherwise let a botched
+#: migration redirect the root-owned sweeper at the wrong tree. Tests
+#: override via the ``staging_sweep_allowed_prefix`` kwarg.
+DEFAULT_STAGING_SWEEP_ALLOWED_PREFIX = "/data/"
 
 #: Initial / max reconnect backoff in seconds for the WPS connection.
 #: Mirrors the existing cms_client transport behavior.
@@ -323,6 +339,8 @@ class OSUpdaterService:
         staging_root: Path = DEFAULT_STAGING_ROOT,
         migration_sentinel_path: Optional[Path] = None,
         promote_handshake_tick_sec: float = _PROMOTE_HANDSHAKE_TICK_SEC,
+        staging_sweep_ttl_sec: float = STAGING_SWEEP_TTL_SECONDS,
+        staging_sweep_allowed_prefix: str = DEFAULT_STAGING_SWEEP_ALLOWED_PREFIX,
     ) -> None:
         self.transport_factory = transport_factory
         self.event_sink: EventSink = event_sink or OutboxEventSink()
@@ -335,6 +353,8 @@ class OSUpdaterService:
         self.staging_root = staging_root
         self.migration_sentinel_path = migration_sentinel_path
         self._promote_handshake_tick_sec = promote_handshake_tick_sec
+        self.staging_sweep_ttl_sec = staging_sweep_ttl_sec
+        self.staging_sweep_allowed_prefix = staging_sweep_allowed_prefix
         self.state: UpdaterState = load_state(self.state_path)
         # Phase 2 / agora#215: the per-reconnect WPS transport, set by
         # :meth:`run` after every successful ``transport_factory()`` +
@@ -350,9 +370,9 @@ class OSUpdaterService:
     # -- public API used by tests and the run loop --------------------------
 
     def recover_on_start(self) -> None:
-        """Reset the FSM on daemon startup if we crashed mid-dispatch.
+        """Reset the FSM on daemon startup AND sweep stale staging dirs.
 
-        Three cases:
+        FSM reset (three cases):
 
         * ``idle`` / ``failed`` — nothing to do.
         * ``tryboot_running`` — this is the normal post-reboot resumption
@@ -363,13 +383,22 @@ class OSUpdaterService:
           the next dispatch arriving moves us back to ``DOWNLOADING``,
           per :data:`LEGAL_TRANSITIONS`. Emit a ``failed`` lifecycle
           event so the CMS sees what happened.
+
+        Then runs :meth:`sweep_stale_staging` so the 24h-TTL filesystem
+        reaper executes once per daemon start — failures intentionally
+        leave the staging dir on disk for forensics, and this sweep is
+        the safety net that keeps ``/data`` from accumulating orphaned
+        bundles forever. Sweep errors are logged and swallowed; the FSM
+        reset is the primary responsibility of this method.
         """
 
         s = self.state
         if s.fsm in (UpdaterFSMState.IDLE, UpdaterFSMState.FAILED):
+            self._safe_sweep_stale_staging()
             return
         if s.fsm is UpdaterFSMState.TRYBOOT_RUNNING:
             # Normal post-tryboot wake — leave alone for slot-confirm.
+            self._safe_sweep_stale_staging()
             return
 
         prior = s.fsm.value
@@ -383,6 +412,120 @@ class OSUpdaterService:
             reason=reason,
             state_path=self.state_path,
         )
+        self._safe_sweep_stale_staging()
+
+    def _safe_sweep_stale_staging(self) -> None:
+        """Run :meth:`sweep_stale_staging` with errors logged-and-swallowed.
+
+        The FSM-reset half of :meth:`recover_on_start` is the contract
+        the rest of the daemon depends on; a sweep failure must not
+        prevent daemon startup.
+        """
+
+        try:
+            self.sweep_stale_staging()
+        except Exception:
+            log.exception("staging sweep failed; continuing daemon startup")
+
+    def sweep_stale_staging(self) -> None:
+        """Reap stale per-dispatch staging dirs left behind by failures.
+
+        Iterates :attr:`staging_root` and removes any entry whose mtime
+        is older than :attr:`staging_sweep_ttl_sec` (24h default). The
+        active dispatch's staging dir (``self.state.staging_dir``) is
+        skipped defensively. This is load-bearing for tryboot wakes
+        (FSM == ``TRYBOOT_RUNNING``) and tolerates one extra dispatch
+        cycle of accumulation for stale-after-crash cases (where the
+        FSM is ``FAILED`` but ``staging_dir`` still references a dir
+        older than the TTL).
+
+        Defends against a symlink-based attack: if :attr:`staging_root`
+        is itself a symlink, or resolves outside the configured allowed
+        prefix (default ``/data/``), the sweep refuses to operate. The
+        daemon runs as root, so the cost of one extra check is trivial
+        compared to the blast radius of recursively rmtree'ing the
+        wrong tree.
+
+        Designed to be called once at daemon start (from
+        :meth:`recover_on_start`). Idempotent and safe to call again.
+        """
+
+        if self.staging_root.is_symlink():
+            log.error(
+                "staging_root %s is a symlink; refusing to sweep",
+                self.staging_root,
+            )
+            return
+
+        try:
+            resolved = self.staging_root.resolve()
+        except Exception:
+            log.exception(
+                "could not resolve staging root %s", self.staging_root
+            )
+            return
+
+        if not str(resolved).startswith(self.staging_sweep_allowed_prefix):
+            log.error(
+                "staging_root %s resolves to %s outside allowed prefix %r; "
+                "refusing to sweep",
+                self.staging_root,
+                resolved,
+                self.staging_sweep_allowed_prefix,
+            )
+            return
+
+        try:
+            entries = list(self.staging_root.iterdir())
+        except FileNotFoundError:
+            return  # Staging root is created lazily on first dispatch.
+        except Exception:
+            log.exception(
+                "could not list staging root %s", self.staging_root
+            )
+            return
+
+        now = time.time()
+        cutoff = now - self.staging_sweep_ttl_sec
+        active = self.state.staging_dir  # str or None
+        try:
+            active_resolved = Path(active).resolve() if active else None
+        except Exception:
+            active_resolved = None
+
+        for entry in entries:
+            try:
+                entry_resolved = entry.resolve()
+            except Exception:
+                entry_resolved = None
+
+            if active_resolved is not None and entry_resolved == active_resolved:
+                continue  # Don't reap the in-flight dispatch.
+
+            try:
+                mtime = entry.stat().st_mtime
+            except FileNotFoundError:
+                continue  # Raced with another sweeper / OS — fine.
+            except Exception:
+                log.exception("could not stat staging entry %s", entry)
+                continue
+
+            if mtime >= cutoff:
+                continue  # Fresh enough; keep for forensics.
+
+            age = now - mtime
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                log.info(
+                    "swept stale staging entry %s (age=%.0fs)", entry, age
+                )
+            except Exception:
+                log.exception(
+                    "failed to remove stale staging entry %s", entry
+                )
 
     async def handle_dispatch(self, raw_msg: Any) -> None:
         """Drive a single dispatch end-to-end on the happy path.

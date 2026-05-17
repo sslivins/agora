@@ -79,8 +79,9 @@ Error taxonomy (the service maps each to a distinct wire code):
 Staging contents (meta.json) are **not** cleaned up on failure —
 forensics trump disk reclaim, especially for ``bundle_invalid`` cases.
 The service-level cleanup that runs on ``agora-os-updater.service``
-start (24h TTL sweep, per Phase 2 deliverable §"Partial-download
-cleanup") catches everything eventually.
+start (24h TTL sweep, see
+:meth:`os_updater.service.OSUpdaterService.sweep_stale_staging`)
+catches everything eventually.
 """
 
 from __future__ import annotations

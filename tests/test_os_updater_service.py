@@ -1332,3 +1332,309 @@ class TestServiceRunBindsLoop:
 
         # Must not raise.
         asyncio.run(runner())
+
+
+# ── sweep_stale_staging ─────────────────────────────────────────────────────
+
+
+def _build_sweep_service(tmp_path, *, ttl_sec: float = 24 * 60 * 60):
+    """Service tuned for sweep tests: tmp staging root + tmp allowed prefix."""
+
+    state_path = tmp_path / "state.json"
+    staging_root = tmp_path / "staging"
+    return OSUpdaterService(
+        transport_factory=lambda: object(),
+        event_sink=_ListSink(),
+        current_version_provider=lambda: "1.0.0",
+        downloader=_OkStub(),
+        verifier=_OkStub(),
+        stager=_OkStub(),
+        migrator=_OkStub(),
+        state_path=state_path,
+        staging_root=staging_root,
+        staging_sweep_ttl_sec=ttl_sec,
+        staging_sweep_allowed_prefix=str(tmp_path),
+    )
+
+
+def _make_stale(path, *, age_sec: float):
+    """Force ``path``'s mtime to be ``age_sec`` seconds in the past."""
+
+    import os
+    import time
+
+    when = time.time() - age_sec
+    os.utime(path, (when, when))
+
+
+class TestSweepStaleStaging:
+    """Filesystem reaper for stale per-dispatch staging dirs.
+
+    Wiring: ``recover_on_start`` calls ``sweep_stale_staging``. The
+    integration test (#1) is the load-bearing one — it confirms the
+    sweep actually runs on daemon startup. The rest are unit tests
+    of the sweep behavior itself.
+    """
+
+    def test_recover_on_start_triggers_sweep(self, tmp_path):
+        """The whole point: ``recover_on_start`` reaps stale entries."""
+
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True, exist_ok=True)
+        stale = s.staging_root / "old_release"
+        fresh = s.staging_root / "new_release"
+        stale.mkdir()
+        fresh.mkdir()
+        _make_stale(stale, age_sec=48 * 60 * 60)
+
+        s.state = UpdaterState(fsm=UpdaterFSMState.IDLE)
+        save_state(s.state, s.state_path)
+
+        s.recover_on_start()
+
+        assert not stale.exists(), "stale entry should have been reaped"
+        assert fresh.exists(), "fresh entry must survive"
+
+    def test_no_staging_root_is_noop(self, tmp_path):
+        """Missing staging_root must not raise — created lazily later."""
+
+        s = _build_sweep_service(tmp_path)
+        assert not s.staging_root.exists()
+        # Must not raise.
+        s.sweep_stale_staging()
+        # Sweep didn't accidentally create it.
+        assert not s.staging_root.exists()
+
+    def test_empty_staging_root_is_noop(self, tmp_path):
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+        s.sweep_stale_staging()
+        # No errors, root still there + empty.
+        assert s.staging_root.is_dir()
+        assert list(s.staging_root.iterdir()) == []
+
+    def test_recent_entry_kept(self, tmp_path):
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+        recent = s.staging_root / "rel-recent"
+        recent.mkdir()
+        # mtime is now-ish; well within TTL.
+        s.sweep_stale_staging()
+        assert recent.exists()
+
+    def test_stale_entry_removed(self, tmp_path):
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+        stale = s.staging_root / "rel-stale"
+        stale.mkdir()
+        (stale / "bundle.tar.zst").write_bytes(b"x" * 1024)
+        _make_stale(stale, age_sec=48 * 60 * 60)
+
+        s.sweep_stale_staging()
+
+        assert not stale.exists()
+
+    def test_mixed_entries_only_stale_removed(self, tmp_path):
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+        stale1 = s.staging_root / "rel-stale-1"
+        stale2 = s.staging_root / "rel-stale-2"
+        fresh = s.staging_root / "rel-fresh"
+        for p in (stale1, stale2, fresh):
+            p.mkdir()
+        _make_stale(stale1, age_sec=48 * 60 * 60)
+        _make_stale(stale2, age_sec=25 * 60 * 60)
+
+        s.sweep_stale_staging()
+
+        assert not stale1.exists()
+        assert not stale2.exists()
+        assert fresh.exists()
+
+    def test_skips_active_staging_dir(self, tmp_path):
+        """Even a stale dir survives if state.staging_dir points at it."""
+
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+        active = s.staging_root / "rel-active"
+        active.mkdir()
+        _make_stale(active, age_sec=48 * 60 * 60)
+
+        # Production stores it as the str() of the staging path; the
+        # Path(active).resolve() == entry.resolve() comparison must
+        # tolerate this exact shape.
+        s.state.staging_dir = str(active)
+        assert str(active) == s.state.staging_dir  # comparison shape sanity
+
+        s.sweep_stale_staging()
+        assert active.exists(), "active dispatch dir must not be swept"
+
+    def test_stale_file_unlinked(self, tmp_path):
+        """Non-dir entries (stray files) get unlinked when stale."""
+
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+        stray = s.staging_root / "stray.tmp"
+        stray.write_bytes(b"junk")
+        _make_stale(stray, age_sec=48 * 60 * 60)
+
+        s.sweep_stale_staging()
+
+        assert not stray.exists()
+
+    def test_symlink_in_staging_root_not_followed(self, tmp_path):
+        """A symlink CHILD pointing outside staging_root must not get
+        its target dereferenced. We unlink the link itself if stale,
+        but leave the target tree intact."""
+
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+
+        # External tree the symlink would point at.
+        external = tmp_path / "outside"
+        external.mkdir()
+        sentinel = external / "DO_NOT_DELETE"
+        sentinel.write_text("guarded")
+
+        link = s.staging_root / "evil"
+        try:
+            link.symlink_to(external)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        # Make the symlink itself stale -- on Linux lutimes is what
+        # os.utime(follow_symlinks=False) uses; we test the bare path.
+        import os
+
+        old = 48 * 60 * 60
+        try:
+            os.utime(link, (
+                __import__("time").time() - old,
+                __import__("time").time() - old,
+            ), follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            # Some platforms can't lutimes; fall back to plain utime
+            # (which would follow the link, but external dir's mtime
+            # is harmless here — we're only checking the safety
+            # property).
+            pass
+
+        s.sweep_stale_staging()
+
+        # Sentinel survives — the symlink target tree is intact.
+        assert sentinel.exists()
+        assert sentinel.read_text() == "guarded"
+
+    def test_per_entry_failure_does_not_stop_sweep(self, tmp_path, monkeypatch):
+        """One bad entry must not poison the remaining entries."""
+
+        s = _build_sweep_service(tmp_path)
+        s.staging_root.mkdir(parents=True)
+        stale1 = s.staging_root / "stale-1"
+        stale2 = s.staging_root / "stale-2"
+        stale1.mkdir()
+        stale2.mkdir()
+        _make_stale(stale1, age_sec=48 * 60 * 60)
+        _make_stale(stale2, age_sec=48 * 60 * 60)
+
+        # Force rmtree to raise on stale1; stale2 must still be swept.
+        import os_updater.service as svc_mod
+
+        real_rmtree = svc_mod.shutil.rmtree
+        blown = {"hit": False}
+
+        def fake_rmtree(path, *args, **kwargs):
+            if str(path) == str(stale1) and not blown["hit"]:
+                blown["hit"] = True
+                raise PermissionError("simulated")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(svc_mod.shutil, "rmtree", fake_rmtree)
+
+        s.sweep_stale_staging()
+
+        assert blown["hit"], "test setup did not exercise the failure path"
+        # stale2 still got cleaned up despite the stale1 explosion.
+        assert not stale2.exists()
+
+    def test_refuses_to_sweep_when_staging_root_is_symlink(
+        self, tmp_path, caplog
+    ):
+        """A symlinked staging_root is a botched-migration/attack signal —
+        sweep must refuse and log."""
+
+        import logging
+
+        real_root = tmp_path / "real_staging"
+        real_root.mkdir()
+        sentinel = real_root / "DO_NOT_TOUCH"
+        sentinel.write_text("guarded")
+        _make_stale(sentinel, age_sec=48 * 60 * 60)
+
+        link = tmp_path / "staging"
+        try:
+            link.symlink_to(real_root, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+
+        s = _build_sweep_service(tmp_path)
+        assert s.staging_root == link
+
+        with caplog.at_level(logging.ERROR, logger="os_updater.service"):
+            s.sweep_stale_staging()
+
+        # Refused → no iterdir, sentinel intact.
+        assert sentinel.exists()
+        assert any(
+            "symlink" in r.message and "refusing" in r.message
+            for r in caplog.records
+        ), f"expected refusal log, got: {[r.message for r in caplog.records]}"
+
+    def test_refuses_to_sweep_when_staging_root_escapes_allowed_prefix(
+        self, tmp_path, caplog
+    ):
+        """If staging_root resolves outside the allowed prefix, refuse.
+
+        Covers the production safety check both directions:
+        - When ``allowed_prefix='/data/'`` and staging_root is under
+          ``tmp_path`` (escape) → refuse.
+        - When ``allowed_prefix=tmp_path`` (matching) → proceed.
+        """
+
+        import logging
+
+        # Case A: prefix='/data/' rejects a tmp_path root.
+        s_reject = OSUpdaterService(
+            transport_factory=lambda: object(),
+            event_sink=_ListSink(),
+            current_version_provider=lambda: "1.0.0",
+            downloader=_OkStub(),
+            verifier=_OkStub(),
+            stager=_OkStub(),
+            migrator=_OkStub(),
+            state_path=tmp_path / "state.json",
+            staging_root=tmp_path / "staging",
+            staging_sweep_allowed_prefix="/data/",
+        )
+        s_reject.staging_root.mkdir(parents=True)
+        stale = s_reject.staging_root / "rel-stale"
+        stale.mkdir()
+        _make_stale(stale, age_sec=48 * 60 * 60)
+
+        with caplog.at_level(logging.ERROR, logger="os_updater.service"):
+            s_reject.sweep_stale_staging()
+
+        assert stale.exists(), "sweep should have refused due to prefix escape"
+        assert any(
+            "outside allowed prefix" in r.message for r in caplog.records
+        )
+        caplog.clear()
+
+        # Case B: matching prefix lets the same sweep proceed.
+        s_ok = _build_sweep_service(tmp_path)
+        s_ok.staging_root = tmp_path / "staging2"
+        s_ok.staging_root.mkdir()
+        stale2 = s_ok.staging_root / "rel-stale-2"
+        stale2.mkdir()
+        _make_stale(stale2, age_sec=48 * 60 * 60)
+        s_ok.sweep_stale_staging()
+        assert not stale2.exists(), "matching-prefix sweep should have succeeded"
