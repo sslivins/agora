@@ -6,11 +6,13 @@ import json
 import logging
 import os
 import queue
+import shlex
 import signal
 import socket
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -196,12 +198,13 @@ class AgoraPlayer:
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self._mpv_process: Optional[subprocess.Popen] = None
-        self._cage_process: Optional[subprocess.Popen] = None
+        self._sway_process: Optional[subprocess.Popen] = None
+        self._sway_scope_unit: Optional[str] = None
         self.loop = GLib.MainLoop()
         self.current_desired: Optional[DesiredState] = None
         self._current_path: Optional[Path] = None  # file being played
         self._current_mtime: Optional[float] = None  # mtime when pipeline was built
-        # URL currently rendered by Cage (webpage mode) — None otherwise.
+        # URL currently rendered by Sway (webpage mode) — None otherwise.
         self._current_url: Optional[str] = None
         # Last desired state successfully applied to the renderer.
         # Used by ``_already_satisfied`` to avoid redundant rebuilds.
@@ -602,7 +605,7 @@ class AgoraPlayer:
         # teardown. The listener is shutdown explicitly from the run()
         # signal handler and finally clause instead.
         self._stop_mpv()
-        self._stop_cage()
+        self._stop_sway()
         if self.pipeline:
             bus = self.pipeline.get_bus()
             if bus:
@@ -616,7 +619,7 @@ class AgoraPlayer:
         self._current_path = None
         self._current_mtime = None
 
-    # ── Cage+Chromium (webpage rendering) ──
+    # ── Sway+Chromium (webpage rendering) ──
 
     # Boards where aggressive Chromium memory-saver flags are applied.
     # These boards either have ≤1 GB RAM (Zero 2 W) or are memory-constrained
@@ -624,6 +627,9 @@ class AgoraPlayer:
     # Pi 5 is excluded: it has ≥4 GB and hardware-accelerated compositing.
     # UNKNOWN is included defensively (same rationale as gstreamer fallback).
     _LOWMEM_BOARDS = frozenset({Board.ZERO_2W, Board.PI_4, Board.UNKNOWN})
+
+    _SWAY_RUNTIME_DIR = "/tmp/agora-sway-run"
+    _SWAY_CONFIG_PATH = "/tmp/agora-sway-run/sway.conf"
 
     @staticmethod
     def _chromium_lowmem_flags() -> list[str]:
@@ -657,17 +663,9 @@ class AgoraPlayer:
             "--js-flags=--max-old-space-size=96 --max-semi-space-size=2",
         ]
 
-    def _start_cage(self, url: str) -> None:
-        """Launch Cage + Chromium in kiosk mode to render a URL."""
-        self._stop_cage()
-        self._teardown()  # Stop any mpv/gstreamer pipeline
-
-        env = os.environ.copy()
-        env["XDG_RUNTIME_DIR"] = "/tmp/cage-run"
-        os.makedirs("/tmp/cage-run", exist_ok=True)
-
+    def _chromium_kiosk_argv(self, url: str) -> list[str]:
+        """Build the chromium argv for a kiosk-mode URL render."""
         cmd = [
-            "cage", "-d", "--",
             "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
             "--disable-translate", "--disable-infobars", "--incognito",
             "--hide-scrollbars", "--autoplay-policy=no-user-gesture-required",
@@ -678,10 +676,96 @@ class AgoraPlayer:
             "--load-extension=/opt/agora/src/player/extensions/hide-cursor",
             url,
         ])
+        return cmd
 
-        logger.info("Starting Cage+Chromium for URL: %s", url)
+    def _write_sway_config(self, url: str) -> Path:
+        """Render the sway config for a URL to the 0o700 runtime dir.
+
+        The config lives inside the same private runtime directory used for
+        ``XDG_RUNTIME_DIR``. We write it with ``O_NOFOLLOW`` so a pre-existing
+        symlink at the target path can't redirect the (URL-containing) body.
+        """
+        chromium_cmd = self._chromium_kiosk_argv(url)
+        exec_line = "exec " + shlex.join(chromium_cmd)
+        body = (
+            "output * bg #000000 solid_color\n"
+            "seat * hide_cursor 1\n"
+            "default_border none\n"
+            "default_floating_border none\n"
+            "hide_edge_borders both\n"
+            'for_window [shell=".*"] fullscreen enable, border none\n'
+            "\n" + exec_line + "\n"
+        )
+        runtime_dir = Path(self._SWAY_RUNTIME_DIR)
+        runtime_dir.mkdir(mode=0o700, exist_ok=True)
         try:
-            self._cage_process = subprocess.Popen(
+            os.chmod(runtime_dir, 0o700)
+        except OSError:
+            pass
+        conf_path = Path(self._SWAY_CONFIG_PATH)
+        # O_NOFOLLOW is the meaningful safety bit (refuse to follow a
+        # symlinked target); on platforms that lack it (Windows test
+        # runners) the flag is 0 and the rest still works.
+        o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(
+            str(conf_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | o_nofollow,
+            0o600,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(body)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        return conf_path
+
+    def _start_sway(self, url: str) -> None:
+        """Launch sway + Chromium in kiosk mode to render a URL.
+
+        sway is wrapped in a transient systemd scope so the cgroup tracks
+        the whole process tree, including chromium grandchildren that
+        sway's ``exec`` double-forks + setsids out of any pgrp. Without
+        the scope, ``killpg`` on the sway pid would leak chromium to
+        init on hung-renderer cleanup and the next start would fail to
+        acquire ``/dev/dri/cardX``.
+        """
+        self._stop_sway()
+        self._teardown()  # Stop any mpv/gstreamer pipeline
+
+        env = os.environ.copy()
+        env["XDG_RUNTIME_DIR"] = self._SWAY_RUNTIME_DIR
+        # _write_sway_config ensures the runtime dir exists at 0o700.
+
+        try:
+            conf = self._write_sway_config(url)
+        except Exception as e:
+            logger.error("Failed to write sway config: %s", e)
+            self._update_current(error=f"Sway config write failed: {e}")
+            self._show_splash()
+            return
+
+        # Per-invocation unique scope unit name. A stable name would
+        # collide if a previous _stop_sway ever failed to fully reap the
+        # scope, causing systemd-run to fail with "unit already exists"
+        # and trapping the back-off retry loop indefinitely.
+        self._sway_scope_unit = f"agora-sway-{uuid.uuid4().hex[:8]}.scope"
+
+        cmd = [
+            "systemd-run", "--scope", "--quiet",
+            "--unit", self._sway_scope_unit, "--collect",
+            "sway", "-c", str(conf),
+        ]
+
+        logger.info(
+            "Starting Sway+Chromium for URL: %s (scope=%s)",
+            url, self._sway_scope_unit,
+        )
+        try:
+            self._sway_process = subprocess.Popen(
                 cmd, env=env,
                 start_new_session=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -690,39 +774,54 @@ class AgoraPlayer:
             self._current_mtime = None
             self._current_url = url
             self._update_current(mode=PlaybackMode.PLAY, asset=url)
-            # Schedule periodic monitoring to detect Cage/Chromium crashes
-            GLib.timeout_add_seconds(3, self._monitor_cage, url)
+            # Schedule periodic monitoring to detect sway/Chromium crashes
+            GLib.timeout_add_seconds(3, self._monitor_sway, url)
         except Exception as e:
-            logger.error("Failed to start Cage+Chromium: %s", e)
-            self._update_current(error=f"Cage startup failed: {e}")
+            logger.error("Failed to start Sway+Chromium: %s", e)
+            self._sway_process = None
+            self._sway_scope_unit = None
+            self._update_current(error=f"Sway startup failed: {e}")
             self._show_splash()
 
-    def _stop_cage(self) -> None:
-        """Stop Cage+Chromium process if running."""
-        proc = self._cage_process
-        if proc and proc.poll() is None:
-            logger.info("Stopping Cage+Chromium (PID %d)", proc.pid)
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                pass
+    def _stop_sway(self) -> None:
+        """Stop sway+Chromium scope if running.
+
+        Tears down via ``systemctl stop`` on the transient scope so the
+        cgroup signals every descendant — including double-forked
+        chromium grandchildren that aren't reachable via the sway pgrp.
+        """
+        proc = self._sway_process
+        unit = self._sway_scope_unit
+        if proc and proc.poll() is None and unit:
+            logger.info(
+                "Stopping Sway+Chromium scope=%s pid=%d", unit, proc.pid,
+            )
+            subprocess.run(
+                ["systemctl", "stop", unit],
+                timeout=8, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
+                # Cgroup KILL fallback — reaches double-forked grandchildren
+                # that pgrp-based kills can't see.
+                subprocess.run(
+                    ["systemctl", "kill", "-s", "SIGKILL", unit],
+                    timeout=5, check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     pass
-        self._cage_process = None
+        self._sway_process = None
+        self._sway_scope_unit = None
         self._current_url = None
 
-    def _monitor_cage(self, url: str) -> bool:
-        """Periodic check for Cage process exit. Returns False to stop timer."""
-        if self._cage_process is None:
+    def _monitor_sway(self, url: str) -> bool:
+        """Periodic check for sway process exit. Returns False to stop timer."""
+        if self._sway_process is None:
             return False
 
         # Stop monitoring if desired state no longer wants this URL
@@ -733,15 +832,16 @@ class AgoraPlayer:
         ):
             return False
 
-        retcode = self._cage_process.poll()
+        retcode = self._sway_process.poll()
         if retcode is None:
             # Still running
             return True
 
-        # Cage exited unexpectedly
-        self._cage_process = None
-        error_msg = f"Cage exited unexpectedly (code {retcode})"
-        logger.error("Cage crashed for %s: %s", url, error_msg)
+        # sway exited unexpectedly
+        self._sway_process = None
+        self._sway_scope_unit = None
+        error_msg = f"Sway exited unexpectedly (code {retcode})"
+        logger.error("Sway crashed for %s: %s", url, error_msg)
         self._update_current(error=error_msg)
 
         # Retry with exponential backoff (same pattern as mpv)
@@ -1571,7 +1671,7 @@ class AgoraPlayer:
     def _start_stream(self, url: str) -> None:
         """Launch mpv for streaming video playback (HLS, DASH, RTMP, etc.).
 
-        Stops any existing player (mpv, Cage, GStreamer) and starts mpv
+        Stops any existing player (mpv, Sway, GStreamer) and starts mpv
         with stream-optimised settings.  Monitoring reuses _monitor_mpv
         with the URL as the asset name for retry/splash fallback.
         """
@@ -1907,7 +2007,7 @@ class AgoraPlayer:
         # Clear any armed scheduled-pending so a stale event arriving from
         # the file we're about to replace can't re-trigger _show_splash.
         self._scheduled_pending = None
-        self._stop_cage()
+        self._stop_sway()
         error = self._pending_error
         self._pending_error = None
         splash = self._find_splash()
@@ -1984,7 +2084,7 @@ class AgoraPlayer:
         started_at: Optional[datetime] = None,
     ) -> None:
         pipeline_state = "NULL"
-        if self._cage_process and self._cage_process.poll() is None:
+        if self._sway_process and self._sway_process.poll() is None:
             pipeline_state = "PLAYING"
         elif self._mpv_process and self._mpv_process.poll() is None:
             pipeline_state = "PLAYING"
@@ -2016,7 +2116,7 @@ class AgoraPlayer:
         is_active = (
             self.pipeline
             or (self._mpv_process and self._mpv_process.poll() is None)
-            or (self._cage_process and self._cage_process.poll() is None)
+            or (self._sway_process and self._sway_process.poll() is None)
         )
         if (
             not is_active
@@ -2098,15 +2198,15 @@ class AgoraPlayer:
         proc = self._mpv_process
         return bool(proc and proc.poll() is None)
 
-    def _cage_alive(self) -> bool:
-        proc = self._cage_process
+    def _sway_alive(self) -> bool:
+        proc = self._sway_process
         return bool(proc and proc.poll() is None)
 
     def _pipeline_alive(self) -> bool:
         return self.pipeline is not None
 
     def _renderer_alive(self) -> bool:
-        return self._mpv_alive() or self._cage_alive() or self._pipeline_alive()
+        return self._mpv_alive() or self._sway_alive() or self._pipeline_alive()
 
     def _is_showing_splash(self) -> bool:
         """True iff the current renderer state is the splash file."""
@@ -2215,7 +2315,7 @@ class AgoraPlayer:
         if kind == "webpage":
             return (
                 self._slideshow is None
-                and self._cage_alive()
+                and self._sway_alive()
                 and self._current_url == desired.url
             )
         if kind == "slideshow":
@@ -2309,10 +2409,10 @@ class AgoraPlayer:
                     self._applied_desired = desired.model_copy(deep=True)
                 return
 
-            # Webpage rendering via Cage+Chromium
+            # Webpage rendering via Sway+Chromium
             self.current_desired = desired
-            self._start_cage(desired.url)
-            if self._cage_alive() and self._current_url == desired.url:
+            self._start_sway(desired.url)
+            if self._sway_alive() and self._current_url == desired.url:
                 self._applied_desired = desired.model_copy(deep=True)
             return
 
