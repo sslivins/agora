@@ -740,3 +740,88 @@ class TestSlideshowShortCircuitRegression:
         assert player._slideshow is None
         assert player._slideshow_manifest_digest is None
         player._show_splash.assert_called_once()
+
+
+class TestChromiumSlideshowTransitions:
+    """Per-slide transition values from the manifest must flow through
+    to the chromium shell. The CMS is the source of truth; missing or
+    unrecognized values default to "cut" (instant) on the shell side.
+
+    These tests cover the service-layer plumbing — they assert that
+    ``_chromium_player.show_image/show_video`` is called with the
+    transition kwargs taken from the manifest. The shell's own
+    fallback-to-cut behaviour is covered separately by the JS protocol
+    contract (see ``player/shell/player.js``).
+    """
+
+    def _arm_chromium(self, player):
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_alive = MagicMock(return_value=True)
+
+    def test_image_slide_forwards_manifest_transition(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "images" / "a.png").touch()
+        _write_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 5000, "play_to_end": False,
+             "transition": "fade", "transition_ms": 800},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_image.assert_called_once()
+        _, kwargs = player._chromium_player.show_image.call_args
+        assert kwargs["transition"] == "fade"
+        assert kwargs["duration_ms"] == 800
+
+    def test_video_slide_forwards_manifest_transition(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 4000, "play_to_end": False,
+             "transition": "fade", "transition_ms": 400},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_video.assert_called_once()
+        _, kwargs = player._chromium_player.show_video.call_args
+        assert kwargs["transition"] == "fade"
+        assert kwargs["duration_ms"] == 400
+
+    def test_missing_transition_field_defaults_to_cut(self, mpv_player):
+        """Manifest without a `transition` key → shell receives "cut"."""
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "images" / "a.png").touch()
+        _write_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 5000, "play_to_end": False},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        _, kwargs = player._chromium_player.show_image.call_args
+        assert kwargs["transition"] == "cut"
+        # transition_ms defaults to 600 even though "cut" ignores it,
+        # so the wire shape stays consistent.
+        assert kwargs["duration_ms"] == 600
+
+    def test_explicit_cut_transition_passes_through(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "images" / "a.png").touch()
+        _write_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 5000, "play_to_end": False,
+             "transition": "cut"},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        _, kwargs = player._chromium_player.show_image.call_args
+        assert kwargs["transition"] == "cut"

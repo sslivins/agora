@@ -41,8 +41,11 @@ sends back a small set of informational events.
 {"cmd":"stop"}
 ```
 
-`transition` is `"fade"` (default) or `"none"`.
-`duration_ms` is the transition length; default 600 ms.
+`transition` is `"fade"` or `"cut"` (default). Missing or unrecognized
+values fall back to `"cut"` (instant swap) — the CMS is the source of
+truth for transition selection; the shell never guesses.
+`duration_ms` is the fade animation length when `transition="fade"`;
+default 600 ms. Ignored for `"cut"`.
 
 ### Client → server (events)
 

@@ -68,7 +68,7 @@ def test_show_video_passes_loop_and_muted(cp):
     assert cmd["muted"] is True
 
 
-def test_show_splash_uses_no_transition(cp):
+def test_show_splash_uses_cut_transition(cp):
     sent = _capture_commands(cp)
     splash = cp.assets_dir / "splash" / "default.png"
     splash.parent.mkdir(parents=True)
@@ -79,9 +79,31 @@ def test_show_splash_uses_no_transition(cp):
     assert sent == [{
         "cmd": "show_splash",
         "url": "/assets/splash/default.png",
-        "transition": "none",
+        "transition": "cut",
         "duration_ms": 0,
     }]
+
+
+def test_show_image_defaults_to_cut_transition(cp):
+    sent = _capture_commands(cp)
+    img = cp.assets_dir / "images" / "foo.jpg"
+    img.parent.mkdir(parents=True)
+    img.write_bytes(b"\xff\xd8\xff")
+
+    cp.show_image(img)
+
+    assert sent[0]["transition"] == "cut"
+
+
+def test_show_video_defaults_to_cut_transition(cp):
+    sent = _capture_commands(cp)
+    vid = cp.assets_dir / "videos" / "clip.mp4"
+    vid.parent.mkdir(parents=True)
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    cp.show_video(vid)
+
+    assert sent[0]["transition"] == "cut"
 
 
 def test_stop_playback_emits_stop_command(cp):

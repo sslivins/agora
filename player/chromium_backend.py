@@ -149,7 +149,7 @@ class ChromiumPlayer:
     def show_image(
         self,
         path: Path,
-        transition: str = "fade",
+        transition: str = "cut",
         duration_ms: int = DEFAULT_TRANSITION_MS,
     ) -> None:
         url = self._asset_url(path)
@@ -168,7 +168,7 @@ class ChromiumPlayer:
         path: Path,
         loop: bool = False,
         muted: bool = False,
-        transition: str = "fade",
+        transition: str = "cut",
         duration_ms: int = DEFAULT_TRANSITION_MS,
     ) -> None:
         url = self._asset_url(path)
@@ -192,7 +192,7 @@ class ChromiumPlayer:
         self._enqueue({
             "cmd": "show_splash",
             "url": url,
-            "transition": "none",
+            "transition": "cut",
             "duration_ms": 0,
         })
 

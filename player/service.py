@@ -442,14 +442,26 @@ class AgoraPlayer:
         # Wiring shell 'ended' events back into _play_next_slide is a
         # follow-up — see docs/chromium-player-demo.md.
         if self._use_chromium_backend and self._chromium_player:
+            # Per-slide transition is opt-in via the manifest; absent or
+            # unknown values fall back to "cut" (instant swap) on the
+            # shell side. transition_ms is the animation length, not the
+            # slide's on-screen duration (that's duration_ms below).
+            slide_transition = slide.get("transition") or "cut"
+            slide_transition_ms = int(slide.get("transition_ms") or 600)
             if is_video_slide:
                 # Slideshow videos loop within their duration; the
                 # next-slide timeout drives advance.
                 self._chromium_player.show_video(
                     path, loop=True, muted=False,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
                 )
             else:
-                self._chromium_player.show_image(path)
+                self._chromium_player.show_image(
+                    path,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
             duration_ms = int(slide.get("duration_ms") or 0)
             if duration_ms <= 0:
                 duration_ms = 30000 if play_to_end else 10000
@@ -2075,7 +2087,7 @@ class AgoraPlayer:
                 self._teardown()
                 if is_video:
                     self._chromium_player.show_video(
-                        splash, loop=True, muted=True, transition="none",
+                        splash, loop=True, muted=True, transition="cut",
                     )
                 else:
                     self._chromium_player.show_splash(splash)

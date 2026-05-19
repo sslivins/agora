@@ -40,7 +40,7 @@ JSON sent over `/ws`. Server → client only; the shell does not respond.
 ```json
 {"cmd":"show_image", "url":"/assets/...","transition":"fade","duration_ms":600}
 {"cmd":"show_video", "url":"/assets/...","loop":false,"muted":false,"transition":"fade","duration_ms":600}
-{"cmd":"show_splash","url":"/assets/...","transition":"none","duration_ms":0}
+{"cmd":"show_splash","url":"/assets/...","transition":"cut","duration_ms":0}
 {"cmd":"stop"}
 ```
 
@@ -48,8 +48,11 @@ Coalescing: if commands queue up because the shell is mid-transition or just
 reconnected, the buffer keeps only the latest `show_*`. A `stop` after a `show_*`
 is kept; a `stop` before a `show_*` is dropped as stale.
 
-Transitions supported: `fade` (default) and `none`. New transitions are
-~5 lines of CSS + a class swap in `player/shell/player.js`.
+Transitions supported: `fade` and `cut` (default). Missing or
+unrecognized transition values fall back to `cut` — the CMS is the
+source of truth for transition selection. New named transitions are
+~5 lines of CSS + a `KNOWN_TRANSITIONS` entry in
+`player/shell/player.js`.
 
 ## What this demo handles
 

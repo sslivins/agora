@@ -6,11 +6,15 @@
  *
  * Protocol (server -> client):
  *   {"cmd":"show_image","url":"/assets/images/foo.jpg",
- *    "transition":"fade"|"none","duration_ms":600}
+ *    "transition":"fade"|"cut","duration_ms":600}
  *   {"cmd":"show_video","url":"/assets/videos/bar.mp4",
  *    "loop":true,"muted":false,"transition":"fade","duration_ms":600}
  *   {"cmd":"show_splash","url":"/assets/splash/default.png"}
  *   {"cmd":"stop"}
+ *
+ * Transitions: "fade" runs the crossfade for `duration_ms`; "cut" swaps
+ * instantly. Missing or unrecognized values fall back to "cut" with a
+ * console.warn — the CMS is the source of truth, the shell never guesses.
  *
  * Client -> server (informational):
  *   {"event":"ready"}                          (on initial connect)
@@ -76,8 +80,16 @@
     const cur = layers[activeIdx];
     const nxt = layers[next];
 
-    // Clear the destination layer and apply transition timing.
-    const durMs = cmd.transition === "none" ? 0 : (cmd.duration_ms || 600);
+    // Resolve the transition. CMS-driven; default and unknown both → "cut".
+    const KNOWN_TRANSITIONS = ["fade", "cut"];
+    let mode = cmd.transition;
+    if (!mode) {
+      mode = "cut";
+    } else if (KNOWN_TRANSITIONS.indexOf(mode) === -1) {
+      log("unknown transition '" + mode + "', falling back to cut");
+      mode = "cut";
+    }
+    const durMs = mode === "fade" ? (cmd.duration_ms || 600) : 0;
     nxt.style.setProperty("--transition-ms", durMs + "ms");
     cur.style.setProperty("--transition-ms", durMs + "ms");
     nxt.classList.toggle("no-transition", durMs === 0);
