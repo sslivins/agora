@@ -211,19 +211,17 @@ def _save_auth_token(path: Path, token: str) -> None:
 def _resolve_device_api_key(settings: Settings) -> str:
     """Return the device API key used for WPS transport auth.
 
-    Prefers ``AGORA_DEVICE_API_KEY`` (dev/test override);
-    otherwise reads ``<persist_dir>/api_key`` — the same file CMS
-    rotates into via the config message and that direct-mode
-    transport uses for asset downloads.
+    Prefers ``AGORA_DEVICE_API_KEY`` (dev/test override); otherwise
+    reads ``persist/devices.json`` slot A, falling back to the legacy
+    ``persist/api_key`` file.  PR 1 multi-display routes credential
+    reads through ``shared.devices_store`` so PR 2 can mint slot-B
+    credentials and have them picked up the same way.
     """
     key = getattr(settings, "device_api_key", "") or ""
     if key:
         return key.strip()
-    key_path = settings.persist_dir / "api_key"
-    try:
-        return key_path.read_text().strip()
-    except (FileNotFoundError, OSError):
-        return ""
+    from shared.devices_store import read_api_key_with_fallback
+    return read_api_key_with_fallback(settings.persist_dir)
 
 
 # ── Schedule evaluation helpers ──
@@ -1514,12 +1512,14 @@ class CMSClient:
     # ── Asset management ──
 
     def _read_api_key(self) -> str:
-        """Read the current device API key from the persist directory."""
-        key_path = self.settings.persist_dir / "api_key"
-        try:
-            return key_path.read_text().strip()
-        except FileNotFoundError:
-            return ""
+        """Read the current device API key from the persist directory.
+
+        Prefers ``persist/devices.json`` slot A; falls back to the legacy
+        ``persist/api_key`` file.  Used as the ``X-Device-API-Key``
+        header on asset downloads.
+        """
+        from shared.devices_store import read_api_key_with_fallback
+        return read_api_key_with_fallback(self.settings.persist_dir)
 
     def _spawn_fetch_asset(self, msg: dict, ws) -> None:
         """Dispatch ``fetch_asset`` as a background task.
@@ -2023,6 +2023,24 @@ class CMSClient:
                 os.chmod(override_path, 0o644)
             except OSError:
                 pass
+            # Dual-write: also stash the rotated key in the slot-keyed
+            # devices.json so the new credential indirection layer sees
+            # it.  PR 3 will drop the legacy persist/api_key write once
+            # the fleet has stabilised on devices.json.
+            try:
+                from shared.devices_store import SLOT_A, read_slot, write_slot
+                existing = read_slot(self.settings.persist_dir, SLOT_A) or {}
+                existing["api_key"] = new_key
+                if "device_id" not in existing:
+                    existing["device_id"] = (
+                        getattr(self.settings, "device_name", "") or ""
+                    )
+                write_slot(self.settings.persist_dir, SLOT_A, existing)
+            except Exception:
+                logger.debug(
+                    "Failed to mirror rotated api_key into devices.json slot A",
+                    exc_info=True,
+                )
             boot_config = Path("/boot/agora-config.json")
             try:
                 cfg = json.loads(boot_config.read_text())
@@ -2086,6 +2104,14 @@ class CMSClient:
         _safe_unlink(persist_dir / "device_name")
         _safe_unlink(persist_dir / "api_key")
         _safe_unlink(persist_dir / "local_api_enabled")
+
+        # Multi-display slot-keyed credential store (PR 1).  Wipe all
+        # slots; on next adoption the device starts fresh.
+        try:
+            from shared.devices_store import wipe as _devices_wipe
+            _devices_wipe(persist_dir)
+        except Exception:
+            logger.debug("Failed to wipe devices.json on factory reset", exc_info=True)
 
         # Bootstrap v2 identity + cached credentials.  These are safe to
         # always remove — on non-v2 builds the paths just don't exist.

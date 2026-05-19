@@ -45,15 +45,16 @@ async def require_auth(
 ) -> str:
     """Dependency for API routes: accepts API key header OR session cookie."""
     if api_key:
-        # Check CMS-pushed key override first, fall back to boot config
+        # Check CMS-pushed key override first, fall back to boot config.
+        # Override is sourced via devices_store with legacy persist/api_key
+        # as the fallback path -- keeps PR 1 multi-display behavior-neutral
+        # against existing fleets.
+        from shared.devices_store import read_api_key_with_fallback
+
         effective_key = settings.api_key
-        override_path = settings.persist_dir / "api_key"
-        try:
-            override = override_path.read_text().strip()
-            if override:
-                effective_key = override
-        except (FileNotFoundError, OSError):
-            pass
+        override = read_api_key_with_fallback(settings.persist_dir)
+        if override:
+            effective_key = override
         if hmac.compare_digest(api_key, effective_key):
             return "api_key"
     user = get_session_user(request, settings)

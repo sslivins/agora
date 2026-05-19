@@ -40,6 +40,14 @@ async def factory_reset(settings: Settings = Depends(get_settings)):
     _safe_unlink(PERSIST_DIR / "device_name")
     _safe_unlink(PERSIST_DIR / "api_key")
 
+    # 2a. Multi-display slot-keyed credential store (PR 1).  Wipe alongside
+    # the legacy persist/api_key so factory reset starts clean.
+    try:
+        from shared.devices_store import wipe as _devices_wipe
+        _devices_wipe(PERSIST_DIR)
+    except Exception:
+        logger.debug("Failed to wipe devices.json on factory reset", exc_info=True)
+
     # 3. Remove state files
     _safe_unlink(STATE_DIR / "cms_status.json")
     _safe_unlink(STATE_DIR / "cms_config.json")
