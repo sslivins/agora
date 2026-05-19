@@ -106,6 +106,55 @@ def test_show_video_defaults_to_cut_transition(cp):
     assert sent[0]["transition"] == "cut"
 
 
+def test_show_video_with_loop_count_includes_field(cp):
+    sent = _capture_commands(cp)
+    vid = cp.assets_dir / "videos" / "clip.mp4"
+    vid.parent.mkdir(parents=True)
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    cp.show_video(vid, loop=False, loop_count=3)
+
+    assert sent[0]["loop_count"] == 3
+    assert sent[0]["loop"] is False
+
+
+def test_show_video_loop_count_zero_omits_field(cp):
+    """loop_count=0 means 'no finite-loop semantics'; the field must
+    not be sent so the shell sticks to the legacy HTML-loop behaviour."""
+    sent = _capture_commands(cp)
+    vid = cp.assets_dir / "videos" / "clip.mp4"
+    vid.parent.mkdir(parents=True)
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    cp.show_video(vid, loop=True, loop_count=0)
+
+    assert "loop_count" not in sent[0]
+    assert sent[0]["loop"] is True
+
+
+def test_show_video_loop_count_none_omits_field(cp):
+    sent = _capture_commands(cp)
+    vid = cp.assets_dir / "videos" / "clip.mp4"
+    vid.parent.mkdir(parents=True)
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    cp.show_video(vid, loop=True)  # default loop_count=None
+
+    assert "loop_count" not in sent[0]
+
+
+def test_asset_url_public_helper_matches_internal(cp):
+    """The public ``asset_url`` (used by service.py for event matching)
+    must return the same string the shell will load for ``show_video``."""
+    p = cp.assets_dir / "videos" / "clip.mp4"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(b".")
+    assert cp.asset_url(p) == "/assets/videos/clip.mp4"
+    outside = cp.assets_dir.parent / "evil.mp4"
+    outside.write_bytes(b".")
+    assert cp.asset_url(outside) is None
+
+
 def test_stop_playback_emits_stop_command(cp):
     sent = _capture_commands(cp)
     cp.stop_playback()

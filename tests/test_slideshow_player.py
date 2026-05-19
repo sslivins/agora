@@ -43,6 +43,7 @@ def mpv_player(tmp_path):
         p._error_retry_delay = 3
         p._pending_error = None
         p._loops_completed = 0
+        p._chromium_scheduled_pending = None
         p._board = svc.Board.PI_5
         p._player_backend = "mpv"
         p._slideshow = None
@@ -825,3 +826,237 @@ class TestChromiumSlideshowTransitions:
             player._start_slideshow("Show", None)
         _, kwargs = player._chromium_player.show_image.call_args
         assert kwargs["transition"] == "cut"
+
+
+class TestChromiumSlideshowPlayToEnd:
+    """play_to_end video slides advance on the shell's terminal ``ended``
+    event, not on a fixed slide timeout. A watchdog guards against a
+    broken video stalling the show forever.
+    """
+
+    def _arm_chromium(self, player):
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url = MagicMock(
+            side_effect=lambda path: "/assets/videos/" + Path(path).name,
+        )
+        player._chromium_alive = MagicMock(return_value=True)
+
+    def test_play_to_end_video_arms_pending_record(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 4000, "play_to_end": True},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 42
+            player._start_slideshow("Show", None)
+        _, kwargs = player._chromium_player.show_video.call_args
+        assert kwargs["loop"] is False
+        pending = player._slideshow["pending_play_to_end_chromium"]
+        assert pending is not None
+        assert pending["asset_url"] == "/assets/videos/v.mp4"
+        assert pending["watchdog_id"] == 42
+        assert glib.timeout_add.call_count == 1
+
+    def test_ended_event_advances_to_next_slide(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        (player.assets_dir / "images" / "a.png").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 4000, "play_to_end": True},
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 2000, "play_to_end": False},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 7
+            player._start_slideshow("Show", None)
+            player._handle_chromium_event_on_main(
+                {"event": "ended", "asset": "/assets/videos/v.mp4"},
+            )
+        player._chromium_player.show_image.assert_called_once()
+        assert player._slideshow["pending_play_to_end_chromium"] is None
+
+    def test_ended_with_mismatched_asset_is_ignored(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 4000, "play_to_end": True},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 7
+            player._start_slideshow("Show", None)
+            player._handle_chromium_event_on_main(
+                {"event": "ended", "asset": "/assets/videos/other.mp4"},
+            )
+        assert player._slideshow["pending_play_to_end_chromium"] is not None
+        assert player._chromium_player.show_image.call_count == 0
+
+    def test_watchdog_advances_when_ended_never_arrives(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        (player.assets_dir / "images" / "a.png").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 4000, "play_to_end": True},
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 2000, "play_to_end": False},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 7
+            player._start_slideshow("Show", None)
+            epoch = player._slideshow["epoch"]
+            player._on_play_to_end_chromium_watchdog(epoch)
+        player._chromium_player.show_image.assert_called_once()
+        assert player._slideshow["pending_play_to_end_chromium"] is None
+
+    def test_stale_watchdog_after_clear_slideshow_is_noop(self, mpv_player):
+        """If the slideshow has already been torn down, a late watchdog
+        callback must not blow up and must not advance anything."""
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video",
+             "duration_ms": 4000, "play_to_end": True},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 7
+            player._start_slideshow("Show", None)
+            epoch = player._slideshow["epoch"]
+            player._clear_slideshow()
+            assert player._on_play_to_end_chromium_watchdog(epoch) is False
+
+
+class TestChromiumScheduledLoopCount:
+    """A scheduled finite-loop video reaches the shell with loop_count=N.
+    The shell counts the iterations in-place and emits a terminal
+    ``ended`` once exhausted, at which point the daemon transitions to
+    splash.
+    """
+
+    def _arm_chromium(self, player):
+        player._use_chromium_backend = True
+        player._applied_desired = None
+        player._current_url = None
+        player._slideshow_manifest_digest = None
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url = MagicMock(
+            side_effect=lambda path: "/assets/videos/" + Path(path).name,
+        )
+        player._chromium_alive = MagicMock(return_value=True)
+        player._teardown = MagicMock()
+
+    def _make_video(self, player, name):
+        vid = player.assets_dir / "videos" / name
+        vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")  # >=8 byte header
+        return vid
+
+    def _drive_apply_desired(self, player, svc, desired):
+        from shared.state import write_state
+        write_state(player.desired_path, desired)
+        with patch.object(svc, "GLib"):
+            player.apply_desired()
+
+    def test_finite_loop_count_is_forwarded_to_show_video(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        self._make_video(player, "v.mp4")
+        desired = DesiredState(
+            asset="v.mp4",
+            asset_type="video",
+            mode=PlaybackMode.PLAY,
+            loop=False,
+            loop_count=3,
+        )
+        self._drive_apply_desired(player, svc, desired)
+        _, kwargs = player._chromium_player.show_video.call_args
+        assert kwargs["loop_count"] == 3
+        # When loop_count is set we don't also set HTML loop=true —
+        # that would suppress the ended event the shell needs to emit.
+        assert kwargs["loop"] is False
+        sp = player._chromium_scheduled_pending
+        assert sp is not None
+        assert sp["asset_url"] == "/assets/videos/v.mp4"
+        assert sp["target_count"] == 3
+
+    def test_loop_without_count_does_not_arm_pending(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        self._make_video(player, "v.mp4")
+        desired = DesiredState(
+            asset="v.mp4",
+            asset_type="video",
+            mode=PlaybackMode.PLAY,
+            loop=True,
+        )
+        self._drive_apply_desired(player, svc, desired)
+        _, kwargs = player._chromium_player.show_video.call_args
+        assert "loop_count" not in kwargs or kwargs["loop_count"] is None
+        assert kwargs["loop"] is True
+        assert player._chromium_scheduled_pending is None
+
+    def test_terminal_ended_event_triggers_splash(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        self._make_video(player, "v.mp4")
+        desired = DesiredState(
+            asset="v.mp4",
+            asset_type="video",
+            mode=PlaybackMode.PLAY,
+            loop=False,
+            loop_count=2,
+        )
+        self._drive_apply_desired(player, svc, desired)
+        player._handle_chromium_event_on_main(
+            {"event": "ended", "asset": "/assets/videos/v.mp4",
+             "completed_loops": 2},
+        )
+        player._show_splash.assert_called_once()
+        assert player._chromium_scheduled_pending is None
+
+    def test_ended_for_different_asset_is_ignored(self, mpv_player):
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        self._make_video(player, "v.mp4")
+        desired = DesiredState(
+            asset="v.mp4",
+            asset_type="video",
+            mode=PlaybackMode.PLAY,
+            loop=False,
+            loop_count=2,
+        )
+        self._drive_apply_desired(player, svc, desired)
+        player._handle_chromium_event_on_main(
+            {"event": "ended", "asset": "/assets/videos/other.mp4"},
+        )
+        player._show_splash.assert_not_called()
+        assert player._chromium_scheduled_pending is not None
+
+    def test_apply_desired_clears_stale_pending(self, mpv_player):
+        """Switching to a new chromium asset must drop any prior armed
+        pending — otherwise a late ended from the old asset would force
+        a spurious splash on top of the new asset."""
+        player, svc = mpv_player
+        self._arm_chromium(player)
+        player._chromium_scheduled_pending = {
+            "asset_url": "/assets/videos/old.mp4",
+            "asset_name": "old.mp4",
+            "target_count": 5,
+        }
+        self._make_video(player, "new.mp4")
+        desired = DesiredState(
+            asset="new.mp4",
+            asset_type="video",
+            mode=PlaybackMode.PLAY,
+            loop=True,
+        )
+        self._drive_apply_desired(player, svc, desired)
+        assert player._chromium_scheduled_pending is None

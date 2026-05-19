@@ -170,6 +170,15 @@ class ChromiumPlayer:
         """The HTTP URL the kiosk should be pointed at."""
         return f"http://{self.host}:{self.port}/"
 
+    def asset_url(self, path: Path) -> Optional[str]:
+        """Return the ``/assets/<rel>`` URL the shell will load for ``path``.
+
+        Returns ``None`` if ``path`` is not under ``assets_dir``. Callers
+        use this to compute the expected URL string for matching against
+        shell ``ended`` events.
+        """
+        return self._asset_url(path)
+
     # ── Command API ──
 
     def show_image(
@@ -196,19 +205,29 @@ class ChromiumPlayer:
         muted: bool = False,
         transition: str = "cut",
         duration_ms: int = DEFAULT_TRANSITION_MS,
+        loop_count: Optional[int] = None,
     ) -> None:
         url = self._asset_url(path)
         if url is None:
             logger.warning("ChromiumPlayer.show_video: not under assets dir: %s", path)
             return
-        self._enqueue({
+        payload: dict = {
             "cmd": "show_video",
             "url": url,
             "loop": bool(loop),
             "muted": bool(muted),
             "transition": transition,
             "duration_ms": duration_ms,
-        })
+        }
+        # loop_count drives finite-loop playback in player.js: the shell
+        # counts down on each video.ended, replays in-place (no layer
+        # swap, no fade hiccup) until the count is exhausted, then emits
+        # a terminal {event:"ended"} so the daemon can transition out.
+        # Only emit the field when the caller actually wants finite
+        # looping — otherwise the protocol stays backward-compatible.
+        if loop_count is not None and loop_count > 0:
+            payload["loop_count"] = int(loop_count)
+        self._enqueue(payload)
 
     def show_splash(self, path: Path) -> None:
         url = self._asset_url(path)

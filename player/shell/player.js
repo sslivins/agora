@@ -9,6 +9,9 @@
  *    "transition":"fade"|"cut","duration_ms":600}
  *   {"cmd":"show_video","url":"/assets/videos/bar.mp4",
  *    "loop":true,"muted":false,"transition":"fade","duration_ms":600}
+ *   {"cmd":"show_video","url":"/assets/videos/bar.mp4",
+ *    "loop":false,"loop_count":3,"muted":false,"transition":"fade",
+ *    "duration_ms":600}
  *   {"cmd":"show_splash","url":"/assets/splash/default.png"}
  *   {"cmd":"stop"}
  *
@@ -16,9 +19,16 @@
  * instantly. Missing or unrecognized values fall back to "cut" with a
  * console.warn — the CMS is the source of truth, the shell never guesses.
  *
+ * loop_count (videos only): when > 0, the shell plays the video N times
+ * in-place (no layer swap between iterations, so the loop is seamless)
+ * and then emits {event:"ended", asset, completed_loops:N}. When absent
+ * or 0, the cmd.loop field is honored as-is (HTML <video loop>).
+ *
  * Client -> server (informational):
  *   {"event":"ready"}                          (on initial connect)
  *   {"event":"ended","asset":"<url>"}           (single-play video ended)
+ *   {"event":"ended","asset":"<url>","completed_loops":N}
+ *                                               (loop_count video done)
  *   {"event":"error","asset":"<url>","msg":""} (load failure)
  */
 (function () {
@@ -51,12 +61,35 @@
       v.src = cmd.url;
       v.autoplay = true;
       v.muted = !!cmd.muted;
-      v.loop = !!cmd.loop;
       v.playsInline = true;
       v.preload = "auto";
-      v.addEventListener("ended", () => {
-        send({ event: "ended", asset: cmd.url });
-      });
+
+      // loop_count: finite seamless loop driven by ended events. We
+      // never set HTML loop=true in this branch because that would
+      // suppress the ended event entirely. Instead we count down,
+      // currentTime=0 + play() to replay in-place, and emit ended
+      // only when the count is exhausted. The user-facing "loop"
+      // (HTML attr) is used only when loop_count isn't specified.
+      const loopCount = Number.isInteger(cmd.loop_count) && cmd.loop_count > 0
+        ? cmd.loop_count : 0;
+      if (loopCount > 0) {
+        let remaining = loopCount - 1;  // first play counts as iteration 1
+        v.loop = false;
+        v.addEventListener("ended", () => {
+          if (remaining > 0) {
+            remaining -= 1;
+            try { v.currentTime = 0; v.play(); }
+            catch (_) { /* if replay fails, fall through to terminal */ }
+            return;
+          }
+          send({ event: "ended", asset: cmd.url, completed_loops: loopCount });
+        });
+      } else {
+        v.loop = !!cmd.loop;
+        v.addEventListener("ended", () => {
+          send({ event: "ended", asset: cmd.url });
+        });
+      }
       v.addEventListener("error", () => {
         send({ event: "error", asset: cmd.url, msg: "video load failed" });
       });

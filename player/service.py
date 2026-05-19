@@ -219,6 +219,11 @@ class AgoraPlayer:
                 assets_dir=self.assets_dir,
                 on_event=self._on_chromium_event,
             )
+        # Armed when ``apply_desired`` dispatches a scheduled finite-loop
+        # video through the chromium shell. ``_on_chromium_event`` clears
+        # it on the terminal ``ended`` event and transitions to splash.
+        # Single entry: only one scheduled asset can be live at once.
+        self._chromium_scheduled_pending: Optional[dict] = None
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self._mpv_process: Optional[subprocess.Popen] = None
@@ -332,6 +337,7 @@ class AgoraPlayer:
         """Tear down slideshow state (cancel timeout, drop manifest)."""
         self._cancel_slide_timeout()
         self._cancel_play_to_end_watchdog()
+        self._cancel_play_to_end_chromium_watchdog()
         self._slideshow = None
         self._slideshow_manifest_digest = None
 
@@ -363,6 +369,7 @@ class AgoraPlayer:
             "timeout_id": None,
             "epoch": prev_epoch + 1,
             "pending_play_to_end": None,
+            "pending_play_to_end_chromium": None,
             # Misses-this-cycle counter guards against runaway recursion
             # when every slide in the manifest is missing on disk.
             "misses_this_cycle": 0,
@@ -437,10 +444,11 @@ class AgoraPlayer:
         )
 
         # Chromium backend (demo): route slide playback through the shell.
-        # For the demo, play_to_end videos are best-effort: we treat them
-        # as fixed-duration using the manifest hint (or a 30s fallback).
-        # Wiring shell 'ended' events back into _play_next_slide is a
-        # follow-up — see docs/chromium-player-demo.md.
+        # For the demo, play_to_end videos used to be best-effort with a
+        # fixed-duration timeout. Now we wire the shell's terminal
+        # "ended" event back into the slideshow sequencer so video slides
+        # advance on real end-of-file. Images and non-play_to_end videos
+        # still use the GLib timeout for slide expiry.
         if self._use_chromium_backend and self._chromium_player:
             # Per-slide transition is opt-in via the manifest; absent or
             # unknown values fall back to "cut" (instant swap) on the
@@ -448,8 +456,15 @@ class AgoraPlayer:
             # slide's on-screen duration (that's duration_ms below).
             slide_transition = slide.get("transition") or "cut"
             slide_transition_ms = int(slide.get("transition_ms") or 600)
+            if is_video_slide and play_to_end:
+                self._play_slide_to_end_chromium(
+                    slide, slide_name, path, ss,
+                    transition=slide_transition,
+                    transition_ms=slide_transition_ms,
+                )
+                return False
             if is_video_slide:
-                # Slideshow videos loop within their duration; the
+                # Slideshow videos loop within their fixed duration; the
                 # next-slide timeout drives advance.
                 self._chromium_player.show_video(
                     path, loop=True, muted=False,
@@ -464,7 +479,7 @@ class AgoraPlayer:
                 )
             duration_ms = int(slide.get("duration_ms") or 0)
             if duration_ms <= 0:
-                duration_ms = 30000 if play_to_end else 10000
+                duration_ms = 10000
             ss["timeout_id"] = GLib.timeout_add(
                 duration_ms, self._on_slide_timeout,
             )
@@ -575,6 +590,85 @@ class AgoraPlayer:
         # _play_next_slide.
         self._stop_mpv()
         self._start_mpv(path, loop=False)
+
+    def _play_slide_to_end_chromium(
+        self,
+        slide: dict,
+        slide_name: str,
+        path: Path,
+        ss: dict,
+        *,
+        transition: str,
+        transition_ms: int,
+    ) -> None:
+        """Chromium equivalent of ``_play_slide_to_end``.
+
+        Sends a single-play (``loop=False``) ``show_video`` so the shell
+        emits an ``ended`` event on natural EOF, arms a slideshow-side
+        pending record matched against the asset URL, and starts a
+        watchdog so a misbehaving asset can't stall the show forever.
+        """
+        if not self._chromium_player:  # pragma: no cover — guarded by caller
+            return
+        asset_url = self._chromium_player.asset_url(path)
+        if asset_url is None:
+            logger.warning(
+                "Slideshow %s: asset %s not under assets dir — falling back to "
+                "timeout-driven advance",
+                ss.get("name"), path,
+            )
+            self._chromium_player.show_video(
+                path, loop=True, muted=False,
+                transition=transition, duration_ms=transition_ms,
+            )
+            duration_ms = int(slide.get("duration_ms") or 0)
+            if duration_ms <= 0:
+                duration_ms = 30000
+            ss["timeout_id"] = GLib.timeout_add(
+                duration_ms, self._on_slide_timeout,
+            )
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=ss["name"],
+                started_at=datetime.now(timezone.utc),
+            )
+            return
+
+        self._chromium_player.show_video(
+            path, loop=False, muted=False,
+            transition=transition, duration_ms=transition_ms,
+        )
+
+        # Watchdog: 2× hinted duration with a 60s floor, capped at the
+        # hard cap so a misreported manifest can't stall the show.
+        duration_ms = int(slide.get("duration_ms") or 0)
+        if duration_ms > 0:
+            watchdog_ms = max(duration_ms * 2, 60_000)
+        else:
+            watchdog_ms = self._PLAY_TO_END_WATCHDOG_HARD_CAP_MS
+        watchdog_ms = min(watchdog_ms, self._PLAY_TO_END_WATCHDOG_HARD_CAP_MS)
+        epoch = ss["epoch"]
+        watchdog_id = GLib.timeout_add(
+            watchdog_ms, self._on_play_to_end_chromium_watchdog, epoch,
+        )
+        ss["pending_play_to_end_chromium"] = {
+            "slide_index": ss["index"] - 1,
+            "slide_name": slide_name,
+            "asset_url": asset_url,
+            "epoch": epoch,
+            "armed_at": datetime.now(timezone.utc),
+            "watchdog_id": watchdog_id,
+        }
+        self._update_current(
+            mode=PlaybackMode.PLAY,
+            asset=ss["name"],
+            started_at=datetime.now(timezone.utc),
+        )
+        logger.info(
+            "Slideshow %s: armed play_to_end via chromium shell "
+            "(slide=%s asset_url=%s watchdog=%dms)",
+            ss["name"], slide_name, asset_url, watchdog_ms,
+        )
 
     def _on_slide_timeout(self) -> bool:
         """GLib timeout callback for image slide expiry."""
@@ -2070,6 +2164,7 @@ class AgoraPlayer:
         # Clear any armed scheduled-pending so a stale event arriving from
         # the file we're about to replace can't re-trigger _show_splash.
         self._scheduled_pending = None
+        self._chromium_scheduled_pending = None
         self._stop_sway()
         error = self._pending_error
         self._pending_error = None
@@ -2299,11 +2394,129 @@ class AgoraPlayer:
     def _on_chromium_event(self, payload: dict) -> None:
         """Shell → daemon event callback (runs on the shell server thread).
 
-        Demo scope: log only. play_to_end accuracy is best-effort via the
-        GLib slide timeout — wiring 'ended' events into the slideshow
-        sequencer is a follow-up.
+        Bridges into the GLib main loop via ``idle_add`` so the actual
+        handler reads/writes ``_slideshow`` and ``_chromium_scheduled_pending``
+        on the same thread as everything else that touches them.
         """
         logger.debug("chromium shell event: %s", payload)
+        try:
+            GLib.idle_add(self._handle_chromium_event_on_main, payload)
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("Failed to schedule chromium event handling")
+
+    def _handle_chromium_event_on_main(self, payload: dict) -> bool:
+        """GLib idle callback: dispatch a single shell event.
+
+        Always returns False (one-shot). The payload is whatever the shell
+        sent over /ws (currently ``{event: "ready" | "ended" | "error",
+        asset?, completed_loops?, msg?}``).
+        """
+        try:
+            kind = payload.get("event") if isinstance(payload, dict) else None
+            if kind != "ended":
+                # "ready" / "error" / unknown — nothing to dispatch yet.
+                return False
+            asset_url = payload.get("asset")
+            if not isinstance(asset_url, str) or not asset_url:
+                logger.debug("chromium 'ended' with no asset url — ignoring")
+                return False
+            # Slideshow play_to_end takes priority — both pending dicts
+            # are scoped to different state machines and cannot be armed
+            # for the same asset simultaneously by construction.
+            if self._dispatch_chromium_ended_to_slideshow(asset_url):
+                return False
+            self._dispatch_chromium_ended_to_scheduled(asset_url)
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("Error handling chromium event %r", payload)
+        return False
+
+    def _dispatch_chromium_ended_to_slideshow(self, asset_url: str) -> bool:
+        """Return True iff the event matched a slideshow play_to_end claim.
+
+        On match, cancels the watchdog and advances the slideshow.
+        """
+        ss = self._slideshow
+        if not ss:
+            return False
+        pending = ss.get("pending_play_to_end_chromium")
+        if not pending:
+            return False
+        if pending.get("asset_url") != asset_url:
+            logger.debug(
+                "chromium ended ignored: asset mismatch (event=%s armed=%s)",
+                asset_url, pending.get("asset_url"),
+            )
+            return False
+        logger.info(
+            "chromium ended for slide %d (%s) — advancing",
+            pending["slide_index"], pending["slide_name"],
+        )
+        self._cancel_play_to_end_chromium_watchdog()
+        ss["pending_play_to_end_chromium"] = None
+        self._play_next_slide()
+        return True
+
+    def _dispatch_chromium_ended_to_scheduled(self, asset_url: str) -> None:
+        """Handle a terminal ``ended`` for a scheduled finite-loop video.
+
+        player.js owns the loop counting (it replays in-place to keep the
+        transition seamless) and only emits ``ended`` once the loop count
+        is exhausted. On match we drop the armed record and transition to
+        splash.
+        """
+        sp = self._chromium_scheduled_pending
+        if not sp:
+            return
+        if sp.get("asset_url") != asset_url:
+            logger.debug(
+                "chromium scheduled-ended ignored: asset mismatch "
+                "(event=%s armed=%s)",
+                asset_url, sp.get("asset_url"),
+            )
+            return
+        logger.info(
+            "chromium scheduled finite-loop completed for %s — splashing",
+            sp.get("asset_name"),
+        )
+        self._chromium_scheduled_pending = None
+        self._show_splash()
+
+    def _cancel_play_to_end_chromium_watchdog(self) -> None:
+        """Cancel any armed chromium play_to_end watchdog."""
+        ss = self._slideshow
+        if not ss:
+            return
+        pending = ss.get("pending_play_to_end_chromium")
+        if not pending:
+            return
+        wid = pending.get("watchdog_id")
+        if wid:
+            try:
+                GLib.source_remove(wid)
+            except Exception:
+                pass
+            pending["watchdog_id"] = None
+
+    def _on_play_to_end_chromium_watchdog(self, slideshow_epoch: int) -> bool:
+        """GLib timeout fired when a chromium play_to_end slide hasn't
+        emitted an ``ended`` event within the watchdog window. Advances
+        the slideshow so we never get stuck on a broken video. Returns
+        False (one-shot).
+        """
+        ss = self._slideshow
+        if not ss or ss.get("epoch") != slideshow_epoch:
+            return False
+        pending = ss.get("pending_play_to_end_chromium")
+        if not pending:
+            return False
+        logger.warning(
+            "chromium play_to_end watchdog fired for slide %d (%s) — advancing",
+            pending["slide_index"], pending["slide_name"],
+        )
+        pending["watchdog_id"] = None
+        ss["pending_play_to_end_chromium"] = None
+        self._play_next_slide()
+        return False
 
     def _is_showing_splash(self) -> bool:
         """True iff the current renderer state is the splash file."""
@@ -2571,15 +2784,52 @@ class AgoraPlayer:
             # path (handled by an earlier branch in this function).
             if self._use_chromium_backend and self._chromium_player:
                 self._teardown()
+                # Clear any stale armed scheduled-pending so a late event
+                # from a previously-armed asset can't fire _show_splash
+                # after we've moved on.
+                self._chromium_scheduled_pending = None
                 self._current_path = path
                 try:
                     self._current_mtime = path.stat().st_mtime
                 except OSError:
                     self._current_mtime = None
                 if is_video:
-                    self._chromium_player.show_video(
-                        path, loop=bool(desired.loop), muted=False,
+                    # Finite-loop is owned by player.js: we hand it
+                    # loop_count and the shell counts down, replays
+                    # in-place, then emits a terminal "ended" we use
+                    # to flip to splash.
+                    finite_loop_count = (
+                        int(desired.loop_count)
+                        if desired.loop_count is not None and desired.loop_count > 0
+                        else None
                     )
+                    self._chromium_player.show_video(
+                        path,
+                        loop=bool(desired.loop) and finite_loop_count is None,
+                        muted=False,
+                        loop_count=finite_loop_count,
+                    )
+                    if finite_loop_count is not None:
+                        asset_url = self._chromium_player.asset_url(path)
+                        if asset_url is not None:
+                            self._chromium_scheduled_pending = {
+                                "asset_url": asset_url,
+                                "asset_name": desired.asset,
+                                "target_count": finite_loop_count,
+                                "armed_at": datetime.now(timezone.utc),
+                            }
+                            logger.info(
+                                "Chromium scheduled finite-loop armed: %s "
+                                "loop_count=%d asset_url=%s",
+                                desired.asset, finite_loop_count, asset_url,
+                            )
+                        else:
+                            logger.warning(
+                                "Chromium scheduled %s: asset not under "
+                                "assets_dir — loop_count semantics will "
+                                "fire-and-forget (no splash on completion)",
+                                desired.asset,
+                            )
                 else:
                     self._chromium_player.show_image(path)
                 self._update_current(

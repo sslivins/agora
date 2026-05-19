@@ -72,17 +72,22 @@ source of truth for transition selection. New named transitions are
 
 ## Known demo limitations
 
-- **`play_to_end` is best-effort.** The shell's `<video>.ended` event isn't
-  wired back through the WebSocket to `_play_next_slide`. Slide advance is
-  driven by the slide's `duration_ms` (or 30 s fallback for play_to_end).
-- **No `loop_count` IPC parity.** Looped videos run with the HTML `loop`
-  attribute; tighter mpv-style loop semantics aren't reproduced.
 - **Streams still on mpv.** Easy to add later but skipped for the demo.
 - **No backend hot-swap.** Backend is chosen once at startup via env var.
 - **Single chromium process owns the display.** If chromium crashes, the
   player as a whole restarts (acceptable for a demo branch).
 - **Pi 5 only.** Tested with the user's Pi-5-with-HEVC-chromium setup.
   Pi Zero 2 W and Pi 4 should stay on mpv — they're not part of this demo.
+
+### Resolved
+
+- **`play_to_end` is now event-driven.** Slideshow video slides marked
+  `play_to_end` advance on the shell's terminal `ended` event, with a
+  2× hinted-duration watchdog (60 s floor, 10 min cap) as a safety net.
+- **`loop_count` reaches the shell.** Scheduled finite-loop videos pass
+  through with `loop_count=N`; the shell counts down in-place (seamless,
+  no layer swap) and emits a terminal `ended` that the daemon converts
+  to a splash transition.
 
 ## Enabling on a Pi 5
 
