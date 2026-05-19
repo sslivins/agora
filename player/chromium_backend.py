@@ -33,7 +33,10 @@ import threading
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    from player.sway_manager import SwayManager  # noqa: F401  (forward ref)
 
 logger = logging.getLogger("agora.player.chromium")
 
@@ -87,6 +90,24 @@ class ChromiumPlayer:
           process group. Without the scope, ``killpg`` on the sway pid
           would leak chromium and the next start would fail to acquire
           ``/dev/dri/cardX``.
+
+    Two operating modes:
+
+      * **Standalone (single-display, legacy)**: ``sway_manager`` is
+        ``None``. This instance owns its own sway scope and chromium
+        runs as an ``exec`` line inside that sway. Existing single-
+        display callers stay on this path.
+
+      * **External sway (multi-display)**: ``sway_manager`` is a
+        :class:`player.sway_manager.SwayManager` that has already been
+        started by the ``Coordinator``. This instance does NOT spawn
+        sway; instead it launches its chromium subprocess directly as
+        a transient systemd scope, attached to the running sway as a
+        Wayland client via ``WAYLAND_DISPLAY`` / ``XDG_RUNTIME_DIR``.
+        ``app_id`` is passed to chromium as ``--class=<app_id>`` so the
+        sway config's ``for_window`` rules can pin the kiosk to its
+        target HDMI output. ``stop()`` only tears down the chromium
+        scope -- the shared sway stays up.
     """
 
     def __init__(
@@ -97,6 +118,8 @@ class ChromiumPlayer:
         port: int = DEFAULT_BIND_PORT,
         on_event: Optional[Callable[[dict], None]] = None,
         spawn_kiosk: bool = True,
+        sway_manager: Optional["SwayManager"] = None,
+        app_id: Optional[str] = None,
     ) -> None:
         self.assets_dir = Path(assets_dir)
         self.shell_dir = Path(shell_dir)
@@ -104,6 +127,8 @@ class ChromiumPlayer:
         self.port = port
         self._on_event = on_event
         self._spawn_kiosk = spawn_kiosk
+        self._sway_manager = sway_manager
+        self._app_id = app_id
 
         self._server_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -111,6 +136,10 @@ class ChromiumPlayer:
         self._stop_event: Optional[asyncio.Event] = None
         self._ws_state = _WebSocketState()
 
+        # Process handle: either the standalone sway scope (when this
+        # instance owns sway) or the chromium-only scope (when external
+        # sway is provided). ``_scope_unit`` always names whichever
+        # scope is alive.
         self._sway_process: Optional[subprocess.Popen] = None
         self._sway_scope_unit: Optional[str] = None
 
@@ -139,10 +168,19 @@ class ChromiumPlayer:
             self.host, self.port,
         )
         if self._spawn_kiosk:
-            self._start_sway_kiosk()
+            if self._sway_manager is not None:
+                self._start_chromium_client_scope()
+            else:
+                self._start_sway_kiosk()
 
     def stop(self) -> None:
-        """Stop sway+chromium and the shell server."""
+        """Stop sway+chromium and the shell server.
+
+        In external-sway mode, ``_stop_sway_kiosk`` stops *our* scope
+        (the chromium-only one). The shared sway is owned by the
+        ``SwayManager`` -- callers there are responsible for shutting
+        it down independently.
+        """
         self._stop_sway_kiosk()
         if self._loop and self._stop_event:
             try:
@@ -386,21 +424,38 @@ class ChromiumPlayer:
 
     # ── Sway kiosk subprocess ──
 
+    def _chromium_argv(self, *, app_id: Optional[str] = None) -> list[str]:
+        """Build the chromium command line used by both launch modes.
+
+        ``--class=<app_id>`` is set when ``app_id`` is provided so the
+        wayland xdg-shell ``app_id`` matches the ``for_window`` rules in
+        the external sway's baked config. (Yes, ``--class`` on Wayland
+        sets the app_id, despite the X11-era flag name.)
+        """
+        argv = [
+            "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
+            "--disable-translate", "--disable-infobars", "--incognito",
+            "--hide-scrollbars",
+            "--autoplay-policy=no-user-gesture-required",
+            "--load-extension=/opt/agora/src/player/extensions/hide-cursor",
+        ]
+        if app_id:
+            argv.append(f"--class={app_id}")
+        argv.append(self.shell_url())
+        return argv
+
     def _write_shell_sway_config(self) -> Path:
         """Render a minimal sway config that execs chromium at the shell URL.
 
         Lives inside the same 0o700 runtime dir used for ``XDG_RUNTIME_DIR``,
         written with ``O_NOFOLLOW`` so a pre-existing symlink can't redirect
         the (URL-containing) config body.
+
+        Only used in standalone (legacy) mode. In external-sway mode
+        the ``SwayManager`` writes its own config; this method is never
+        called.
         """
-        chromium_cmd = [
-            "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
-            "--disable-translate", "--disable-infobars", "--incognito",
-            "--hide-scrollbars",
-            "--autoplay-policy=no-user-gesture-required",
-            "--load-extension=/opt/agora/src/player/extensions/hide-cursor",
-            self.shell_url(),
-        ]
+        chromium_cmd = self._chromium_argv(app_id=None)
         exec_line = "exec " + shlex.join(chromium_cmd)
         body = (
             "output * bg #000000 solid_color\n"
@@ -488,6 +543,10 @@ class ChromiumPlayer:
         Tears down via ``systemctl stop`` on the transient scope so the
         cgroup signals every descendant — including double-forked
         chromium grandchildren that pgrp-based kills can't see.
+
+        Works for both standalone and external-sway modes: the scope
+        contains different processes (sway+chromium vs chromium-only)
+        but the scope-teardown logic is identical.
         """
         proc = self._sway_process
         unit = self._sway_scope_unit
@@ -517,6 +576,58 @@ class ChromiumPlayer:
                     pass
         self._sway_process = None
         self._sway_scope_unit = None
+
+    def _start_chromium_client_scope(self) -> None:
+        """Launch chromium as a wayland client of the external SwayManager.
+
+        Used only when ``sway_manager`` is provided (multi-display
+        mode). Skips sway entirely -- the chromium subprocess connects
+        to the running sway via ``WAYLAND_DISPLAY`` /
+        ``XDG_RUNTIME_DIR`` from :meth:`SwayManager.env_for_client`.
+
+        Sets ``--class=<app_id>`` on chromium so the sway config's
+        ``for_window`` rules can pin the kiosk window to the correct
+        HDMI output. Wrapped in a transient systemd scope (same
+        rationale as standalone mode) so cgroup teardown reaches
+        chromium's double-forked grandchildren.
+        """
+        # Idempotency: if a previous client scope is still alive,
+        # tear it down first so we never have two chromiums fighting
+        # for the same shell URL.
+        self._stop_sway_kiosk()
+
+        assert self._sway_manager is not None  # checked by caller
+        env = os.environ.copy()
+        env.update(self._sway_manager.env_for_client())
+
+        self._sway_scope_unit = (
+            f"agora-shell-{(self._app_id or 'kiosk').replace('agora-shell-', '')}"
+            f"-{uuid.uuid4().hex[:8]}.scope"
+        )
+
+        argv = self._chromium_argv(app_id=self._app_id)
+        cmd = [
+            "systemd-run", "--scope", "--quiet",
+            "--unit", self._sway_scope_unit, "--collect",
+            *argv,
+        ]
+        logger.info(
+            "ChromiumPlayer: launching chromium client kiosk → %s "
+            "(app_id=%s, scope=%s)",
+            self.shell_url(), self._app_id, self._sway_scope_unit,
+        )
+        try:
+            self._sway_process = subprocess.Popen(
+                cmd, env=env,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, OSError) as e:
+            logger.error(
+                "ChromiumPlayer: failed to launch chromium client: %s", e,
+            )
+            self._sway_process = None
+            self._sway_scope_unit = None
 
 
 class _WebSocketState:
