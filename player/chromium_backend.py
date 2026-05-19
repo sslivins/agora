@@ -3,15 +3,23 @@ Chromium-based playback backend (demo).
 
 A small FastAPI/uvicorn server bound to 127.0.0.1 serves a static "player
 shell" SPA and the device's asset directory, plus a control WebSocket.
-A single cage+chromium subprocess is launched in kiosk mode pointing at
-that server, and the daemon drives the shell over the WebSocket with
-JSON commands.
+A single sway+chromium subprocess (wrapped in a transient systemd scope)
+is launched in kiosk mode pointing at that server, and the daemon drives
+the shell over the WebSocket with JSON commands.
 
 This is an opt-in alternative to mpv, intended to make rich image
 transitions and unified image/video rendering easy to iterate on.
 Enable by setting environment variable AGORA_PLAYER_BACKEND=chromium.
 
 The protocol is documented in ``player/shell/README.md``.
+
+Note: this module owns its own sway+chromium kiosk pointed at the shell
+URL. A separate sway is spawned by ``AgoraPlayer._start_sway`` for
+webpage-asset rendering. The two cannot coexist (single DRM device),
+so mode-mixing chromium-backed playback with webpage assets is a known
+follow-up — when a webpage URL arrives, the shell-kiosk sway is torn
+down, and apply_desired will need to bring it back when returning to
+chromium-backed playback.
 """
 from __future__ import annotations
 
@@ -19,9 +27,10 @@ import asyncio
 import json
 import logging
 import os
-import signal
+import shlex
 import subprocess
 import threading
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
@@ -46,9 +55,17 @@ DEFAULT_TRANSITION_MS = 600
 
 SHELL_DIR = Path(__file__).resolve().parent / "shell"
 
+# Sway runtime paths for the chromium-shell kiosk. Kept distinct from the
+# webpage-asset path's ``/tmp/agora-sway-run`` so the two can't trample
+# each other's config file or runtime state — but only ONE sway can be
+# alive at a time on the actual DRM device, so the coordination problem
+# is real even with split paths. See module docstring.
+_SHELL_SWAY_RUNTIME_DIR = "/tmp/agora-sway-shell-run"
+_SHELL_SWAY_CONFIG_PATH = "/tmp/agora-sway-shell-run/sway.conf"
+
 
 class ChromiumPlayer:
-    """Manage a persistent cage+chromium kiosk + shell control channel.
+    """Manage a persistent sway+chromium kiosk + shell control channel.
 
     Lifecycle:
         player = ChromiumPlayer(assets_dir=Path("/opt/agora/assets"))
@@ -63,9 +80,13 @@ class ChromiumPlayer:
         * Callers invoke ``show_*`` / ``stop_playback`` from any thread; the
           method pushes the command into the loop via
           ``run_coroutine_threadsafe``.
-        * The cage+chromium subprocess is unmanaged by the asyncio loop —
-          it's just a child process polled the same way ``_sway_process``
-          is in ``service.py``.
+        * The sway+chromium subprocess is unmanaged by the asyncio loop —
+          it's wrapped in a transient systemd scope (mirroring
+          ``AgoraPlayer._start_sway``) so the cgroup tracks chromium
+          grandchildren that sway's ``exec`` double-forks out of any
+          process group. Without the scope, ``killpg`` on the sway pid
+          would leak chromium and the next start would fail to acquire
+          ``/dev/dri/cardX``.
     """
 
     def __init__(
@@ -75,14 +96,14 @@ class ChromiumPlayer:
         host: str = DEFAULT_BIND_HOST,
         port: int = DEFAULT_BIND_PORT,
         on_event: Optional[Callable[[dict], None]] = None,
-        spawn_chromium: bool = True,
+        spawn_kiosk: bool = True,
     ) -> None:
         self.assets_dir = Path(assets_dir)
         self.shell_dir = Path(shell_dir)
         self.host = host
         self.port = port
         self._on_event = on_event
-        self._spawn_chromium = spawn_chromium
+        self._spawn_kiosk = spawn_kiosk
 
         self._server_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -90,12 +111,13 @@ class ChromiumPlayer:
         self._stop_event: Optional[asyncio.Event] = None
         self._ws_state = _WebSocketState()
 
-        self._chromium_proc: Optional[subprocess.Popen] = None
+        self._sway_process: Optional[subprocess.Popen] = None
+        self._sway_scope_unit: Optional[str] = None
 
     # ── Public lifecycle ──
 
     def start(self) -> None:
-        """Start the shell server and spawn cage+chromium."""
+        """Start the shell server and spawn sway+chromium."""
         if self._server_thread and self._server_thread.is_alive():
             logger.debug("ChromiumPlayer.start: already running")
             return
@@ -116,12 +138,12 @@ class ChromiumPlayer:
             "ChromiumPlayer shell server listening on http://%s:%d",
             self.host, self.port,
         )
-        if self._spawn_chromium:
-            self._start_chromium()
+        if self._spawn_kiosk:
+            self._start_sway_kiosk()
 
     def stop(self) -> None:
-        """Stop cage+chromium and the shell server."""
-        self._stop_chromium()
+        """Stop sway+chromium and the shell server."""
+        self._stop_sway_kiosk()
         if self._loop and self._stop_event:
             try:
                 self._loop.call_soon_threadsafe(self._stop_event.set)
@@ -135,14 +157,18 @@ class ChromiumPlayer:
         self._server = None
 
     def is_alive(self) -> bool:
-        """True iff both the shell server thread and chromium are alive."""
+        """True iff both the shell server thread and the kiosk are alive."""
         server_ok = bool(self._server_thread and self._server_thread.is_alive())
-        if not self._spawn_chromium:
+        if not self._spawn_kiosk:
             return server_ok
-        chromium_ok = bool(
-            self._chromium_proc and self._chromium_proc.poll() is None
+        kiosk_ok = bool(
+            self._sway_process and self._sway_process.poll() is None
         )
-        return server_ok and chromium_ok
+        return server_ok and kiosk_ok
+
+    def shell_url(self) -> str:
+        """The HTTP URL the kiosk should be pointed at."""
+        return f"http://{self.host}:{self.port}/"
 
     # ── Command API ──
 
@@ -339,60 +365,139 @@ class ChromiumPlayer:
             loop.close()
             ready.set()  # in case we crashed before binding
 
-    # ── Chromium subprocess ──
+    # ── Sway kiosk subprocess ──
 
-    def _start_chromium(self) -> None:
-        """Launch cage + chromium in kiosk mode pointed at the shell."""
-        env = os.environ.copy()
-        env["XDG_RUNTIME_DIR"] = "/tmp/cage-run"
-        try:
-            os.makedirs("/tmp/cage-run", exist_ok=True)
-        except OSError as e:
-            logger.warning("ChromiumPlayer: could not create cage runtime dir: %s", e)
+    def _write_shell_sway_config(self) -> Path:
+        """Render a minimal sway config that execs chromium at the shell URL.
 
-        url = f"http://{self.host}:{self.port}/"
-        cmd = [
-            "cage", "-d", "--",
+        Lives inside the same 0o700 runtime dir used for ``XDG_RUNTIME_DIR``,
+        written with ``O_NOFOLLOW`` so a pre-existing symlink can't redirect
+        the (URL-containing) config body.
+        """
+        chromium_cmd = [
             "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
             "--disable-translate", "--disable-infobars", "--incognito",
             "--hide-scrollbars",
             "--autoplay-policy=no-user-gesture-required",
-            # Loading a local URL → no need to fight a low-mem prompt or
-            # disable site isolation. Pi 5 has enough RAM for defaults.
             "--load-extension=/opt/agora/src/player/extensions/hide-cursor",
-            url,
+            self.shell_url(),
+        ]
+        exec_line = "exec " + shlex.join(chromium_cmd)
+        body = (
+            "output * bg #000000 solid_color\n"
+            "seat * hide_cursor 1\n"
+            "default_border none\n"
+            "default_floating_border none\n"
+            "hide_edge_borders both\n"
+            'for_window [shell=".*"] fullscreen enable, border none\n'
+            "\n" + exec_line + "\n"
+        )
+        runtime_dir = Path(_SHELL_SWAY_RUNTIME_DIR)
+        runtime_dir.mkdir(mode=0o700, exist_ok=True)
+        try:
+            os.chmod(runtime_dir, 0o700)
+        except OSError:
+            pass
+        conf_path = Path(_SHELL_SWAY_CONFIG_PATH)
+        o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(
+            str(conf_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | o_nofollow,
+            0o600,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(body)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        return conf_path
+
+    def _start_sway_kiosk(self) -> None:
+        """Launch sway + chromium in kiosk mode pointed at the shell URL.
+
+        Mirrors ``AgoraPlayer._start_sway`` — wraps sway in a transient
+        systemd scope so the cgroup catches chromium grandchildren that
+        sway's ``exec`` double-forks + setsids out of any process group.
+        """
+        self._stop_sway_kiosk()
+
+        env = os.environ.copy()
+        env["XDG_RUNTIME_DIR"] = _SHELL_SWAY_RUNTIME_DIR
+        # _write_shell_sway_config ensures the runtime dir exists at 0o700.
+
+        try:
+            conf = self._write_shell_sway_config()
+        except OSError as e:
+            logger.error("ChromiumPlayer: could not write sway config: %s", e)
+            return
+
+        # Per-invocation unique scope unit name — a stable name would
+        # collide if a previous _stop_sway_kiosk ever failed to fully
+        # reap the scope, trapping retries with "unit already exists".
+        self._sway_scope_unit = f"agora-sway-shell-{uuid.uuid4().hex[:8]}.scope"
+
+        cmd = [
+            "systemd-run", "--scope", "--quiet",
+            "--unit", self._sway_scope_unit, "--collect",
+            "sway", "-c", str(conf),
         ]
 
-        logger.info("ChromiumPlayer: launching kiosk → %s", url)
+        logger.info(
+            "ChromiumPlayer: launching sway+chromium kiosk → %s (scope=%s)",
+            self.shell_url(), self._sway_scope_unit,
+        )
         try:
-            self._chromium_proc = subprocess.Popen(
+            self._sway_process = subprocess.Popen(
                 cmd, env=env,
                 start_new_session=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except (FileNotFoundError, OSError) as e:
-            logger.error("ChromiumPlayer: failed to launch cage+chromium: %s", e)
+            logger.error(
+                "ChromiumPlayer: failed to launch sway+chromium: %s", e,
+            )
+            self._sway_process = None
+            self._sway_scope_unit = None
 
-    def _stop_chromium(self) -> None:
-        proc = self._chromium_proc
-        if proc and proc.poll() is None:
-            logger.info("ChromiumPlayer: stopping kiosk (PID %d)", proc.pid)
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                pass
+    def _stop_sway_kiosk(self) -> None:
+        """Stop the sway+chromium kiosk scope if running.
+
+        Tears down via ``systemctl stop`` on the transient scope so the
+        cgroup signals every descendant — including double-forked
+        chromium grandchildren that pgrp-based kills can't see.
+        """
+        proc = self._sway_process
+        unit = self._sway_scope_unit
+        if proc and proc.poll() is None and unit:
+            logger.info(
+                "ChromiumPlayer: stopping kiosk scope=%s pid=%d",
+                unit, proc.pid,
+            )
+            subprocess.run(
+                ["systemctl", "stop", unit],
+                timeout=8, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
+                # Cgroup KILL fallback — reaches double-forked grandchildren
+                # that pgrp-based kills can't see.
+                subprocess.run(
+                    ["systemctl", "kill", "-s", "SIGKILL", unit],
+                    timeout=5, check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     pass
-        self._chromium_proc = None
+        self._sway_process = None
+        self._sway_scope_unit = None
 
 
 class _WebSocketState:

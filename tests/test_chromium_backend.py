@@ -1,7 +1,7 @@
 """Unit tests for the chromium-shell playback backend (demo).
 
 These tests purposely do not require fastapi/uvicorn to be installed,
-and do not spawn cage/chromium or open real network sockets. They cover
+and do not spawn sway/chromium or open real network sockets. They cover
 the public command API, asset-URL sandboxing, and the buffer-coalescing
 behaviour of ``_WebSocketState`` which guards against losing user
 intent across shell reconnects.
@@ -26,7 +26,7 @@ def cp(tmp_path):
     """ChromiumPlayer pointed at a temp assets dir; no real subprocess."""
     assets = tmp_path / "assets"
     assets.mkdir()
-    return ChromiumPlayer(assets_dir=assets, spawn_chromium=False)
+    return ChromiumPlayer(assets_dir=assets, spawn_kiosk=False)
 
 
 def _capture_commands(cp: ChromiumPlayer) -> list[dict]:
@@ -279,7 +279,7 @@ def routing_cp(tmp_path):
     shell = tmp_path / "shell"
     shell.mkdir()
     (shell / "index.html").write_text("<html>shell-root</html>", encoding="utf-8")
-    return ChromiumPlayer(assets_dir=assets, shell_dir=shell, spawn_chromium=False)
+    return ChromiumPlayer(assets_dir=assets, shell_dir=shell, spawn_kiosk=False)
 
 
 def test_ws_route_is_not_shadowed_by_static_mount(routing_cp):

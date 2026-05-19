@@ -207,9 +207,9 @@ class AgoraPlayer:
         # When AGORA_PLAYER_BACKEND=chromium is set, image / video / splash
         # / slideshow playback is routed through a persistent chromium
         # kiosk + shell SPA instead of mpv. Streams and webpage assets
-        # keep their existing renderers (mpv-stream, cage+chromium-webpage)
-        # because the demo doesn't replace those. See player/shell/ and
-        # docs/chromium-player-demo.md.
+        # keep their existing renderers (mpv-stream, sway+chromium for
+        # webpage assets) because the demo doesn't replace those. See
+        # player/shell/ and docs/chromium-player-demo.md.
         self._use_chromium_backend = (
             os.environ.get("AGORA_PLAYER_BACKEND") == "chromium"
         )
@@ -2567,8 +2567,8 @@ class AgoraPlayer:
             self._loops_completed = 0
 
             # Chromium backend (demo): route image/video through the shell.
-            # Streams stay on mpv; webpage assets stay on cage+chromium
-            # (handled by an earlier branch in this function).
+            # Streams stay on mpv; webpage assets fall back to the sway
+            # path (handled by an earlier branch in this function).
             if self._use_chromium_backend and self._chromium_player:
                 self._teardown()
                 self._current_path = path

@@ -19,8 +19,9 @@ The daemon also serves the asset library at `/assets/`:
 - `/assets/videos/...`
 - `/assets/splash/...`
 
-Chromium is launched (via `cage`) pointing at `http://127.0.0.1:8780/`.
-It stays up for the life of the player process.
+Chromium is launched (via `sway`, wrapped in a transient systemd scope)
+pointing at `http://127.0.0.1:8780/`. It stays up for the life of the
+player process.
 
 ## Control protocol
 

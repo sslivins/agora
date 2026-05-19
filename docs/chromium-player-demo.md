@@ -6,7 +6,7 @@ Status: **experimental demo, branch `feat/chromium-player-demo`** — not for pr
 
 A second playback renderer for the agora player. Instead of driving mpv (video)
 and GStreamer (images/splash) directly, the player runs an in-process FastAPI
-server, launches **one** chromium-in-cage kiosk pointed at it, and drives
+server, launches **one** chromium-in-sway kiosk pointed at it, and drives
 playback by sending JSON commands over a WebSocket to a small SPA ("the shell").
 
 Goal: prototype richer still-image transitions (crossfade today, Ken Burns / wipe
@@ -27,11 +27,15 @@ agora-player (Python process)
     │     GET  /static/*         →  shell CSS/JS
     │     GET  /assets/<path>    →  sandboxed asset reads from /var/lib/agora/...
     │     WS   /ws               →  control channel (one client at a time)
-    └── subprocess: cage -- chromium --kiosk http://127.0.0.1:8780/
-          └── shell SPA (player/shell/*) — connects to /ws, runs commands
+    └── subprocess: systemd-run --scope -- sway -c <conf>
+          └── chromium --kiosk http://127.0.0.1:8780/
+                └── shell SPA (player/shell/*) — connects to /ws, runs commands
 ```
 
-One chromium process owns the framebuffer for the lifetime of the player.
+One sway+chromium pair owns the framebuffer for the lifetime of the player
+(a second sway is spawned by ``AgoraPlayer._start_sway`` when a webpage asset
+is desired — the two can't coexist on a single DRM device, so mode-mixing is
+a known follow-up).
 
 ## Control protocol (player → shell)
 
@@ -63,7 +67,7 @@ source of truth for transition selection. New named transitions are
 | Splash image          | ✅ instant `show_splash`            | imagefreeze pipeline          |
 | Splash video          | ✅ looped+muted `show_video`        | mpv subprocess                |
 | Slideshow (images/vid)| ✅ driven by `_play_next_slide`     | mpv per-slide                 |
-| Webpage asset         | uses existing cage path             | uses existing cage path       |
+| Webpage asset         | uses existing sway path             | uses existing sway path       |
 | Stream (HLS/RTMP/…)   | falls back to mpv                   | mpv subprocess                |
 
 ## Known demo limitations
@@ -146,7 +150,7 @@ If the demo holds up on hardware, the obvious follow-ups are:
    so `_play_next_slide` and `loop_count` can match mpv behaviour exactly.
 2. Add a richer transition catalogue (Ken Burns, slide, dissolve).
 3. Move webpage-asset rendering inside the same shell (one chromium for
-   everything) and retire the per-asset cage spawns.
+   everything) and retire the dual-sway split.
 4. Decide whether to keep mpv around for streams or move streams into
    chromium too (HLS/DASH would Just Work; RTMP would need media server
    help).
