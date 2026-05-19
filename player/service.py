@@ -218,10 +218,13 @@ class AgoraPlayer:
         self._coordinator: Optional["Coordinator"] = None
         if self._use_chromium_backend:
             from player.coordinator import Coordinator
+            from shared.board import hdmi_port_count
+            n_ports = hdmi_port_count()
+            available_slots: tuple[str, ...] = ("A", "B") if n_ports >= 2 else ("A",)
             self._coordinator = Coordinator(
                 base_path=self.base,
                 assets_dir=self.assets_dir,
-                available_slots=("A",),
+                available_slots=available_slots,
                 slot_a_paths_mode="legacy",
                 on_chromium_event=self._on_chromium_event_for_slot,
             )
@@ -2425,6 +2428,37 @@ class AgoraPlayer:
             return
         self._on_chromium_event(payload)
 
+    def _reconcile_slots_tick(self) -> bool:
+        """Periodic reconciliation of slot B against ``persist/devices.json``.
+
+        The cms_client persists bind/unbind decisions to that file; we
+        reflect them into the Coordinator here. Idempotent.
+
+        Always returns True so GLib re-arms the timeout.
+        """
+        try:
+            self._reconcile_slot_b()
+        except Exception:
+            logger.exception("slot reconciliation failed")
+        return True
+
+    def _reconcile_slot_b(self) -> None:
+        """Bring slot B up iff devices.json[B] has credentials, down otherwise."""
+        if not self._coordinator:
+            return
+        if "B" not in self._coordinator.available_slots:
+            return
+        from shared.devices_store import SLOT_B, read_slot
+        creds = read_slot(self.persist_dir, SLOT_B)
+        has_creds = creds is not None and bool(creds.get("api_key"))
+        currently_up = self._coordinator.has_slot("B")
+        if has_creds and not currently_up:
+            logger.info("slot reconciliation: activating slot B")
+            self._coordinator.activate_slot("B")
+        elif not has_creds and currently_up:
+            logger.info("slot reconciliation: deactivating slot B")
+            self._coordinator.deactivate_slot("B")
+
     def _handle_chromium_event_on_main(self, payload: dict) -> bool:
         """GLib idle callback: dispatch a single shell event.
 
@@ -3174,6 +3208,12 @@ class AgoraPlayer:
         # Periodic display probe: runs regardless of playback state so
         # display_connected in current.json stays fresh during splash/idle.
         GLib.timeout_add_seconds(10, self._probe_display_tick)
+
+        # Periodic slot-B reconciliation: cms_client persists bind/unbind
+        # decisions to devices.json; we read that on a tick and bring
+        # slot B up/down to match. Cheap (one stat + maybe one read).
+        if self._coordinator:
+            GLib.timeout_add_seconds(5, self._reconcile_slots_tick)
 
         # Signal handlers for clean shutdown
         def on_shutdown(signum, frame):

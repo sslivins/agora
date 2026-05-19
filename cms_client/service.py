@@ -715,6 +715,10 @@ class CMSClient:
                         await self._handle_wipe_assets(msg, ws)
                     elif msg_type == "request_logs":
                         await self._handle_request_logs(msg, ws)
+                    elif msg_type == "bind_display":
+                        await self._handle_bind_display(msg, ws)
+                    elif msg_type == "unbind_display":
+                        await self._handle_unbind_display(msg, ws)
                     elif msg_type == "os_update_dispatch":
                         # Routed independently by agora-os-updater.service,
                         # which opens its own WPS connection. We see it on
@@ -891,6 +895,14 @@ class CMSClient:
 
         _, used_mb = _get_storage_mb(self.settings.assets_dir)
 
+        try:
+            from shared.board import hdmi_port_count
+            n_ports = hdmi_port_count()
+            available_slots = ["A", "B"] if n_ports >= 2 else ["A"]
+        except Exception:
+            logger.exception("Failed to read HDMI port count for heartbeat")
+            available_slots = ["A"]
+
         status_msg = {
             "type": "status",
             "protocol_version": PROTOCOL_VERSION,
@@ -909,6 +921,7 @@ class CMSClient:
             "local_api_enabled": _is_local_api_enabled(self.settings.persist_dir),
             "display_connected": current_data.get("display_connected"),
             "display_ports": current_data.get("display_ports"),
+            "available_slots": available_slots,
         }
         await self._ws.send(json.dumps(status_msg))
 
@@ -2079,6 +2092,96 @@ class CMSClient:
             pass
         await asyncio.sleep(1)
         os.system("sudo reboot")
+
+    async def _handle_bind_display(self, msg: dict, ws) -> None:
+        """Persist slot-B credentials so the player can activate slot B.
+
+        CMS sends ``bind_display`` over slot A's WS when an operator
+        clicks "Add second display" in the CMS UI. The message carries
+        the freshly minted slot-B credentials. Our job: persist them to
+        ``devices.json`` and acknowledge. The player process watches the
+        same file and brings up SlotState[B] on its next reconciliation
+        tick.
+
+        Expected message shape::
+
+            {
+              "type": "bind_display",
+              "slot": "B",
+              "device_id": "<slot-B device_id>",
+              "api_key": "<slot-B api_key>"
+            }
+        """
+        from shared.devices_store import KNOWN_SLOTS, write_slot
+
+        slot = msg.get("slot")
+        device_id = msg.get("device_id")
+        api_key = msg.get("api_key")
+
+        ack: dict = {"type": "bind_ack", "slot": slot}
+        if slot not in KNOWN_SLOTS or slot == "A":
+            ack["status"] = "error"
+            ack["error"] = f"invalid slot {slot!r}; must be 'B'"
+        elif not device_id or not api_key:
+            ack["status"] = "error"
+            ack["error"] = "missing device_id or api_key"
+        else:
+            try:
+                write_slot(
+                    self.settings.persist_dir,
+                    slot,
+                    {"device_id": device_id, "api_key": api_key},
+                )
+            except Exception as exc:
+                logger.exception("bind_display: failed to persist slot %s", slot)
+                ack["status"] = "error"
+                ack["error"] = str(exc)
+            else:
+                logger.info("bind_display: slot %s credentials persisted", slot)
+                ack["status"] = "ok"
+
+        try:
+            await ws.send(json.dumps(ack))
+        except Exception:
+            logger.exception("bind_display: failed to send bind_ack")
+
+    async def _handle_unbind_display(self, msg: dict, ws) -> None:
+        """Clear slot-B credentials so the player tears slot B down.
+
+        CMS sends ``unbind_display`` when an operator removes the second
+        virtual device (or as a precursor to deleting it). We clear slot
+        B from ``devices.json`` and acknowledge; the player reconciles
+        on its next tick.
+
+        Expected message shape::
+
+            {"type": "unbind_display", "slot": "B"}
+        """
+        from shared.devices_store import KNOWN_SLOTS, remove_slot
+
+        slot = msg.get("slot")
+        ack: dict = {"type": "unbind_ack", "slot": slot}
+        if slot not in KNOWN_SLOTS or slot == "A":
+            ack["status"] = "error"
+            ack["error"] = f"invalid slot {slot!r}; must be 'B'"
+        else:
+            try:
+                existed = remove_slot(self.settings.persist_dir, slot)
+            except Exception as exc:
+                logger.exception("unbind_display: failed to remove slot %s", slot)
+                ack["status"] = "error"
+                ack["error"] = str(exc)
+            else:
+                logger.info(
+                    "unbind_display: slot %s %s",
+                    slot, "removed" if existed else "was already absent",
+                )
+                ack["status"] = "ok"
+
+        try:
+            await ws.send(json.dumps(ack))
+        except Exception:
+            logger.exception("unbind_display: failed to send unbind_ack")
 
     async def _handle_factory_reset(self, ws) -> None:
         """Factory reset: wipe all data and reboot into AP mode.
