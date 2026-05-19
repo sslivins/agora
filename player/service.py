@@ -164,6 +164,7 @@ class AgoraPlayer:
     # defaults and the existing mpv code paths remain untouched.
     _use_chromium_backend: bool = False
     _chromium_player = None  # type: ignore[var-annotated]
+    _coordinator = None  # type: ignore[var-annotated]
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -214,10 +215,15 @@ class AgoraPlayer:
             os.environ.get("AGORA_PLAYER_BACKEND") == "chromium"
         )
         self._chromium_player: Optional[ChromiumPlayer] = None
+        self._coordinator: Optional["Coordinator"] = None
         if self._use_chromium_backend:
-            self._chromium_player = ChromiumPlayer(
+            from player.coordinator import Coordinator
+            self._coordinator = Coordinator(
+                base_path=self.base,
                 assets_dir=self.assets_dir,
-                on_event=self._on_chromium_event,
+                available_slots=("A",),
+                slot_a_paths_mode="legacy",
+                on_chromium_event=self._on_chromium_event_for_slot,
             )
         # Armed when ``apply_desired`` dispatches a scheduled finite-loop
         # video through the chromium shell. ``_on_chromium_event`` clears
@@ -2404,6 +2410,21 @@ class AgoraPlayer:
         except Exception:  # pragma: no cover — defensive
             logger.exception("Failed to schedule chromium event handling")
 
+    def _on_chromium_event_for_slot(self, slot: str, payload: dict) -> None:
+        """Coordinator → daemon shell event callback (slot-aware).
+
+        For PR 2a only slot A is active, so we drop the slot id and
+        delegate to the existing single-slot callback. Future commits
+        that activate slot B will route by slot here.
+        """
+        if slot != "A":
+            logger.debug(
+                "chromium shell event for slot %s ignored (slot B not yet wired): %s",
+                slot, payload,
+            )
+            return
+        self._on_chromium_event(payload)
+
     def _handle_chromium_event_on_main(self, payload: dict) -> bool:
         """GLib idle callback: dispatch a single shell event.
 
@@ -3127,9 +3148,16 @@ class AgoraPlayer:
 
         # Chromium player demo: bring up shell server + kiosk early so
         # the first apply_desired can hand off image/video without
-        # falling back to mpv.
-        if self._chromium_player:
-            self._chromium_player.start()
+        # falling back to mpv. The Coordinator handles sway + per-slot
+        # chromium kiosks; slot A is always activated at start(). For
+        # back-compat with the (large) existing call surface that
+        # references ``self._chromium_player``, we alias it to slot A's
+        # ChromiumPlayer after start.
+        if self._coordinator:
+            self._coordinator.start()
+            slot_a = self._coordinator.slots.get("A")
+            if slot_a is not None:
+                self._chromium_player = slot_a.chromium_player
 
         # Apply initial state (may show splash, which can take seconds)
         self.apply_desired()
@@ -3153,8 +3181,9 @@ class AgoraPlayer:
             self._running = False
             self._stop_mpv_event_listener()
             self._teardown()
-            if self._chromium_player:
-                self._chromium_player.stop()
+            if self._coordinator:
+                self._coordinator.stop()
+                self._chromium_player = None
             self.loop.quit()
 
         signal.signal(signal.SIGTERM, on_shutdown)
@@ -3167,6 +3196,7 @@ class AgoraPlayer:
         finally:
             self._stop_mpv_event_listener()
             self._teardown()
-            if self._chromium_player:
-                self._chromium_player.stop()
+            if self._coordinator:
+                self._coordinator.stop()
+                self._chromium_player = None
             logger.info("Agora Player stopped")
