@@ -183,7 +183,11 @@ def _open_existing_regular_file(path: Path, exc_cls: type[Exception]) -> int:
     Raises ``exc_cls`` if the file is a symlink, not a regular file, owned
     by a different uid, or (repairably) has loose permissions.
 
-    Same-owner over-permissive mode is repaired to ``0o400`` via ``fchmod``.
+    Same-owner over-permissive mode is repaired to ``0o400`` via ``fchmod``
+    on POSIX. On Windows the POSIX file mode bits are synthesized from a
+    default template that doesn't reflect actual ACLs, and ``fchmod`` to
+    ``0o400`` raises ``WinError 5 (Access is denied)``, so we skip the
+    perm check entirely on non-POSIX platforms.
 
     Note: ``os.O_NOFOLLOW`` is Unix-only; on platforms without it (e.g.
     Windows) we degrade to a no-op (``0``) bit in the open flags. This
@@ -211,8 +215,7 @@ def _open_existing_regular_file(path: Path, exc_cls: type[Exception]) -> int:
                 f"refusing to load a secret from a file owned by another user"
             )
         perm = st.st_mode & 0o777
-        if perm != _FILE_MODE:
-            # Same owner and loose perms → repair via fd.
+        if os.name == "posix" and perm != _FILE_MODE:
             try:
                 os.fchmod(fd, _FILE_MODE)
             except OSError as e:
