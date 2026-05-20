@@ -184,9 +184,17 @@ def _open_existing_regular_file(path: Path, exc_cls: type[Exception]) -> int:
     by a different uid, or (repairably) has loose permissions.
 
     Same-owner over-permissive mode is repaired to ``0o400`` via ``fchmod``.
+
+    Note: ``os.O_NOFOLLOW`` is Unix-only; on platforms without it (e.g.
+    Windows) we degrade to a no-op (``0``) bit in the open flags. This
+    matches the defensive ``getattr(os, "O_NOFOLLOW", 0)`` pattern used by
+    the rest of agora (``chromium_backend``, ``player.service``,
+    ``sway_manager``) and lets the softplayer's Windows shim path actually
+    boot.
     """
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | o_nofollow)
     except OSError as e:
         # ELOOP means a symlink was followed; distinguish for the caller.
         if getattr(e, "errno", None) in (40,):  # ELOOP on Linux
@@ -233,10 +241,11 @@ def _create_new_secret_file(
     newly-created file is durable across power-loss.
     """
     parent = path.parent
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(
             path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | o_nofollow,
             _FILE_MODE,
         )
     except FileExistsError:
