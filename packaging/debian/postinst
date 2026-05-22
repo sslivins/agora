@@ -179,12 +179,20 @@ fi
 # ── Disable console login on HDMI (tty1) ──
 systemctl disable getty@tty1 2>/dev/null || true
 
-# ── Plymouth: player controls quit, not systemd ──
-# The player calls `plymouth quit --retain-splash` right before building the first
-# GStreamer pipeline, keeping the boot splash visible until content takes over.
-# These units are "static" so they must be masked, not just disabled.
-systemctl mask plymouth-quit.service 2>/dev/null || true
-systemctl mask plymouth-quit-wait.service 2>/dev/null || true
+# ── Plymouth: let systemd quit it at multi-user.target ──
+# Previously these units were masked because the player itself called
+# `plymouth quit --retain-splash` right before its first GStreamer pipeline.
+# That left no fallback when the player's kiosk child (mpv / chromium / sway)
+# crashed early in boot — plymouth would keep animating forever with nothing
+# to overdraw it, and the device looked hung. We now let the standard
+# Debian plymouth-quit.service fire on multi-user.target reached, which
+# kills plymouth (and frees the framebuffer / DRM master) even if the
+# player never comes up. The player still calls `plymouth quit
+# --retain-splash` itself — that's idempotent and a no-op once systemd
+# has already quit plymouth.
+# Defensive: unmask in case a previous version of this package masked them.
+systemctl unmask plymouth-quit.service 2>/dev/null || true
+systemctl unmask plymouth-quit-wait.service 2>/dev/null || true
 
 # ── Rebuild initramfs with new splash theme ──
 update-initramfs -u 2>/dev/null || true

@@ -38,9 +38,11 @@ class DispatchPayloadError(ValueError):
 
 
 #: Regex matching ``major.minor.patch`` semver with optional ``-prerelease``.
+#: The prerelease segment allows hyphens inside it (e.g. ``0.0.40-test-k612``)
+#: so multi-token prereleases produced by our agora-os release flow pass.
 #: Intentionally simple — we control both ends of this wire so we don't need
 #: full semver-2.0 compliance.
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?$")
+_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$")
 
 #: Regex matching the allowed shape of an opaque ``release_id``: alphanumeric
 #: plus ``_-.``, length 1..128. Mirrors what the CMS will generate.

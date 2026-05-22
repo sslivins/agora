@@ -58,6 +58,15 @@ class TestHappyPath:
         assert p.target_version == "1.1.0-rc1"
         assert p.min_from_version == "1.0.0-beta.2"
 
+    def test_multi_token_prerelease_accepted(self):
+        """Tags like ``v0.0.40-test-k612`` produce a multi-hyphen prerelease
+        when stripped of the leading ``v``. The dispatch regex must accept
+        that or every multi-token test build looks invalid to the device."""
+        p = parse_dispatch_payload(
+            _ok_msg(target_version="0.0.40-test-k612", min_from_version="0.0.0")
+        )
+        assert p.target_version == "0.0.40-test-k612"
+
     def test_extra_field_ignored(self):
         """Phase 3 adds ``not_before`` etc. — older daemons must ignore
         anything they don't recognize so a CMS-side schema bump doesn't
