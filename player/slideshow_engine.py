@@ -5,9 +5,18 @@ mpv / Linux-path dependencies so it can be re-used unchanged by the
 agora-softplayer (Windows host) and any future non-Pi platform that
 runs the same chromium-shell slideshow logic.
 
-Phase 4 (incremental) of agora#226: PR-1 lifts the helpers that were
-already pure; the slideshow state machine itself stays in
-``player/service.py`` for now and will move in PR-2.
+Phase 4 of agora#226 lifts these in two steps:
+
+* PR-1 — pure helpers (``parse_schema_version``, ``is_forward_schema``,
+  ``parse_iso8601_utc``, ``locate_slide_at``) + constants.
+* PR-2 — adds ``read_slideshow_manifest`` (file IO + parse + digest)
+  and ``resolve_anchored_target`` (pure anchor → target-slide math
+  with an ``AnchorStatus`` enum for callers to drive their own
+  telemetry).
+
+The full slideshow state machine itself stays in ``player/service.py``
+for now — extracting it requires a Renderer/Timer/StateSink protocol
+design with broader test churn and is tracked as a future epic.
 
 The helpers are also re-exported from ``player/service.py`` as
 module-level aliases (``_parse_schema_version``, ``_is_forward_schema``,
@@ -17,7 +26,12 @@ modification.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 
@@ -136,3 +150,117 @@ def locate_slide_at(
     # ``pos < cycle_ms`` guarantees this is unreachable, but a defensive
     # fallback keeps mypy happy and prevents UB on a bug elsewhere.
     return (len(slides) - 1, max(durations[-1], 1))
+
+
+# ── Manifest reading (agora#226 Phase 4 PR-2) ──
+
+
+def read_slideshow_manifest(
+    assets_dir: Path, name: str,
+) -> Optional[tuple[dict, str]]:
+    """Read, parse, and digest a slideshow manifest from disk.
+
+    Returns ``(parsed_dict, sha256_hex)`` or ``None`` if the manifest is
+    missing, unreadable, malformed JSON, or has no slides list.  Pure
+    w.r.t. ``assets_dir``: callers pass the directory they want to read
+    from, so the same function serves both the Pi (``/opt/agora/assets``)
+    and the softplayer (Windows app-data dir).
+
+    The SHA-256 digest is used to detect manifest edits between
+    apply_desired calls — manifest contents are not part of
+    DesiredState, so without the digest a CMS-side edit is invisible to
+    the player.
+
+    Exceptions (``OSError``, ``json.JSONDecodeError``,
+    ``UnicodeDecodeError``) are swallowed and turned into ``None`` so
+    callers can take a "manifest missing → show splash" path without
+    sprinkling try/except everywhere.
+    """
+    path = assets_dir / "slideshows" / f"{name}.json"
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    slides = data.get("slides")
+    if not isinstance(slides, list) or not slides:
+        return None
+    return data, hashlib.sha256(raw).hexdigest()
+
+
+# ── Anchored-playback resolution (agora#226 Phase 2 + Phase 4 PR-2) ──
+
+
+class AnchorStatus(Enum):
+    """Outcome of evaluating whether anchored playback should drive the
+    next slide dispatch.  ``OK`` means the caller should use
+    ``AnchorResolution.target``; everything else means fall back to the
+    legacy relative-timer chain.
+    """
+
+    OK = "ok"
+    NO_ANCHOR = "no_anchor"            # schema < 1.1 or missing started_at
+    DEGENERATE_CYCLE = "degenerate"    # no slides / total duration <= 0
+    CLOCK_SKEW_BEHIND = "skew_behind"  # now < anchor - tolerance (pre-NTP)
+
+
+@dataclass(frozen=True)
+class AnchorResolution:
+    """Result of :func:`resolve_anchored_target`.
+
+    * ``status`` — see :class:`AnchorStatus`.
+    * ``target`` — ``(target_idx, remaining_ms)`` iff ``status == OK``.
+    * ``skew_s`` — ``(anchor - now).total_seconds()``; informational,
+      useful for the one-shot clock-skew telemetry message.  ``0.0``
+      when no anchor was supplied.
+    """
+
+    status: AnchorStatus
+    target: Optional[tuple[int, int]] = None
+    skew_s: float = 0.0
+
+
+def resolve_anchored_target(
+    slides: list[dict],
+    cycle_duration_ms: int,
+    anchor: Optional[datetime],
+    *,
+    now: Optional[datetime] = None,
+    clock_skew_tolerance_s: int = CLOCK_SKEW_TOLERANCE_S,
+) -> AnchorResolution:
+    """Compute the wall-clock-anchored target slide.
+
+    Pure function — does not mutate inputs, does not log, does not read
+    the wall clock unless ``now`` is left as ``None``.  Callers own all
+    telemetry (the player logs the clock-skew-guard transitions; the
+    softplayer might surface them differently).
+
+    Inputs:
+
+    * ``slides`` — the manifest's slide list (each dict has at least
+      ``duration_ms``).  Empty/missing produces ``DEGENERATE_CYCLE``.
+    * ``cycle_duration_ms`` — pre-computed sum of slide durations; passed
+      in so callers can cache it on their slideshow-state dict instead
+      of re-summing each tick.
+    * ``anchor`` — UTC ``datetime`` parsed from ``manifest.started_at``,
+      or ``None`` if the manifest is pre-1.1 or has no parseable
+      ``started_at``.  ``None`` → ``NO_ANCHOR``.
+    * ``now`` — override for testing; defaults to ``datetime.now(UTC)``.
+    * ``clock_skew_tolerance_s`` — how far the wall clock may lag the
+      anchor before we punt to legacy playback.  Default matches
+      :data:`CLOCK_SKEW_TOLERANCE_S`.
+    """
+    if anchor is None:
+        return AnchorResolution(AnchorStatus.NO_ANCHOR)
+    if not slides or cycle_duration_ms <= 0:
+        return AnchorResolution(AnchorStatus.DEGENERATE_CYCLE)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    skew_s = (anchor - now).total_seconds()
+    if skew_s > clock_skew_tolerance_s:
+        return AnchorResolution(AnchorStatus.CLOCK_SKEW_BEHIND, skew_s=skew_s)
+    elapsed_ms = int((now - anchor).total_seconds() * 1000)
+    target = locate_slide_at(elapsed_ms, slides)
+    return AnchorResolution(AnchorStatus.OK, target=target, skew_s=skew_s)
