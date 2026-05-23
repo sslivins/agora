@@ -11,11 +11,12 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from player.chromium_backend import ChromiumPlayer, _WebSocketState
+import player.chromium_backend as chromium_backend
 
 
 # ── Command JSON shape ──────────────────────────────────────────────
@@ -366,3 +367,69 @@ def test_root_serves_shell_index(routing_cp):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "shell-root" in resp.text
+
+
+# ── Plymouth quit on sway-kiosk launch ───────────────────────────────
+
+
+def test_start_sway_kiosk_quits_plymouth_before_launching_sway(cp, monkeypatch):
+    """Regression: the chromium backend MUST call `plymouth quit` before
+    spawning sway, otherwise plymouth keeps DRM master and sway silently
+    fails to come up (visible as a frozen boot splash).
+    """
+    chromium_backend._plymouth_quit_done = False  # reset module-level flag
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+    fake_popen = MagicMock()
+    fake_popen.return_value.poll.return_value = None
+    fake_popen.return_value.pid = 12345
+
+    monkeypatch.setattr(chromium_backend.subprocess, "run", fake_run)
+    monkeypatch.setattr(chromium_backend.subprocess, "Popen", fake_popen)
+
+    cp._start_sway_kiosk()
+
+    # plymouth must have been invoked, and BEFORE Popen (which spawns sway).
+    plymouth_invocations = [c for c in calls if c and "plymouth" in c[0]]
+    assert plymouth_invocations, "plymouth quit was never called"
+    assert plymouth_invocations[0][1:] == ["quit", "--retain-splash"], (
+        f"unexpected plymouth args: {plymouth_invocations[0]}"
+    )
+    # Popen called exactly once (the sway launch).
+    assert fake_popen.call_count == 1
+    sway_argv = fake_popen.call_args.args[0]
+    assert "sway" in sway_argv, f"sway not in argv: {sway_argv}"
+
+
+def test_quit_plymouth_is_idempotent(monkeypatch):
+    """Second call should be a no-op so repeated kiosk restarts don't
+    keep firing /usr/bin/plymouth."""
+    chromium_backend._plymouth_quit_done = False
+    calls = []
+    monkeypatch.setattr(
+        chromium_backend.subprocess, "run",
+        lambda cmd, *a, **kw: (calls.append(list(cmd)) or MagicMock(returncode=0)),
+    )
+
+    chromium_backend._quit_plymouth()
+    chromium_backend._quit_plymouth()
+    chromium_backend._quit_plymouth()
+
+    assert len(calls) == 1, f"plymouth quit fired {len(calls)} times, want 1"
+
+
+def test_quit_plymouth_swallows_missing_binary(monkeypatch):
+    """Dev hosts without plymouth installed must not crash the player."""
+    chromium_backend._plymouth_quit_done = False
+
+    def raises(cmd, *args, **kwargs):
+        raise FileNotFoundError("/usr/bin/plymouth")
+
+    monkeypatch.setattr(chromium_backend.subprocess, "run", raises)
+    # Must not raise.
+    chromium_backend._quit_plymouth()
