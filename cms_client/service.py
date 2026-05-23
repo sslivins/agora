@@ -1871,6 +1871,12 @@ class CMSClient:
                     "size_bytes": s.get("size_bytes", 0),
                     "duration_ms": s.get("duration_ms", 0),
                     "play_to_end": bool(s.get("play_to_end", False)),
+                    # Per-slide transition (Phase 1a of agora#226).  Persisted
+                    # verbatim so the chromium-player branch can read it back;
+                    # the mpv player ignores anything other than ``cut``.
+                    # Defaults match the wire schema defaults.
+                    "transition": s.get("transition", "cut"),
+                    "transition_ms": int(s.get("transition_ms", 600)),
                 }
                 for s in slides
             ],

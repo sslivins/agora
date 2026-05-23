@@ -236,6 +236,63 @@ class TestSlideshowFetch:
         assert manifest["manifest_schema_version"] == "1.1"
 
     @pytest.mark.asyncio
+    async def test_transition_fields_default_when_absent_on_wire(self, cms_client):
+        """agora#226 Phase 1a: CMS may omit ``transition``/``transition_ms``
+        on a slide (older CMS, default-asset path) → persist as cut/600 so
+        the chromium player sees a sane default and the mpv player ignores
+        the cut as a no-op.
+        """
+        b1 = b"slide-bytes"
+        slides = [_make_slide("a.png", b1, asset_type="image", duration_ms=2000)]
+        # NOTE: no transition/transition_ms keys
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "NoTrans.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "slides": slides,
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest_path = cms_client.settings.slideshows_dir / "NoTrans.slideshow.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["slides"][0]["transition"] == "cut"
+        assert manifest["slides"][0]["transition_ms"] == 600
+
+    @pytest.mark.asyncio
+    async def test_transition_fields_propagated_from_wire(self, cms_client):
+        """agora#226 Phase 1a: when CMS provides transition/transition_ms,
+        they are persisted verbatim for the chromium player to consume.
+        """
+        b1 = b"slide-bytes"
+        slide = _make_slide("a.png", b1, asset_type="image", duration_ms=2000)
+        slide["transition"] = "fade"
+        slide["transition_ms"] = 850
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "WithTrans.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "slides": [slide],
+        }
+        mapping = {slide["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest_path = cms_client.settings.slideshows_dir / "WithTrans.slideshow.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["slides"][0]["transition"] == "fade"
+        assert manifest["slides"][0]["transition_ms"] == 850
+
+    @pytest.mark.asyncio
     async def test_already_cached_short_circuits(self, cms_client):
         """Slideshow + every slide already cached → ACK without re-downloading."""
         b1, b2 = b"already-have-1", b"already-have-2"
