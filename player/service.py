@@ -29,6 +29,7 @@ from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
 from player.chromium_backend import ChromiumPlayer  # noqa: E402
 from player.slideshow_engine import (  # noqa: E402
+    AnchorStatus as _AnchorStatus,
     CLOCK_SKEW_TOLERANCE_S as _CLOCK_SKEW_TOLERANCE_S,
     PLAYER_MAX_MANIFEST_SCHEMA_VERSION as _PLAYER_MAX_MANIFEST_SCHEMA_VERSION,
     RESYNC_CAP_MS as _RESYNC_CAP_MS,
@@ -36,6 +37,8 @@ from player.slideshow_engine import (  # noqa: E402
     locate_slide_at as _locate_slide_at,
     parse_iso8601_utc as _parse_iso8601_utc,
     parse_schema_version as _parse_schema_version,
+    read_slideshow_manifest as _read_slideshow_manifest_pure,
+    resolve_anchored_target as _resolve_anchored_target_pure,
 )
 
 logger = logging.getLogger("agora.player")
@@ -340,25 +343,21 @@ class AgoraPlayer:
     def _read_slideshow_manifest(self, name: str) -> Optional[tuple[dict, str]]:
         """Read and validate a slideshow manifest from the assets dir.
 
-        Returns ``(parsed_dict, digest_hex)`` or ``None`` if missing/invalid.
-        ``digest_hex`` is the SHA-256 hex digest of the raw manifest bytes
-        and is used by ``_already_satisfied`` to detect manifest edits
-        between apply_desired calls (which would otherwise be invisible
-        because manifest contents are not part of DesiredState).
+        Thin wrapper around
+        :func:`player.slideshow_engine.read_slideshow_manifest` that
+        plugs in this instance's ``assets_dir`` and emits the existing
+        log message on unreadable / malformed manifests (the pure
+        helper is silent so softplayer can surface failures
+        differently).
         """
-        path = self.assets_dir / "slideshows" / f"{name}.json"
-        try:
-            raw = path.read_bytes()
-            data = json.loads(raw.decode("utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error("Slideshow manifest %s unreadable: %s", path, e)
-            return None
-        if not isinstance(data, dict):
-            return None
-        slides = data.get("slides")
-        if not isinstance(slides, list) or not slides:
-            return None
-        return data, hashlib.sha256(raw).hexdigest()
+        result = _read_slideshow_manifest_pure(self.assets_dir, name)
+        if result is None:
+            # Re-derive the path for the log message so behaviour matches
+            # the previous version exactly when the manifest is missing
+            # or malformed.
+            path = self.assets_dir / "slideshows" / f"{name}.json"
+            logger.error("Slideshow manifest %s unreadable or invalid", path)
+        return result
 
     def _cancel_slide_timeout(self) -> None:
         """Cancel any pending GLib slide-advance timeout."""
@@ -471,53 +470,49 @@ class AgoraPlayer:
         """Return ``(target_idx, remaining_ms)`` for the anchored path,
         or ``None`` if we should take the legacy relative-timer path.
 
-        Falls back to legacy when:
+        Thin wrapper around
+        :func:`player.slideshow_engine.resolve_anchored_target` that:
 
-        * The manifest has no ``anchor`` (schema < 1.1, or 1.1 without
-          a parseable ``started_at``).
-        * The cycle is degenerate (no slides with positive duration).
-        * The wall clock is more than ``_CLOCK_SKEW_TOLERANCE_S`` before
-          the anchor — implies NTP hasn't converged yet.  We toggle
-          ``ss["clock_skew_active"]`` so the next tick re-evaluates and
-          we log the transition exactly once per slideshow start.
-
-        Note this is called from BOTH ``_play_next_slide`` (initial
-        dispatch and natural advance) AND ``_on_resync_tick`` (mid-slide
-        re-evaluation).  The function is pure w.r.t. ``ss`` (it only
-        mutates ``clock_skew_active`` for telemetry).
+        * extracts the slides/cycle/anchor from ``ss`` so callers can
+          continue passing the existing slideshow-state dict, and
+        * owns the clock-skew telemetry (mutates
+          ``ss["clock_skew_active"]`` and logs the transition exactly
+          once per direction).  The pure helper is silent so softplayer
+          can surface skew differently.
         """
-        anchor: Optional[datetime] = ss.get("anchor")
-        if anchor is None:
-            return None
-        slides = ss.get("slides") or []
-        cycle_ms = int(ss.get("cycle_duration_ms") or 0)
-        if not slides or cycle_ms <= 0:
-            return None
+        resolution = _resolve_anchored_target_pure(
+            slides=ss.get("slides") or [],
+            cycle_duration_ms=int(ss.get("cycle_duration_ms") or 0),
+            anchor=ss.get("anchor"),
+            clock_skew_tolerance_s=_CLOCK_SKEW_TOLERANCE_S,
+        )
 
-        now = datetime.now(timezone.utc)
-        skew_s = (anchor - now).total_seconds()
-        if skew_s > _CLOCK_SKEW_TOLERANCE_S:
-            # Wall clock is too far behind the anchor — likely a freshly
-            # booted Pi without an RTC, before NTP syncs.  Run the
-            # legacy relative-timer path until the clock catches up.
+        if resolution.status is _AnchorStatus.CLOCK_SKEW_BEHIND:
             if not ss.get("clock_skew_active"):
+                now = datetime.now(timezone.utc)
                 logger.info(
                     "Slideshow %s: clock-skew guard ACTIVE "
                     "(now=%s anchor=%s skew_s=%.0f) — using legacy timer chain",
-                    ss["name"], now.isoformat(), anchor.isoformat(), skew_s,
+                    ss["name"], now.isoformat(),
+                    ss["anchor"].isoformat() if ss.get("anchor") else "<none>",
+                    resolution.skew_s,
                 )
                 ss["clock_skew_active"] = True
             return None
-        if ss.get("clock_skew_active"):
+
+        if ss.get("clock_skew_active") and resolution.status is _AnchorStatus.OK:
+            now = datetime.now(timezone.utc)
             logger.info(
                 "Slideshow %s: clock-skew guard CLEARED (now=%s anchor=%s) "
                 "— switching to anchored playback",
-                ss["name"], now.isoformat(), anchor.isoformat(),
+                ss["name"], now.isoformat(),
+                ss["anchor"].isoformat() if ss.get("anchor") else "<none>",
             )
             ss["clock_skew_active"] = False
 
-        elapsed_ms = int((now - anchor).total_seconds() * 1000)
-        return _locate_slide_at(elapsed_ms, slides)
+        if resolution.status is _AnchorStatus.OK:
+            return resolution.target
+        return None
 
     def _play_anchored_slide(
         self, ss: dict, target_idx: int, remaining_ms: int,
