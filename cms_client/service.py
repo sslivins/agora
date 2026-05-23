@@ -211,19 +211,17 @@ def _save_auth_token(path: Path, token: str) -> None:
 def _resolve_device_api_key(settings: Settings) -> str:
     """Return the device API key used for WPS transport auth.
 
-    Prefers ``AGORA_DEVICE_API_KEY`` (dev/test override);
-    otherwise reads ``<persist_dir>/api_key`` — the same file CMS
-    rotates into via the config message and that direct-mode
-    transport uses for asset downloads.
+    Prefers ``AGORA_DEVICE_API_KEY`` (dev/test override); otherwise
+    reads ``persist/devices.json`` slot A, falling back to the legacy
+    ``persist/api_key`` file.  PR 1 multi-display routes credential
+    reads through ``shared.devices_store`` so PR 2 can mint slot-B
+    credentials and have them picked up the same way.
     """
     key = getattr(settings, "device_api_key", "") or ""
     if key:
         return key.strip()
-    key_path = settings.persist_dir / "api_key"
-    try:
-        return key_path.read_text().strip()
-    except (FileNotFoundError, OSError):
-        return ""
+    from shared.devices_store import read_api_key_with_fallback
+    return read_api_key_with_fallback(settings.persist_dir)
 
 
 # ── Schedule evaluation helpers ──
@@ -717,6 +715,10 @@ class CMSClient:
                         await self._handle_wipe_assets(msg, ws)
                     elif msg_type == "request_logs":
                         await self._handle_request_logs(msg, ws)
+                    elif msg_type == "bind_display":
+                        await self._handle_bind_display(msg, ws)
+                    elif msg_type == "unbind_display":
+                        await self._handle_unbind_display(msg, ws)
                     elif msg_type == "os_update_dispatch":
                         # Routed independently by agora-os-updater.service,
                         # which opens its own WPS connection. We see it on
@@ -893,6 +895,14 @@ class CMSClient:
 
         _, used_mb = _get_storage_mb(self.settings.assets_dir)
 
+        try:
+            from shared.board import hdmi_port_count
+            n_ports = hdmi_port_count()
+            available_slots = ["A", "B"] if n_ports >= 2 else ["A"]
+        except Exception:
+            logger.exception("Failed to read HDMI port count for heartbeat")
+            available_slots = ["A"]
+
         status_msg = {
             "type": "status",
             "protocol_version": PROTOCOL_VERSION,
@@ -911,6 +921,7 @@ class CMSClient:
             "local_api_enabled": _is_local_api_enabled(self.settings.persist_dir),
             "display_connected": current_data.get("display_connected"),
             "display_ports": current_data.get("display_ports"),
+            "available_slots": available_slots,
         }
         await self._ws.send(json.dumps(status_msg))
 
@@ -1514,12 +1525,14 @@ class CMSClient:
     # ── Asset management ──
 
     def _read_api_key(self) -> str:
-        """Read the current device API key from the persist directory."""
-        key_path = self.settings.persist_dir / "api_key"
-        try:
-            return key_path.read_text().strip()
-        except FileNotFoundError:
-            return ""
+        """Read the current device API key from the persist directory.
+
+        Prefers ``persist/devices.json`` slot A; falls back to the legacy
+        ``persist/api_key`` file.  Used as the ``X-Device-API-Key``
+        header on asset downloads.
+        """
+        from shared.devices_store import read_api_key_with_fallback
+        return read_api_key_with_fallback(self.settings.persist_dir)
 
     def _spawn_fetch_asset(self, msg: dict, ws) -> None:
         """Dispatch ``fetch_asset`` as a background task.
@@ -2047,6 +2060,24 @@ class CMSClient:
                 os.chmod(override_path, 0o644)
             except OSError:
                 pass
+            # Dual-write: also stash the rotated key in the slot-keyed
+            # devices.json so the new credential indirection layer sees
+            # it.  PR 3 will drop the legacy persist/api_key write once
+            # the fleet has stabilised on devices.json.
+            try:
+                from shared.devices_store import SLOT_A, read_slot, write_slot
+                existing = read_slot(self.settings.persist_dir, SLOT_A) or {}
+                existing["api_key"] = new_key
+                if "device_id" not in existing:
+                    existing["device_id"] = (
+                        getattr(self.settings, "device_name", "") or ""
+                    )
+                write_slot(self.settings.persist_dir, SLOT_A, existing)
+            except Exception:
+                logger.debug(
+                    "Failed to mirror rotated api_key into devices.json slot A",
+                    exc_info=True,
+                )
             boot_config = Path("/boot/agora-config.json")
             try:
                 cfg = json.loads(boot_config.read_text())
@@ -2086,6 +2117,96 @@ class CMSClient:
         await asyncio.sleep(1)
         os.system("sudo reboot")
 
+    async def _handle_bind_display(self, msg: dict, ws) -> None:
+        """Persist slot-B credentials so the player can activate slot B.
+
+        CMS sends ``bind_display`` over slot A's WS when an operator
+        clicks "Add second display" in the CMS UI. The message carries
+        the freshly minted slot-B credentials. Our job: persist them to
+        ``devices.json`` and acknowledge. The player process watches the
+        same file and brings up SlotState[B] on its next reconciliation
+        tick.
+
+        Expected message shape::
+
+            {
+              "type": "bind_display",
+              "slot": "B",
+              "device_id": "<slot-B device_id>",
+              "api_key": "<slot-B api_key>"
+            }
+        """
+        from shared.devices_store import KNOWN_SLOTS, write_slot
+
+        slot = msg.get("slot")
+        device_id = msg.get("device_id")
+        api_key = msg.get("api_key")
+
+        ack: dict = {"type": "bind_ack", "slot": slot}
+        if slot not in KNOWN_SLOTS or slot == "A":
+            ack["status"] = "error"
+            ack["error"] = f"invalid slot {slot!r}; must be 'B'"
+        elif not device_id or not api_key:
+            ack["status"] = "error"
+            ack["error"] = "missing device_id or api_key"
+        else:
+            try:
+                write_slot(
+                    self.settings.persist_dir,
+                    slot,
+                    {"device_id": device_id, "api_key": api_key},
+                )
+            except Exception as exc:
+                logger.exception("bind_display: failed to persist slot %s", slot)
+                ack["status"] = "error"
+                ack["error"] = str(exc)
+            else:
+                logger.info("bind_display: slot %s credentials persisted", slot)
+                ack["status"] = "ok"
+
+        try:
+            await ws.send(json.dumps(ack))
+        except Exception:
+            logger.exception("bind_display: failed to send bind_ack")
+
+    async def _handle_unbind_display(self, msg: dict, ws) -> None:
+        """Clear slot-B credentials so the player tears slot B down.
+
+        CMS sends ``unbind_display`` when an operator removes the second
+        virtual device (or as a precursor to deleting it). We clear slot
+        B from ``devices.json`` and acknowledge; the player reconciles
+        on its next tick.
+
+        Expected message shape::
+
+            {"type": "unbind_display", "slot": "B"}
+        """
+        from shared.devices_store import KNOWN_SLOTS, remove_slot
+
+        slot = msg.get("slot")
+        ack: dict = {"type": "unbind_ack", "slot": slot}
+        if slot not in KNOWN_SLOTS or slot == "A":
+            ack["status"] = "error"
+            ack["error"] = f"invalid slot {slot!r}; must be 'B'"
+        else:
+            try:
+                existed = remove_slot(self.settings.persist_dir, slot)
+            except Exception as exc:
+                logger.exception("unbind_display: failed to remove slot %s", slot)
+                ack["status"] = "error"
+                ack["error"] = str(exc)
+            else:
+                logger.info(
+                    "unbind_display: slot %s %s",
+                    slot, "removed" if existed else "was already absent",
+                )
+                ack["status"] = "ok"
+
+        try:
+            await ws.send(json.dumps(ack))
+        except Exception:
+            logger.exception("unbind_display: failed to send unbind_ack")
+
     async def _handle_factory_reset(self, ws) -> None:
         """Factory reset: wipe all data and reboot into AP mode.
 
@@ -2110,6 +2231,14 @@ class CMSClient:
         _safe_unlink(persist_dir / "device_name")
         _safe_unlink(persist_dir / "api_key")
         _safe_unlink(persist_dir / "local_api_enabled")
+
+        # Multi-display slot-keyed credential store (PR 1).  Wipe all
+        # slots; on next adoption the device starts fresh.
+        try:
+            from shared.devices_store import wipe as _devices_wipe
+            _devices_wipe(persist_dir)
+        except Exception:
+            logger.debug("Failed to wipe devices.json on factory reset", exc_info=True)
 
         # Bootstrap v2 identity + cached credentials.  These are safe to
         # always remove — on non-v2 builds the paths just don't exist.
