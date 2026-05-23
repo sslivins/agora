@@ -155,8 +155,34 @@ def test_start_invokes_systemd_run_with_scope(tmp_path: Path) -> None:
     assert cmd[-3:] == ["sway", "-c", str(runtime_dir / "sway.conf")]
     env = kwargs["env"]
     assert env["XDG_RUNTIME_DIR"] == str(runtime_dir)
-    assert env["WAYLAND_DISPLAY"] == "wayland-1"
+    # sway IS the compositor — must NOT have WAYLAND_DISPLAY in its env,
+    # or wlroots picks the wayland-client backend and exits silently.
+    # (env_for_client() still returns WAYLAND_DISPLAY — that's for the
+    # chromium kiosk clients, covered by a separate test below.)
+    assert "WAYLAND_DISPLAY" not in env
     assert mgr.is_alive()
+
+
+def test_start_strips_inherited_wayland_display(tmp_path: Path) -> None:
+    """Regression: even if the parent agora-player process has
+    WAYLAND_DISPLAY in its env (e.g. via a systemd drop-in or a stray
+    export), it must be removed before sway is launched."""
+    runtime_dir = tmp_path / "rt"
+    runtime_dir.mkdir()
+    mgr = SwayManager(
+        slots=("A",),
+        runtime_dir=str(runtime_dir),
+        config_path=str(runtime_dir / "sway.conf"),
+    )
+    fake_proc = _fake_popen(alive=True)
+    with patch.dict(
+        "player.sway_manager.os.environ",
+        {"WAYLAND_DISPLAY": "wayland-99"},
+        clear=False,
+    ), patch("player.sway_manager.subprocess.Popen", return_value=fake_proc) as popen:
+        mgr.start()
+    env = popen.call_args.kwargs["env"]
+    assert "WAYLAND_DISPLAY" not in env
 
 
 def test_start_idempotent_when_already_alive(tmp_path: Path) -> None:

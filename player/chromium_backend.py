@@ -470,6 +470,11 @@ class ChromiumPlayer:
         """
         argv = [
             "chromium", "--no-sandbox", "--kiosk", "--noerrdialogs",
+            # Force the wayland ozone backend; without these chromium
+            # defaults to X11 and exits immediately on systems with no
+            # X server (i.e. every agora device).
+            "--ozone-platform=wayland",
+            "--enable-features=UseOzonePlatform",
             "--disable-translate", "--disable-infobars", "--incognito",
             "--hide-scrollbars",
             "--autoplay-policy=no-user-gesture-required",
@@ -570,7 +575,9 @@ class ChromiumPlayer:
             self._sway_process = subprocess.Popen(
                 cmd, env=env,
                 start_new_session=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                # stderr inherited (→ journal) so silent launch failures
+                # surface in `journalctl -u agora-player`.
+                stdout=subprocess.DEVNULL,
             )
         except (FileNotFoundError, OSError) as e:
             logger.error(
@@ -662,7 +669,9 @@ class ChromiumPlayer:
             self._sway_process = subprocess.Popen(
                 cmd, env=env,
                 start_new_session=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                # stderr inherited (→ journal) so silent launch failures
+                # surface in `journalctl -u agora-player`.
+                stdout=subprocess.DEVNULL,
             )
         except (FileNotFoundError, OSError) as e:
             logger.error(
