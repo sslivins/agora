@@ -127,6 +127,154 @@ class TestStartSlideshow:
         assert player._slideshow["timeout_id"] == 42
 
 
+class TestManifestSchemaVersion:
+    """Phase 0 of agora#226: parse manifest_schema_version, default to 1.0,
+    warn-once on forward versions, store on runtime state for Phase 2.
+    """
+
+    def _write_versioned_manifest(self, player, name, slides, version):
+        import json
+        path = player.assets_dir / "slideshows" / f"{name}.json"
+        payload = {"name": name, "slides": slides}
+        if version is not None:
+            payload["manifest_schema_version"] = version
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_v1_0_default_when_field_absent(self, mpv_player):
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        self._write_versioned_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 1000, "play_to_end": False},
+        ], version=None)
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        assert player._slideshow["schema_version"] == "1.0"
+
+    def test_v1_0_explicit(self, mpv_player):
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        self._write_versioned_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 1000, "play_to_end": False},
+        ], version="1.0")
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        assert player._slideshow["schema_version"] == "1.0"
+
+    def test_forward_version_logs_info_and_still_plays(self, mpv_player, caplog):
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        self._write_versioned_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 1000, "play_to_end": False},
+        ], version="1.1")
+        with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
+            player._start_slideshow("Show", None)
+        assert player._slideshow is not None
+        assert player._slideshow["schema_version"] == "1.1"
+        # INFO logged, mentions both the observed and the player-max version.
+        assert any(
+            "manifest_schema_version=1.1" in rec.getMessage()
+            and "player max=1.0" in rec.getMessage()
+            for rec in caplog.records
+        ), f"forward-version INFO not logged: {[r.getMessage() for r in caplog.records]}"
+
+    def test_forward_version_logged_only_once_per_digest(self, mpv_player, caplog):
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        self._write_versioned_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 1000, "play_to_end": False},
+        ], version="1.1")
+        with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
+            player._start_slideshow("Show", None)
+            player._clear_slideshow()
+            player._start_slideshow("Show", None)
+        forward_logs = [
+            r for r in caplog.records
+            if "manifest_schema_version=1.1" in r.getMessage()
+        ]
+        assert len(forward_logs) == 1, (
+            f"forward-version INFO should fire once per digest, got "
+            f"{len(forward_logs)} entries"
+        )
+
+    def test_unknown_envelope_fields_ignored(self, mpv_player):
+        """Forward-compat: a manifest sprouting an unrecognised top-level
+        field (e.g. cycle_duration_ms from Phase 1b) doesn't break the
+        legacy reader.
+        """
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        import json
+        path = player.assets_dir / "slideshows" / "Show.json"
+        path.write_text(json.dumps({
+            "name": "Show",
+            "manifest_schema_version": "1.1",
+            "cycle_duration_ms": 1000,
+            "started_at": "2026-05-17T00:00:00Z",
+            "slides": [{"name": "a.png", "asset_type": "image",
+                        "duration_ms": 1000, "play_to_end": False}],
+        }))
+        with patch.object(svc, "GLib"):
+            player._start_slideshow("Show", None)
+        assert player._slideshow is not None
+        assert player._slideshow["schema_version"] == "1.1"
+        # Legacy timer chain still in charge — Phase 0 does not consume
+        # cycle_duration_ms/started_at yet.
+
+    def test_corrupt_schema_version_treated_as_pre_1_0(self, mpv_player, caplog):
+        """A garbage value (e.g. ``"abc"``) is parsed as (0,0) which is
+        NOT forward of (1,0), so no warning fires.  It just gets stored
+        verbatim for diagnostic purposes.
+        """
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        self._write_versioned_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 1000, "play_to_end": False},
+        ], version="abc")
+        with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
+            player._start_slideshow("Show", None)
+        assert player._slideshow["schema_version"] == "abc"
+        # No forward-version warning for unparseable values.
+        assert not any(
+            "manifest_schema_version=abc" in r.getMessage()
+            for r in caplog.records
+        )
+
+
+class TestSchemaVersionHelpers:
+    """Pure-function unit tests for the version comparator."""
+
+    @pytest.fixture
+    def svc(self, mpv_player):
+        """Reuse the gi-mocked module that mpv_player already imported."""
+        _, svc = mpv_player
+        return svc
+
+    def test_parse_basic(self, svc):
+        assert svc._parse_schema_version("1.0") == (1, 0)
+        assert svc._parse_schema_version("1.1") == (1, 1)
+        assert svc._parse_schema_version("2.5") == (2, 5)
+        assert svc._parse_schema_version("1.0.3") == (1, 0)  # patch ignored
+
+    def test_parse_invalid(self, svc):
+        assert svc._parse_schema_version("abc") == (0, 0)
+        assert svc._parse_schema_version("") == (0, 0)
+        assert svc._parse_schema_version("1") == (0, 0)  # need major.minor
+        assert svc._parse_schema_version(None) == (0, 0)  # type: ignore[arg-type]
+
+    def test_forward(self, svc):
+        assert svc._is_forward_schema("1.1", "1.0") is True
+        assert svc._is_forward_schema("2.0", "1.5") is True
+        assert svc._is_forward_schema("1.0", "1.0") is False  # equal not forward
+        assert svc._is_forward_schema("0.9", "1.0") is False
+        assert svc._is_forward_schema("abc", "1.0") is False
+
+
 class TestSlideAdvance:
     def test_advance_loops_back_until_count_exceeded(self, mpv_player):
         player, svc = mpv_player
