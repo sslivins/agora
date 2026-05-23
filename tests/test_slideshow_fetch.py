@@ -293,6 +293,67 @@ class TestSlideshowFetch:
         assert manifest["slides"][0]["transition_ms"] == 850
 
     @pytest.mark.asyncio
+    async def test_wall_clock_fields_absent_persist_as_none(self, cms_client):
+        """agora#226 Phase 1b: older CMS (or non-slideshow paths) won't
+        emit ``cycle_duration_ms``/``started_at``.  Persist as ``null``
+        so the player can detect "no anchor available" and fall back
+        to the legacy relative-timer chain.
+        """
+        b1 = b"sb"
+        slides = [_make_slide("a.png", b1, asset_type="image", duration_ms=2000)]
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "NoAnchor.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "slides": slides,
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest = json.loads(
+            (cms_client.settings.slideshows_dir / "NoAnchor.slideshow.json").read_text()
+        )
+        assert manifest["cycle_duration_ms"] is None
+        assert manifest["started_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_fields_propagated_from_wire(self, cms_client):
+        """agora#226 Phase 1b: when CMS sends ``cycle_duration_ms`` and
+        ``started_at``, persist them verbatim into the on-disk manifest
+        so Phase 2 wall-clock resync can read them after a reboot.
+        """
+        b1 = b"sb"
+        slides = [_make_slide("a.png", b1, asset_type="image", duration_ms=2500)]
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "Anchored.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "manifest_schema_version": "1.1",
+            "cycle_duration_ms": 2500,
+            "started_at": "2026-05-23T19:39:45.000Z",
+            "slides": slides,
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest = json.loads(
+            (cms_client.settings.slideshows_dir / "Anchored.slideshow.json").read_text()
+        )
+        assert manifest["manifest_schema_version"] == "1.1"
+        assert manifest["cycle_duration_ms"] == 2500
+        assert manifest["started_at"] == "2026-05-23T19:39:45.000Z"
+
+    @pytest.mark.asyncio
     async def test_already_cached_short_circuits(self, cms_client):
         """Slideshow + every slide already cached → ACK without re-downloading."""
         b1, b2 = b"already-have-1", b"already-have-2"
