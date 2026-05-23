@@ -226,6 +226,12 @@ jobs:
         with:
           ref: gh-pages
           fetch-depth: 0
+          # Use the shared VERSION_BUMP_TOKEN PAT so the push to
+          # gh-pages succeeds.  The default GITHUB_TOKEN started
+          # failing here on 2026-05-23 with "could not read Username
+          # for 'https://github.com'" — see plan.md Phase 1a status.
+          # No fallback: fail loudly if the secret is missing.
+          token: ${{ secrets.VERSION_BUMP_TOKEN }}
         continue-on-error: true
 
       - name: Initialize gh-pages if needed
