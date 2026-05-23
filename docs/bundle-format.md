@@ -22,7 +22,7 @@ agora-os-<version>.tar.zst
 agora-os-<version>.tar.zst.minisig
 ```
 
-- `<version>` is the same SemVer string declared inside `meta.json` (`major.minor.patch`, optionally `-prerelease`). It matches `^\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?$` — the same regex the dispatch validator enforces.
+- `<version>` is the same SemVer string declared inside `meta.json` (`major.minor.patch`, optionally `-prerelease`). It matches `^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$` — the same regex the dispatch validator enforces.
 - The minisign sig file ALWAYS has the `.minisig` extension (minisign's default), not `.sig`. The dispatch payload's `signature_url` SHOULD point at the `.minisig`, but the device is willing to accept a `.sig` extension as well so an operator can rename it without breaking anything.
 
 ## Tarball layout

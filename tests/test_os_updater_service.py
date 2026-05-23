@@ -171,6 +171,11 @@ class TestVersionAtLeast:
             ("1.0.0", "1.0.0-rc1", True),
             ("1.0.0-rc1", "1.0.0", False),
             ("1.0.0-rc2", "1.0.0-rc1", True),
+            # Multi-hyphen prerelease tags (e.g. agora-os "-test-unpin",
+            # "-test-hevc-real", "-rc1-hotfix") must parse, not crash.
+            ("0.1.1-test-unpin", "0.1.0", True),
+            ("0.1.3-test-hevc-real", "0.1.1-test-unpin", True),
+            ("1.0.0-rc1", "0.1.3-test-hevc-real", True),
         ],
     )
     def test_compare(self, current, floor, expected):

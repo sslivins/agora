@@ -118,7 +118,7 @@ _PROMOTE_HANDSHAKE_TICK_SEC = 30.0
 
 #: Same regex as dispatch._VERSION_RE — kept local to avoid importing a
 #: private symbol. Used by the version-floor check.
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9.]+))?$")
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9.-]+))?$")
 
 
 log = logging.getLogger(__name__)
