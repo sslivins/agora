@@ -32,6 +32,31 @@ from player.chromium_backend import ChromiumPlayer  # noqa: E402
 logger = logging.getLogger("agora.player")
 
 
+def _parse_schema_version(version: str) -> tuple[int, int]:
+    """Parse a ``major.minor`` (or ``major.minor.patch``) version string.
+
+    Returns ``(major, minor)``.  Anything unparseable is treated as
+    ``(0, 0)`` — i.e. older than every real version — so a corrupted
+    or unexpected value never trips the "forward" comparison.  We only
+    care about major+minor; patch-level differences are below the
+    granularity of the manifest schema.
+    """
+    try:
+        parts = version.split(".")
+        return int(parts[0]), int(parts[1])
+    except (AttributeError, IndexError, ValueError):
+        return (0, 0)
+
+
+def _is_forward_schema(observed: str, player_max: str) -> bool:
+    """True iff ``observed`` is strictly greater than ``player_max``.
+
+    Used to decide whether to log the once-per-manifest "CMS is ahead of
+    this player" INFO message.  Equal versions are NOT forward.
+    """
+    return _parse_schema_version(observed) > _parse_schema_version(player_max)
+
+
 def _build_video_pipeline_str(board: Board) -> str:
     """Return the GStreamer pipeline string for video playback with audio.
 
@@ -150,6 +175,21 @@ class AgoraPlayer:
     and mpv subprocess on Pi 4/Pi 5 for video playback with hardware decoding.
     """
 
+    # ── Slideshow manifest schema version (agora#226 Phase 0) ──
+    #
+    # The CMS now tags every slideshow manifest with a
+    # ``manifest_schema_version`` semver string ("1.0", "1.1", …).  This
+    # player understands up to ``PLAYER_MAX_MANIFEST_SCHEMA_VERSION``.
+    # A higher version on the wire just means the CMS may emit fields
+    # this player doesn't know about — they're silently ignored, and we
+    # log INFO once-per-content-hash so the fleet dashboard can spot
+    # devices lagging behind a CMS rollout.
+    #
+    # Phase 0 ships the plumbing but does not yet bump the supported
+    # ceiling above 1.0 — Phase 2 lifts it to "1.1" once wall-clock
+    # resync lands.
+    PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.0"
+
     # Class-level default so tests that bypass __init__ still see this
     # attribute as None (matches "not in a slideshow").
     _slideshow: Optional[dict] = None
@@ -164,6 +204,14 @@ class AgoraPlayer:
     # defaults and the existing mpv code paths remain untouched.
     _use_chromium_backend: bool = False
     _chromium_player = None  # type: ignore[var-annotated]
+    # SHA-256 prefixes of slideshow manifests for which a forward
+    # ``manifest_schema_version`` has already been logged.  Bounded by
+    # the number of distinct slideshows the device sees; cleared on
+    # process restart.  Used purely for log-spam suppression.  Defined
+    # as an instance attribute in ``__init__``; declared here only so
+    # tests that build instances via ``__new__`` still see the
+    # attribute name.
+    _forward_schema_logged: Optional[set] = None
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -263,6 +311,9 @@ class AgoraPlayer:
         # Slideshow sequencer state. None when not playing a slideshow.
         # Populated by _start_slideshow; cleared by _clear_slideshow.
         self._slideshow: Optional[dict] = None
+        # Dedup set for forward-schema-version INFO logs (Phase 0).  Keyed
+        # by manifest content digest so we log once per distinct manifest.
+        self._forward_schema_logged: set[str] = set()
 
         # ── mpv IPC event listener (Phase 1) ──
         #
@@ -356,6 +407,25 @@ class AgoraPlayer:
         manifest, digest = result
         self._cancel_slide_timeout()
         slides = manifest["slides"]
+        # Slideshow manifest schema version (agora#226 Phase 0).  Missing
+        # from disk = pre-versioning manifest = treat as "1.0".  We log
+        # once-per-content-digest when the CMS is emitting a version
+        # higher than this player understands; the manifest still plays
+        # because unknown fields are ignored (additive evolution).
+        schema_version = str(manifest.get("manifest_schema_version") or "1.0")
+        if self._forward_schema_logged is None:
+            self._forward_schema_logged = set()
+        if (
+            _is_forward_schema(schema_version, self.PLAYER_MAX_MANIFEST_SCHEMA_VERSION)
+            and digest not in self._forward_schema_logged
+        ):
+            logger.info(
+                "Slideshow %s manifest_schema_version=%s exceeds player max=%s "
+                "— unknown fields will be ignored (digest=%s)",
+                name, schema_version, self.PLAYER_MAX_MANIFEST_SCHEMA_VERSION,
+                digest[:8],
+            )
+            self._forward_schema_logged.add(digest)
         # ``epoch`` is bumped each time a slideshow starts so a stale
         # play_to_end watchdog or late mpv event from a prior slideshow
         # cannot drive the new one.
@@ -373,6 +443,9 @@ class AgoraPlayer:
             # Misses-this-cycle counter guards against runaway recursion
             # when every slide in the manifest is missing on disk.
             "misses_this_cycle": 0,
+            # Manifest schema version observed (Phase 0).  Phase 2 will
+            # branch on this to choose legacy vs anchored playback.
+            "schema_version": schema_version,
         }
         self._slideshow_manifest_digest = digest
         self._loops_completed = 0

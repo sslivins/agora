@@ -1745,6 +1745,11 @@ class CMSClient:
         asset_name = msg.get("asset_name", "")
         expected_checksum = msg.get("checksum", "")
         slides = msg.get("slides") or []
+        # Slideshow manifest schema version (agora#226 Phase 0).  Missing on
+        # the wire = pre-versioning CMS = treat as "1.0".  Persisted into the
+        # manifest dict on disk so the player sees the same value whether the
+        # manifest came from a fresh fetch or a reboot-time read.
+        manifest_schema_version = msg.get("manifest_schema_version") or "1.0"
 
         if not asset_name:
             logger.warning("Invalid slideshow fetch_asset: missing asset_name")
@@ -1857,6 +1862,7 @@ class CMSClient:
         manifest_payload = {
             "name": asset_name,
             "checksum": expected_checksum,
+            "manifest_schema_version": manifest_schema_version,
             "slides": [
                 {
                     "name": s["asset_name"],
