@@ -183,10 +183,22 @@ def _open_existing_regular_file(path: Path, exc_cls: type[Exception]) -> int:
     Raises ``exc_cls`` if the file is a symlink, not a regular file, owned
     by a different uid, or (repairably) has loose permissions.
 
-    Same-owner over-permissive mode is repaired to ``0o400`` via ``fchmod``.
+    Same-owner over-permissive mode is repaired to ``0o400`` via ``fchmod``
+    on POSIX. On Windows the POSIX file mode bits are synthesized from a
+    default template that doesn't reflect actual ACLs, and ``fchmod`` to
+    ``0o400`` raises ``WinError 5 (Access is denied)``, so we skip the
+    perm check entirely on non-POSIX platforms.
+
+    Note: ``os.O_NOFOLLOW`` is Unix-only; on platforms without it (e.g.
+    Windows) we degrade to a no-op (``0``) bit in the open flags. This
+    matches the defensive ``getattr(os, "O_NOFOLLOW", 0)`` pattern used by
+    the rest of agora (``chromium_backend``, ``player.service``,
+    ``sway_manager``) and lets the softplayer's Windows shim path actually
+    boot.
     """
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | o_nofollow)
     except OSError as e:
         # ELOOP means a symlink was followed; distinguish for the caller.
         if getattr(e, "errno", None) in (40,):  # ELOOP on Linux
@@ -203,8 +215,7 @@ def _open_existing_regular_file(path: Path, exc_cls: type[Exception]) -> int:
                 f"refusing to load a secret from a file owned by another user"
             )
         perm = st.st_mode & 0o777
-        if perm != _FILE_MODE:
-            # Same owner and loose perms → repair via fd.
+        if os.name == "posix" and perm != _FILE_MODE:
             try:
                 os.fchmod(fd, _FILE_MODE)
             except OSError as e:
@@ -233,10 +244,11 @@ def _create_new_secret_file(
     newly-created file is durable across power-loss.
     """
     parent = path.parent
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(
             path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | o_nofollow,
             _FILE_MODE,
         )
     except FileExistsError:
