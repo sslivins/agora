@@ -1750,6 +1750,16 @@ class CMSClient:
         # manifest dict on disk so the player sees the same value whether the
         # manifest came from a fresh fetch or a reboot-time read.
         manifest_schema_version = msg.get("manifest_schema_version") or "1.0"
+        # Wall-clock anchor fields (agora#226 Phase 1b, schema_version 1.1).
+        # ``cycle_duration_ms`` is the sum of slide durations (CMS-computed).
+        # ``started_at`` is the floor(now_utc, cycle_duration_ms) anchor that
+        # the wall-clock player uses to derive the active slide regardless of
+        # reboots. Both are optional — older CMS won't send them, and on the
+        # mpv player they're carried in the manifest but currently unused
+        # (Phase 2 of agora#226 will activate them).  Phase 2 will need the
+        # exact values that were on the wire, so we persist them verbatim.
+        cycle_duration_ms = msg.get("cycle_duration_ms")
+        started_at = msg.get("started_at")
 
         if not asset_name:
             logger.warning("Invalid slideshow fetch_asset: missing asset_name")
@@ -1863,6 +1873,8 @@ class CMSClient:
             "name": asset_name,
             "checksum": expected_checksum,
             "manifest_schema_version": manifest_schema_version,
+            "cycle_duration_ms": cycle_duration_ms,
+            "started_at": started_at,
             "slides": [
                 {
                     "name": s["asset_name"],
