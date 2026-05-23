@@ -433,3 +433,20 @@ def test_quit_plymouth_swallows_missing_binary(monkeypatch):
     monkeypatch.setattr(chromium_backend.subprocess, "run", raises)
     # Must not raise.
     chromium_backend._quit_plymouth()
+
+
+# ── Chromium argv: wayland ozone backend ─────────────────────────────
+
+
+def test_chromium_argv_forces_wayland_ozone(cp):
+    """Regression: without ``--ozone-platform=wayland`` chromium tries the
+    X11 backend, fails to connect to an X server (none on agora devices),
+    and exits within ~1s — leaving the player with no rendered output and
+    no visible error. The kiosk MUST be launched with the wayland ozone
+    backend explicitly forced.
+    """
+    argv = cp._chromium_argv(app_id="agora-shell-A")
+    assert "--ozone-platform=wayland" in argv
+    assert "--enable-features=UseOzonePlatform" in argv
+    # And the binary is still first so systemd-run can find it.
+    assert argv[0] == "chromium"

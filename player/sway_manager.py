@@ -130,7 +130,12 @@ class SwayManager:
 
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = self._runtime_dir
-        env["WAYLAND_DISPLAY"] = self._wayland_display
+        # sway IS the wayland compositor — must not have WAYLAND_DISPLAY set
+        # in its own env, or wlroots picks the wayland-client backend and
+        # tries to connect to a nonexistent parent compositor, then exits
+        # silently. Only client subprocesses (chromium kiosks) get this
+        # via env_for_client().
+        env.pop("WAYLAND_DISPLAY", None)
 
         self._scope_unit = f"agora-sway-shell-{uuid.uuid4().hex[:8]}.scope"
         cmd = [
@@ -148,7 +153,10 @@ class SwayManager:
             self._process = subprocess.Popen(
                 cmd, env=env,
                 start_new_session=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                # stderr → journal (inherit) so launch failures are visible.
+                # Sway's stdout is noisy on success but its stderr stays
+                # quiet unless it actually breaks, so the trade-off is fine.
+                stdout=subprocess.DEVNULL,
             )
         except (FileNotFoundError, OSError) as e:
             logger.error("SwayManager: failed to launch sway: %s", e)
