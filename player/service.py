@@ -201,6 +201,7 @@ class AgoraPlayer:
     # tests that build instances via ``__new__`` still see the
     # attribute name.
     _forward_schema_logged: Optional[set] = None
+    _coordinator = None  # type: ignore[var-annotated]
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -251,10 +252,18 @@ class AgoraPlayer:
             os.environ.get("AGORA_PLAYER_BACKEND") == "chromium"
         )
         self._chromium_player: Optional[ChromiumPlayer] = None
+        self._coordinator: Optional["Coordinator"] = None
         if self._use_chromium_backend:
-            self._chromium_player = ChromiumPlayer(
+            from player.coordinator import Coordinator
+            from shared.board import hdmi_port_count
+            n_ports = hdmi_port_count()
+            available_slots: tuple[str, ...] = ("A", "B") if n_ports >= 2 else ("A",)
+            self._coordinator = Coordinator(
+                base_path=self.base,
                 assets_dir=self.assets_dir,
-                on_event=self._on_chromium_event,
+                available_slots=available_slots,
+                slot_a_paths_mode="legacy",
+                on_chromium_event=self._on_chromium_event_for_slot,
             )
         # Armed when ``apply_desired`` dispatches a scheduled finite-loop
         # video through the chromium shell. ``_on_chromium_event`` clears
@@ -2753,6 +2762,52 @@ class AgoraPlayer:
         except Exception:  # pragma: no cover — defensive
             logger.exception("Failed to schedule chromium event handling")
 
+    def _on_chromium_event_for_slot(self, slot: str, payload: dict) -> None:
+        """Coordinator → daemon shell event callback (slot-aware).
+
+        For PR 2a only slot A is active, so we drop the slot id and
+        delegate to the existing single-slot callback. Future commits
+        that activate slot B will route by slot here.
+        """
+        if slot != "A":
+            logger.debug(
+                "chromium shell event for slot %s ignored (slot B not yet wired): %s",
+                slot, payload,
+            )
+            return
+        self._on_chromium_event(payload)
+
+    def _reconcile_slots_tick(self) -> bool:
+        """Periodic reconciliation of slot B against ``persist/devices.json``.
+
+        The cms_client persists bind/unbind decisions to that file; we
+        reflect them into the Coordinator here. Idempotent.
+
+        Always returns True so GLib re-arms the timeout.
+        """
+        try:
+            self._reconcile_slot_b()
+        except Exception:
+            logger.exception("slot reconciliation failed")
+        return True
+
+    def _reconcile_slot_b(self) -> None:
+        """Bring slot B up iff devices.json[B] has credentials, down otherwise."""
+        if not self._coordinator:
+            return
+        if "B" not in self._coordinator.available_slots:
+            return
+        from shared.devices_store import SLOT_B, read_slot
+        creds = read_slot(self.persist_dir, SLOT_B)
+        has_creds = creds is not None and bool(creds.get("api_key"))
+        currently_up = self._coordinator.has_slot("B")
+        if has_creds and not currently_up:
+            logger.info("slot reconciliation: activating slot B")
+            self._coordinator.activate_slot("B")
+        elif not has_creds and currently_up:
+            logger.info("slot reconciliation: deactivating slot B")
+            self._coordinator.deactivate_slot("B")
+
     def _handle_chromium_event_on_main(self, payload: dict) -> bool:
         """GLib idle callback: dispatch a single shell event.
 
@@ -3476,9 +3531,16 @@ class AgoraPlayer:
 
         # Chromium player demo: bring up shell server + kiosk early so
         # the first apply_desired can hand off image/video without
-        # falling back to mpv.
-        if self._chromium_player:
-            self._chromium_player.start()
+        # falling back to mpv. The Coordinator handles sway + per-slot
+        # chromium kiosks; slot A is always activated at start(). For
+        # back-compat with the (large) existing call surface that
+        # references ``self._chromium_player``, we alias it to slot A's
+        # ChromiumPlayer after start.
+        if self._coordinator:
+            self._coordinator.start()
+            slot_a = self._coordinator.slots.get("A")
+            if slot_a is not None:
+                self._chromium_player = slot_a.chromium_player
 
         # Apply initial state (may show splash, which can take seconds)
         self.apply_desired()
@@ -3496,14 +3558,21 @@ class AgoraPlayer:
         # display_connected in current.json stays fresh during splash/idle.
         GLib.timeout_add_seconds(10, self._probe_display_tick)
 
+        # Periodic slot-B reconciliation: cms_client persists bind/unbind
+        # decisions to devices.json; we read that on a tick and bring
+        # slot B up/down to match. Cheap (one stat + maybe one read).
+        if self._coordinator:
+            GLib.timeout_add_seconds(5, self._reconcile_slots_tick)
+
         # Signal handlers for clean shutdown
         def on_shutdown(signum, frame):
             logger.info("Received signal %d, shutting down", signum)
             self._running = False
             self._stop_mpv_event_listener()
             self._teardown()
-            if self._chromium_player:
-                self._chromium_player.stop()
+            if self._coordinator:
+                self._coordinator.stop()
+                self._chromium_player = None
             self.loop.quit()
 
         signal.signal(signal.SIGTERM, on_shutdown)
@@ -3516,6 +3585,7 @@ class AgoraPlayer:
         finally:
             self._stop_mpv_event_listener()
             self._teardown()
-            if self._chromium_player:
-                self._chromium_player.stop()
+            if self._coordinator:
+                self._coordinator.stop()
+                self._chromium_player = None
             logger.info("Agora Player stopped")
