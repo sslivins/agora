@@ -43,7 +43,6 @@ def mpv_player(tmp_path):
         p._error_retry_delay = 3
         p._pending_error = None
         p._loops_completed = 0
-        p._chromium_scheduled_pending = None
         p._board = svc.Board.PI_5
         p._player_backend = "mpv"
         p._slideshow = None
@@ -170,15 +169,15 @@ class TestManifestSchemaVersion:
         self._write_versioned_manifest(player, "Show", [
             {"name": "a.png", "asset_type": "image",
              "duration_ms": 1000, "play_to_end": False},
-        ], version="1.1")
+        ], version="1.2")
         with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
             player._start_slideshow("Show", None)
         assert player._slideshow is not None
-        assert player._slideshow["schema_version"] == "1.1"
+        assert player._slideshow["schema_version"] == "1.2"
         # INFO logged, mentions both the observed and the player-max version.
         assert any(
-            "manifest_schema_version=1.1" in rec.getMessage()
-            and "player max=1.0" in rec.getMessage()
+            "manifest_schema_version=1.2" in rec.getMessage()
+            and "player max=1.1" in rec.getMessage()
             for rec in caplog.records
         ), f"forward-version INFO not logged: {[r.getMessage() for r in caplog.records]}"
 
@@ -188,14 +187,14 @@ class TestManifestSchemaVersion:
         self._write_versioned_manifest(player, "Show", [
             {"name": "a.png", "asset_type": "image",
              "duration_ms": 1000, "play_to_end": False},
-        ], version="1.1")
+        ], version="1.2")
         with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
             player._start_slideshow("Show", None)
             player._clear_slideshow()
             player._start_slideshow("Show", None)
         forward_logs = [
             r for r in caplog.records
-            if "manifest_schema_version=1.1" in r.getMessage()
+            if "manifest_schema_version=1.2" in r.getMessage()
         ]
         assert len(forward_logs) == 1, (
             f"forward-version INFO should fire once per digest, got "
@@ -204,8 +203,8 @@ class TestManifestSchemaVersion:
 
     def test_unknown_envelope_fields_ignored(self, mpv_player):
         """Forward-compat: a manifest sprouting an unrecognised top-level
-        field (e.g. cycle_duration_ms from Phase 1b) doesn't break the
-        legacy reader.
+        field (from a hypothetical schema_version above the current
+        player max) doesn't break the reader.
         """
         player, svc = mpv_player
         (player.assets_dir / "images" / "a.png").touch()
@@ -213,18 +212,15 @@ class TestManifestSchemaVersion:
         path = player.assets_dir / "slideshows" / "Show.json"
         path.write_text(json.dumps({
             "name": "Show",
-            "manifest_schema_version": "1.1",
-            "cycle_duration_ms": 1000,
-            "started_at": "2026-05-17T00:00:00Z",
+            "manifest_schema_version": "1.2",
+            "future_field": "ignored",
             "slides": [{"name": "a.png", "asset_type": "image",
                         "duration_ms": 1000, "play_to_end": False}],
         }))
         with patch.object(svc, "GLib"):
             player._start_slideshow("Show", None)
         assert player._slideshow is not None
-        assert player._slideshow["schema_version"] == "1.1"
-        # Legacy timer chain still in charge — Phase 0 does not consume
-        # cycle_duration_ms/started_at yet.
+        assert player._slideshow["schema_version"] == "1.2"
 
     def test_corrupt_schema_version_treated_as_pre_1_0(self, mpv_player, caplog):
         """A garbage value (e.g. ``"abc"``) is parsed as (0,0) which is
@@ -891,6 +887,234 @@ class TestSlideshowShortCircuitRegression:
         player._show_splash.assert_called_once()
 
 
+
+# ── agora#226 Phase 2: wall-clock-anchored playback ──
+
+
+class TestLocateSlideAt:
+    """Pure-function tests for the ``_locate_slide_at`` helper.
+
+    Each test names the (elapsed_ms, slide-durations) input and the
+    expected (target_idx, remaining_ms) output. ``_locate_slide_at`` is
+    the math kernel of the anchored playback path — everything else in
+    Phase 2 is plumbing around it.
+    """
+
+    def _locate(self, *durations):
+        # Just builds a slides list with the given durations; field
+        # names match the on-disk manifest shape.
+        return [{"name": f"s{i}", "duration_ms": d}
+                for i, d in enumerate(durations)]
+
+    def test_start_of_cycle(self, mpv_player):
+        _, svc = mpv_player
+        idx, remaining = svc._locate_slide_at(0, self._locate(1000, 2000, 3000))
+        assert idx == 0
+        assert remaining == 1000
+
+    def test_mid_first_slide(self, mpv_player):
+        _, svc = mpv_player
+        idx, remaining = svc._locate_slide_at(400, self._locate(1000, 2000, 3000))
+        assert idx == 0
+        assert remaining == 600
+
+    def test_exact_boundary_to_second_slide(self, mpv_player):
+        """Cycle position == 1000 lands the start of slide 1, not the
+        end of slide 0 (half-open intervals).
+        """
+        _, svc = mpv_player
+        idx, remaining = svc._locate_slide_at(1000, self._locate(1000, 2000, 3000))
+        assert idx == 1
+        assert remaining == 2000
+
+    def test_mid_last_slide(self, mpv_player):
+        _, svc = mpv_player
+        idx, remaining = svc._locate_slide_at(4500, self._locate(1000, 2000, 3000))
+        assert idx == 2
+        assert remaining == 1500
+
+    def test_wraps_around_cycle(self, mpv_player):
+        """elapsed_ms past one full cycle wraps cleanly."""
+        _, svc = mpv_player
+        # cycle = 6000; elapsed = 6500 -> pos = 500 -> slide 0, 500ms left.
+        idx, remaining = svc._locate_slide_at(6500, self._locate(1000, 2000, 3000))
+        assert idx == 0
+        assert remaining == 500
+
+    def test_negative_elapsed_wraps(self, mpv_player):
+        """A small clock-skew (anchor slightly in the future) wraps to
+        the end of the cycle instead of crashing."""
+        _, svc = mpv_player
+        idx, remaining = svc._locate_slide_at(-200, self._locate(1000, 2000, 3000))
+        # -200 % 6000 == 5800 -> 5800-3000(slide0)=2800, 2800-2000(slide1)=800
+        # actually: pos=5800; slide0 dur=1000, pos>=1000 -> pos=4800;
+        # slide1 dur=2000, pos>=2000 -> pos=2800; slide2 dur=3000, pos<3000
+        # -> idx=2, remaining = 3000-2800 = 200.
+        assert idx == 2
+        assert remaining == 200
+
+    def test_single_slide(self, mpv_player):
+        _, svc = mpv_player
+        idx, remaining = svc._locate_slide_at(500, self._locate(2000))
+        assert idx == 0
+        assert remaining == 1500
+
+    def test_empty_slides_raises(self, mpv_player):
+        _, svc = mpv_player
+        with pytest.raises(ValueError):
+            svc._locate_slide_at(0, [])
+
+    def test_all_zero_duration_returns_safe_default(self, mpv_player):
+        """Degenerate manifest: every slide has zero duration. Return
+        (0, 1) so the caller schedules a 1ms re-eval rather than dividing
+        by zero or sleeping forever.
+        """
+        _, svc = mpv_player
+        idx, remaining = svc._locate_slide_at(100, self._locate(0, 0, 0))
+        assert idx == 0
+        assert remaining == 1
+
+
+class TestParseIso8601Utc:
+    def test_z_suffix(self, mpv_player):
+        _, svc = mpv_player
+        dt = svc._parse_iso8601_utc("2026-05-23T19:39:45.000Z")
+        from datetime import timezone
+        assert dt is not None
+        assert dt.tzinfo is timezone.utc
+
+    def test_plus_zero_suffix(self, mpv_player):
+        _, svc = mpv_player
+        dt = svc._parse_iso8601_utc("2026-05-23T19:39:45+00:00")
+        assert dt is not None
+
+    def test_invalid_returns_none(self, mpv_player):
+        _, svc = mpv_player
+        assert svc._parse_iso8601_utc("not-a-date") is None
+        assert svc._parse_iso8601_utc("") is None
+        assert svc._parse_iso8601_utc(None) is None  # type: ignore[arg-type]
+
+
+class TestAnchoredPlayback:
+    """Mid-cycle reboot → land on the right slide."""
+
+    def _write_anchored(self, player, name, slides, started_at,
+                        schema="1.1"):
+        import json
+        path = player.assets_dir / "slideshows" / f"{name}.json"
+        path.write_text(json.dumps({
+            "name": name,
+            "manifest_schema_version": schema,
+            "started_at": started_at,
+            "cycle_duration_ms": sum(s["duration_ms"] for s in slides),
+            "slides": slides,
+        }))
+        return path
+
+    def test_anchor_in_past_lands_on_mid_cycle_slide(self, mpv_player):
+        """Anchor = 12 min ago, cycle = 5 min, three 100s slides. We
+        should land 2 min into cycle 3 → slide index 1.
+        """
+        player, svc = mpv_player
+        from datetime import datetime, timedelta, timezone
+        for n in ("a.png", "b.png", "c.png"):
+            (player.assets_dir / "images" / n).touch()
+        anchor = datetime.now(timezone.utc) - timedelta(minutes=12)
+        self._write_anchored(player, "Show", [
+            {"name": "a.png", "asset_type": "image", "duration_ms": 100_000,
+             "play_to_end": False},
+            {"name": "b.png", "asset_type": "image", "duration_ms": 100_000,
+             "play_to_end": False},
+            {"name": "c.png", "asset_type": "image", "duration_ms": 100_000,
+             "play_to_end": False},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        # 12 min = 720_000 ms; cycle = 300_000 ms; pos = 720_000 % 300_000
+        # = 120_000 ms = 2 min in -> slide index 1.
+        ss = player._slideshow
+        assert ss is not None
+        assert ss.get("anchored_current_idx") == 1
+        # Resync tick armed at the cap, not the full remaining 180s.
+        tick_ms = glib.timeout_add.call_args[0][0]
+        assert tick_ms == 5000  # _RESYNC_CAP_MS
+
+    def test_clock_skew_active_falls_back_to_legacy(self, mpv_player, caplog):
+        """Anchor far in the future (NTP hasn't synced yet) → use the
+        legacy relative-timer chain until the wall clock catches up.
+        """
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        from datetime import datetime, timedelta, timezone
+        future = datetime.now(timezone.utc) + timedelta(days=365)
+        self._write_anchored(player, "Show", [
+            {"name": "a.png", "asset_type": "image", "duration_ms": 5000,
+             "play_to_end": False},
+        ], started_at=future.isoformat().replace("+00:00", "Z"))
+        with patch.object(svc, "GLib") as glib, \
+                caplog.at_level("INFO", logger="agora.player"):
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        ss = player._slideshow
+        assert ss is not None
+        assert ss.get("clock_skew_active") is True
+        # No anchored_current_idx set — went through legacy path.
+        assert "anchored_current_idx" not in ss
+        assert any(
+            "clock-skew guard ACTIVE" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_legacy_manifest_takes_legacy_path(self, mpv_player):
+        """schema 1.0 manifest with no anchor → existing index-driven
+        chain runs unchanged.
+        """
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        _write_manifest(player, "Show", [
+            {"name": "a.png", "asset_type": "image",
+             "duration_ms": 5000, "play_to_end": False},
+        ])
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 7
+            player._start_slideshow("Show", None)
+        ss = player._slideshow
+        assert ss is not None
+        # Legacy path advances ss["index"] in lockstep with dispatch.
+        assert ss["index"] == 1
+        assert "anchored_current_idx" not in ss
+
+    def test_resync_tick_advances_naturally(self, mpv_player):
+        """When the resync tick fires and computes the same idx as we
+        last dispatched, it just arms the next tick — no snap, no
+        re-loadfile.
+        """
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        (player.assets_dir / "images" / "b.png").touch()
+        from datetime import datetime, timezone
+        anchor = datetime.now(timezone.utc)
+        self._write_anchored(player, "Show", [
+            {"name": "a.png", "asset_type": "image", "duration_ms": 60_000,
+             "play_to_end": False},
+            {"name": "b.png", "asset_type": "image", "duration_ms": 60_000,
+             "play_to_end": False},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 42
+            player._start_slideshow("Show", None)
+            ss = player._slideshow
+            assert ss["anchored_current_idx"] == 0
+            # Fire the resync tick — same epoch, slide 0 still active.
+            player._loadfile_mpv.reset_mock()
+            result = player._on_anchored_resync_tick(ss["epoch"])
+        assert result is False
+        # Still on slide 0; no extra loadfile call.
+        assert ss["anchored_current_idx"] == 0
+        player._loadfile_mpv.assert_not_called()
+
+
 class TestChromiumSlideshowTransitions:
     """Per-slide transition values from the manifest must flow through
     to the chromium shell. The CMS is the source of truth; missing or
@@ -1113,98 +1337,58 @@ class TestChromiumScheduledLoopCount:
         with patch.object(svc, "GLib"):
             player.apply_desired()
 
-    def test_finite_loop_count_is_forwarded_to_show_video(self, mpv_player):
-        player, svc = mpv_player
-        self._arm_chromium(player)
-        self._make_video(player, "v.mp4")
-        desired = DesiredState(
-            asset="v.mp4",
-            asset_type="video",
-            mode=PlaybackMode.PLAY,
-            loop=False,
-            loop_count=3,
-        )
-        self._drive_apply_desired(player, svc, desired)
-        _, kwargs = player._chromium_player.show_video.call_args
-        assert kwargs["loop_count"] == 3
-        # When loop_count is set we don't also set HTML loop=true —
-        # that would suppress the ended event the shell needs to emit.
-        assert kwargs["loop"] is False
-        sp = player._chromium_scheduled_pending
-        assert sp is not None
-        assert sp["asset_url"] == "/assets/videos/v.mp4"
-        assert sp["target_count"] == 3
 
-    def test_loop_without_count_does_not_arm_pending(self, mpv_player):
-        player, svc = mpv_player
-        self._arm_chromium(player)
-        self._make_video(player, "v.mp4")
-        desired = DesiredState(
-            asset="v.mp4",
-            asset_type="video",
-            mode=PlaybackMode.PLAY,
-            loop=True,
-        )
-        self._drive_apply_desired(player, svc, desired)
-        _, kwargs = player._chromium_player.show_video.call_args
-        assert "loop_count" not in kwargs or kwargs["loop_count"] is None
-        assert kwargs["loop"] is True
-        assert player._chromium_scheduled_pending is None
+class TestAnchoredPlaybackChromium:
+    """Phase 3: anchored playback through the chromium backend."""
 
-    def test_terminal_ended_event_triggers_splash(self, mpv_player):
-        player, svc = mpv_player
-        self._arm_chromium(player)
-        self._make_video(player, "v.mp4")
-        desired = DesiredState(
-            asset="v.mp4",
-            asset_type="video",
-            mode=PlaybackMode.PLAY,
-            loop=False,
-            loop_count=2,
-        )
-        self._drive_apply_desired(player, svc, desired)
-        player._handle_chromium_event_on_main(
-            {"event": "ended", "asset": "/assets/videos/v.mp4",
-             "completed_loops": 2},
-        )
-        player._show_splash.assert_called_once()
-        assert player._chromium_scheduled_pending is None
+    def _write_anchored(self, player, name, slides, started_at):
+        import json
+        path = player.assets_dir / "slideshows" / f"{name}.json"
+        path.write_text(json.dumps({
+            "name": name,
+            "manifest_schema_version": "1.1",
+            "started_at": started_at,
+            "cycle_duration_ms": sum(s["duration_ms"] for s in slides),
+            "slides": slides,
+        }))
+        return path
 
-    def test_ended_for_different_asset_is_ignored(self, mpv_player):
-        player, svc = mpv_player
-        self._arm_chromium(player)
-        self._make_video(player, "v.mp4")
-        desired = DesiredState(
-            asset="v.mp4",
-            asset_type="video",
-            mode=PlaybackMode.PLAY,
-            loop=False,
-            loop_count=2,
-        )
-        self._drive_apply_desired(player, svc, desired)
-        player._handle_chromium_event_on_main(
-            {"event": "ended", "asset": "/assets/videos/other.mp4"},
-        )
-        player._show_splash.assert_not_called()
-        assert player._chromium_scheduled_pending is not None
+    def _arm_chromium(self, player):
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_alive = MagicMock(return_value=True)
 
-    def test_apply_desired_clears_stale_pending(self, mpv_player):
-        """Switching to a new chromium asset must drop any prior armed
-        pending — otherwise a late ended from the old asset would force
-        a spurious splash on top of the new asset."""
+    def test_anchored_image_dispatches_via_chromium_shell(self, mpv_player):
+        """Anchor 12 min ago, 5 min cycle of three 100s image slides.
+        Should call ``_chromium_player.show_image`` (not mpv) for slide 1,
+        and arm the resync tick at the 5s cap.
+        """
         player, svc = mpv_player
         self._arm_chromium(player)
-        player._chromium_scheduled_pending = {
-            "asset_url": "/assets/videos/old.mp4",
-            "asset_name": "old.mp4",
-            "target_count": 5,
-        }
-        self._make_video(player, "new.mp4")
-        desired = DesiredState(
-            asset="new.mp4",
-            asset_type="video",
-            mode=PlaybackMode.PLAY,
-            loop=True,
-        )
-        self._drive_apply_desired(player, svc, desired)
-        assert player._chromium_scheduled_pending is None
+        from datetime import datetime, timedelta, timezone
+        for n in ("a.png", "b.png", "c.png"):
+            (player.assets_dir / "images" / n).touch()
+        anchor = datetime.now(timezone.utc) - timedelta(minutes=12)
+        self._write_anchored(player, "Show", [
+            {"name": "a.png", "asset_type": "image", "duration_ms": 100_000,
+             "play_to_end": False, "transition": "fade", "transition_ms": 400},
+            {"name": "b.png", "asset_type": "image", "duration_ms": 100_000,
+             "play_to_end": False, "transition": "fade", "transition_ms": 400},
+            {"name": "c.png", "asset_type": "image", "duration_ms": 100_000,
+             "play_to_end": False, "transition": "fade", "transition_ms": 400},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        ss = player._slideshow
+        assert ss is not None
+        # Anchor math: 12min mod 5min cycle = 2min in -> slide idx 1.
+        assert ss.get("anchored_current_idx") == 1
+        # Dispatched via the chromium shell, not mpv.
+        player._chromium_player.show_image.assert_called_once()
+        _, kwargs = player._chromium_player.show_image.call_args
+        assert kwargs["transition"] == "fade"
+        assert kwargs["duration_ms"] == 400
+        # Resync tick armed at the 5s cap (not full remaining 180s).
+        tick_ms = glib.timeout_add.call_args[0][0]
+        assert tick_ms == 5000
