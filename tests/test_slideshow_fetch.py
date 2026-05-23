@@ -184,6 +184,58 @@ class TestSlideshowFetch:
         assert not [m for m in sent if m["type"] == "fetch_failed"]
 
     @pytest.mark.asyncio
+    async def test_manifest_schema_version_defaults_to_1_0_when_absent(self, cms_client):
+        """agora#226 Phase 0: pre-versioning CMS payloads (no
+        ``manifest_schema_version`` on the wire) get persisted as "1.0".
+        """
+        b1 = b"only-slide-bytes"
+        slides = [_make_slide("a.png", b1, asset_type="image", duration_ms=2000)]
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "NoVer.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "slides": slides,
+            # NOTE: no manifest_schema_version
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest_path = cms_client.settings.slideshows_dir / "NoVer.slideshow.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["manifest_schema_version"] == "1.0"
+
+    @pytest.mark.asyncio
+    async def test_manifest_schema_version_propagated_from_wire(self, cms_client):
+        """agora#226 Phase 0: when CMS sends a versioned manifest, the
+        version is persisted verbatim so the player can branch on it.
+        """
+        b1 = b"only-slide-bytes"
+        slides = [_make_slide("a.png", b1, asset_type="image", duration_ms=2000)]
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "Versioned.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "manifest_schema_version": "1.1",
+            "slides": slides,
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest_path = cms_client.settings.slideshows_dir / "Versioned.slideshow.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["manifest_schema_version"] == "1.1"
+
+    @pytest.mark.asyncio
     async def test_already_cached_short_circuits(self, cms_client):
         """Slideshow + every slide already cached → ACK without re-downloading."""
         b1, b2 = b"already-have-1", b"already-have-2"

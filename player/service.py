@@ -32,6 +32,113 @@ from player.chromium_backend import ChromiumPlayer  # noqa: E402
 logger = logging.getLogger("agora.player")
 
 
+def _parse_schema_version(version: str) -> tuple[int, int]:
+    """Parse a ``major.minor`` (or ``major.minor.patch``) version string.
+
+    Returns ``(major, minor)``.  Anything unparseable is treated as
+    ``(0, 0)`` — i.e. older than every real version — so a corrupted
+    or unexpected value never trips the "forward" comparison.  We only
+    care about major+minor; patch-level differences are below the
+    granularity of the manifest schema.
+    """
+    try:
+        parts = version.split(".")
+        return int(parts[0]), int(parts[1])
+    except (AttributeError, IndexError, ValueError):
+        return (0, 0)
+
+
+def _is_forward_schema(observed: str, player_max: str) -> bool:
+    """True iff ``observed`` is strictly greater than ``player_max``.
+
+    Used to decide whether to log the once-per-manifest "CMS is ahead of
+    this player" INFO message.  Equal versions are NOT forward.
+    """
+    return _parse_schema_version(observed) > _parse_schema_version(player_max)
+
+
+# ── Wall-clock anchor helpers (agora#226 Phase 2) ──
+
+# How far in the past we'll tolerate the wall clock being relative to a
+# manifest anchor before assuming NTP hasn't converged yet.  A Pi without
+# an RTC boots near the Unix epoch; once NTP syncs, the clock jumps
+# forward by several decades.  We don't want to drive playback from a
+# 1970 timestamp.
+_CLOCK_SKEW_TOLERANCE_S = 3600  # 1h
+
+# The biggest gap we ever sleep between resync evaluations.  The "next
+# advance" timer is always armed at min(remaining_ms, RESYNC_CAP_MS) so
+# we re-check the anchor at least this often — that's how a Pi that
+# fell behind catches up without needing a separate watchdog tick.
+_RESYNC_CAP_MS = 5000
+
+
+def _parse_iso8601_utc(value: str) -> Optional[datetime]:
+    """Parse an ISO-8601 UTC timestamp (``...Z`` or ``+00:00`` suffix).
+
+    Returns ``None`` if the value is missing, the wrong type, or
+    unparseable — callers must treat ``None`` as "no anchor available"
+    and fall back to legacy relative-timer playback.  We intentionally
+    do not raise; bad manifest data should not crash the player.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        # ``fromisoformat`` accepts ``+00:00`` but not the ``Z`` suffix
+        # until 3.11.  Normalize the suffix.
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _locate_slide_at(
+    elapsed_ms: int, slides: list[dict],
+) -> tuple[int, int]:
+    """Locate the active slide given ``elapsed_ms`` into the cycle.
+
+    Returns ``(target_idx, remaining_ms)`` where ``target_idx`` is the
+    0-based slide index that should be on screen right now, and
+    ``remaining_ms`` is the wall-clock time until the next slide
+    boundary (always > 0 and <= that slide's duration_ms).
+
+    ``elapsed_ms`` is normalized into ``[0, cycle_duration_ms)``, so
+    negative values (clock skew) or values past the cycle wrap around
+    correctly.  Empty slide lists raise ``ValueError`` — callers must
+    not invoke the anchored path on a degenerate manifest.
+
+    Slides with ``duration_ms <= 0`` are treated as 0-duration: the
+    function still returns a valid ``(idx, remaining_ms)`` by walking
+    past them.  If every slide is 0-duration the function returns
+    ``(0, 1)`` so the caller schedules a 1ms re-evaluation rather than
+    blocking forever.
+    """
+    if not slides:
+        raise ValueError("_locate_slide_at: slides must be non-empty")
+    durations = [max(int(s.get("duration_ms") or 0), 0) for s in slides]
+    cycle_ms = sum(durations)
+    if cycle_ms <= 0:
+        return (0, 1)
+    pos = elapsed_ms % cycle_ms
+    if pos < 0:
+        pos += cycle_ms
+    for idx, dur in enumerate(durations):
+        if dur <= 0:
+            continue
+        if pos < dur:
+            remaining = dur - pos
+            if remaining <= 0:
+                remaining = dur
+            return (idx, remaining)
+        pos -= dur
+    # ``pos < cycle_ms`` guarantees this is unreachable, but a defensive
+    # fallback keeps mypy happy and prevents UB on a bug elsewhere.
+    return (len(slides) - 1, max(durations[-1], 1))
+
+
 def _build_video_pipeline_str(board: Board) -> str:
     """Return the GStreamer pipeline string for video playback with audio.
 
@@ -150,6 +257,23 @@ class AgoraPlayer:
     and mpv subprocess on Pi 4/Pi 5 for video playback with hardware decoding.
     """
 
+    # ── Slideshow manifest schema version (agora#226 Phase 0 + Phase 2) ──
+    #
+    # The CMS now tags every slideshow manifest with a
+    # ``manifest_schema_version`` semver string ("1.0", "1.1", …).  This
+    # player understands up to ``PLAYER_MAX_MANIFEST_SCHEMA_VERSION``.
+    # A higher version on the wire just means the CMS may emit fields
+    # this player doesn't know about — they're silently ignored, and we
+    # log INFO once-per-content-hash so the fleet dashboard can spot
+    # devices lagging behind a CMS rollout.
+    #
+    # Phase 2 lifts the supported ceiling to "1.1": this player can
+    # consume the wall-clock anchor fields (``cycle_duration_ms`` /
+    # ``started_at``) and use them to land on the correct slide after a
+    # mid-cycle reboot.  Legacy 1.0 manifests still take the
+    # relative-timer path.
+    PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.1"
+
     # Class-level default so tests that bypass __init__ still see this
     # attribute as None (matches "not in a slideshow").
     _slideshow: Optional[dict] = None
@@ -164,6 +288,14 @@ class AgoraPlayer:
     # defaults and the existing mpv code paths remain untouched.
     _use_chromium_backend: bool = False
     _chromium_player = None  # type: ignore[var-annotated]
+    # SHA-256 prefixes of slideshow manifests for which a forward
+    # ``manifest_schema_version`` has already been logged.  Bounded by
+    # the number of distinct slideshows the device sees; cleared on
+    # process restart.  Used purely for log-spam suppression.  Defined
+    # as an instance attribute in ``__init__``; declared here only so
+    # tests that build instances via ``__new__`` still see the
+    # attribute name.
+    _forward_schema_logged: Optional[set] = None
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -263,6 +395,9 @@ class AgoraPlayer:
         # Slideshow sequencer state. None when not playing a slideshow.
         # Populated by _start_slideshow; cleared by _clear_slideshow.
         self._slideshow: Optional[dict] = None
+        # Dedup set for forward-schema-version INFO logs (Phase 0).  Keyed
+        # by manifest content digest so we log once per distinct manifest.
+        self._forward_schema_logged: set[str] = set()
 
         # ── mpv IPC event listener (Phase 1) ──
         #
@@ -356,6 +491,36 @@ class AgoraPlayer:
         manifest, digest = result
         self._cancel_slide_timeout()
         slides = manifest["slides"]
+        # Slideshow manifest schema version (agora#226 Phase 0).  Missing
+        # from disk = pre-versioning manifest = treat as "1.0".  We log
+        # once-per-content-digest when the CMS is emitting a version
+        # higher than this player understands; the manifest still plays
+        # because unknown fields are ignored (additive evolution).
+        schema_version = str(manifest.get("manifest_schema_version") or "1.0")
+        if self._forward_schema_logged is None:
+            self._forward_schema_logged = set()
+        if (
+            _is_forward_schema(schema_version, self.PLAYER_MAX_MANIFEST_SCHEMA_VERSION)
+            and digest not in self._forward_schema_logged
+        ):
+            logger.info(
+                "Slideshow %s manifest_schema_version=%s exceeds player max=%s "
+                "— unknown fields will be ignored (digest=%s)",
+                name, schema_version, self.PLAYER_MAX_MANIFEST_SCHEMA_VERSION,
+                digest[:8],
+            )
+            self._forward_schema_logged.add(digest)
+        # Wall-clock anchor (agora#226 Phase 2).  Only meaningful when
+        # the manifest is schema 1.1+ AND carries a parseable
+        # ``started_at`` AND the local wall clock is plausibly past it
+        # (clock-skew guard for pre-NTP boot).  If any precondition
+        # fails we fall back to the legacy relative-timer path; the
+        # anchor is rechecked each tick so a Pi whose clock syncs
+        # mid-playback transitions into anchored mode at the next tick.
+        anchor_dt = _parse_iso8601_utc(manifest.get("started_at") or "")
+        if anchor_dt is not None and _parse_schema_version(schema_version) < (1, 1):
+            # Defensive: ``started_at`` is only meaningful for 1.1+.
+            anchor_dt = None
         # ``epoch`` is bumped each time a slideshow starts so a stale
         # play_to_end watchdog or late mpv event from a prior slideshow
         # cannot drive the new one.
@@ -373,6 +538,22 @@ class AgoraPlayer:
             # Misses-this-cycle counter guards against runaway recursion
             # when every slide in the manifest is missing on disk.
             "misses_this_cycle": 0,
+            # Manifest schema version observed (Phase 0).  Phase 2 will
+            # branch on this to choose legacy vs anchored playback.
+            "schema_version": schema_version,
+            # Phase 2: wall-clock anchor (timezone-aware UTC) or None
+            # for legacy / unparseable manifests.  ``cycle_duration_ms``
+            # is cached on the dict so resync ticks don't have to
+            # re-sum slide durations each time.
+            "anchor": anchor_dt,
+            "cycle_duration_ms": sum(
+                max(int(s.get("duration_ms") or 0), 0) for s in slides
+            ),
+            # Phase 2: when set, indicates we're currently in the
+            # clock-skew guard window — anchor exists but ``now < anchor
+            # - tolerance``, so we play via legacy timers and re-check
+            # the wall clock each tick.
+            "clock_skew_active": False,
         }
         self._slideshow_manifest_digest = digest
         self._loops_completed = 0
@@ -382,16 +563,287 @@ class AgoraPlayer:
         )
         self._play_next_slide()
 
+    def _resolve_anchored_target(
+        self, ss: dict,
+    ) -> Optional[tuple[int, int]]:
+        """Return ``(target_idx, remaining_ms)`` for the anchored path,
+        or ``None`` if we should take the legacy relative-timer path.
+
+        Falls back to legacy when:
+
+        * The manifest has no ``anchor`` (schema < 1.1, or 1.1 without
+          a parseable ``started_at``).
+        * The cycle is degenerate (no slides with positive duration).
+        * The wall clock is more than ``_CLOCK_SKEW_TOLERANCE_S`` before
+          the anchor — implies NTP hasn't converged yet.  We toggle
+          ``ss["clock_skew_active"]`` so the next tick re-evaluates and
+          we log the transition exactly once per slideshow start.
+
+        Note this is called from BOTH ``_play_next_slide`` (initial
+        dispatch and natural advance) AND ``_on_resync_tick`` (mid-slide
+        re-evaluation).  The function is pure w.r.t. ``ss`` (it only
+        mutates ``clock_skew_active`` for telemetry).
+        """
+        anchor: Optional[datetime] = ss.get("anchor")
+        if anchor is None:
+            return None
+        slides = ss.get("slides") or []
+        cycle_ms = int(ss.get("cycle_duration_ms") or 0)
+        if not slides or cycle_ms <= 0:
+            return None
+
+        now = datetime.now(timezone.utc)
+        skew_s = (anchor - now).total_seconds()
+        if skew_s > _CLOCK_SKEW_TOLERANCE_S:
+            # Wall clock is too far behind the anchor — likely a freshly
+            # booted Pi without an RTC, before NTP syncs.  Run the
+            # legacy relative-timer path until the clock catches up.
+            if not ss.get("clock_skew_active"):
+                logger.info(
+                    "Slideshow %s: clock-skew guard ACTIVE "
+                    "(now=%s anchor=%s skew_s=%.0f) — using legacy timer chain",
+                    ss["name"], now.isoformat(), anchor.isoformat(), skew_s,
+                )
+                ss["clock_skew_active"] = True
+            return None
+        if ss.get("clock_skew_active"):
+            logger.info(
+                "Slideshow %s: clock-skew guard CLEARED (now=%s anchor=%s) "
+                "— switching to anchored playback",
+                ss["name"], now.isoformat(), anchor.isoformat(),
+            )
+            ss["clock_skew_active"] = False
+
+        elapsed_ms = int((now - anchor).total_seconds() * 1000)
+        return _locate_slide_at(elapsed_ms, slides)
+
+    def _play_anchored_slide(
+        self, ss: dict, target_idx: int, remaining_ms: int,
+    ) -> bool:
+        """Wall-clock-anchored slide dispatch (Phase 2 of agora#226).
+
+        Plays ``slides[target_idx]`` and arms a single resync timer at
+        ``min(remaining_ms, _RESYNC_CAP_MS)``.  On fire, the tick
+        re-evaluates the anchor:
+
+        * Same target as last time → natural advance to ``target_idx+1``
+          via ``_play_next_slide``.
+        * Different target → snap to the new index (corrects for the
+          case where the player drifted behind or the wall clock just
+          jumped forward).
+
+        ``play_to_end`` videos in the anchored path still use mpv's
+        natural ``end-file`` event for the common case, but the resync
+        tick will force-advance if the cycle has drifted past the
+        video's expected end by more than the overrun tolerance
+        (``max(2 × _RESYNC_CAP_MS, 0.25 × cycle_duration_ms, 10s)``).
+        """
+        slides = ss["slides"]
+        slide = slides[target_idx]
+        slide_name = slide.get("name") or ""
+        path = self._resolve_asset(slide_name)
+        if not path:
+            logger.error(
+                "Slideshow %s: anchored slide %d (%s) missing on disk "
+                "— skipping ahead",
+                ss["name"], target_idx, slide_name,
+            )
+            ss["misses_this_cycle"] = ss.get("misses_this_cycle", 0) + 1
+            if ss["misses_this_cycle"] >= len(slides):
+                logger.error(
+                    "Slideshow %s: all %d slides missing on disk — "
+                    "aborting → splash",
+                    ss["name"], len(slides),
+                )
+                self._clear_slideshow()
+                self._show_splash()
+                return False
+            # Advance the cursor past the missing slide and let the next
+            # tick (or recursion) pick up the next target.
+            ss["index"] = (target_idx + 1) % len(slides)
+            return self._play_next_slide()
+
+        ss["misses_this_cycle"] = 0
+        # Track the index so ``_play_next_slide``'s natural-advance
+        # branch keeps working for legacy callers (mpv ``ended`` events,
+        # tests poking at ``ss["index"]``).
+        ss["index"] = target_idx + 1
+        ss["anchored_current_idx"] = target_idx
+
+        self._cancel_slide_timeout()
+        is_video_slide = (slide.get("asset_type") == "video")
+        play_to_end = bool(slide.get("play_to_end")) and is_video_slide
+
+        logger.info(
+            "Slideshow %s: anchored slide %d/%d %s "
+            "(play_to_end=%s remaining_ms=%d)",
+            ss["name"], target_idx + 1, len(slides),
+            slide_name, play_to_end, remaining_ms,
+        )
+
+        if self._use_chromium_backend and self._chromium_player:
+            # Anchored dispatch through the chromium shell. Mirrors the
+            # chromium branch of ``_play_next_slide`` — but the resync
+            # tick (armed below) replaces the per-slide timeout for
+            # advance, so the shell does not need to know about anchoring.
+            slide_transition = slide.get("transition") or "cut"
+            slide_transition_ms = int(slide.get("transition_ms") or 600)
+            if play_to_end:
+                self._play_slide_to_end_chromium(
+                    slide, slide_name, path, ss,
+                    transition=slide_transition,
+                    transition_ms=slide_transition_ms,
+                )
+            elif is_video_slide:
+                self._chromium_player.show_video(
+                    path, loop=True, muted=False,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
+            else:
+                self._chromium_player.show_image(
+                    path,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=ss["name"],
+                started_at=datetime.now(timezone.utc),
+            )
+        elif play_to_end:
+            # Reuse the existing IPC/respawn machinery — its watchdog
+            # already covers the "mpv silently misbehaves" case.  The
+            # resync tick below covers the wall-clock overrun case.
+            self._play_slide_to_end(slide, slide_name, path, ss)
+        else:
+            if not self._loadfile_mpv(path, loop=True, muted=False):
+                self._start_mpv(path, loop=True)
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=ss["name"],
+                started_at=datetime.now(timezone.utc),
+            )
+
+        tick_ms = min(max(remaining_ms, 1), _RESYNC_CAP_MS)
+        epoch = ss["epoch"]
+        ss["timeout_id"] = GLib.timeout_add(
+            tick_ms, self._on_anchored_resync_tick, epoch,
+        )
+        return False
+
+    def _on_anchored_resync_tick(self, epoch: int) -> bool:
+        """GLib timeout for the wall-clock-anchored resync tick.
+
+        Fired at most every ``_RESYNC_CAP_MS`` ms.  Re-evaluates the
+        anchor and decides whether to natural-advance, snap, or
+        force-advance an overrunning ``play_to_end`` video.
+        """
+        ss = self._slideshow
+        if not ss or ss.get("epoch") != epoch:
+            return False  # one-shot, stale tick
+        ss["timeout_id"] = None
+
+        target = self._resolve_anchored_target(ss)
+        if target is None:
+            # Anchor became unusable (e.g. someone replaced the manifest
+            # mid-flight).  Fall back to a legacy natural advance so
+            # playback keeps moving.
+            return self._play_next_slide()
+
+        target_idx, remaining_ms = target
+        current_idx = ss.get("anchored_current_idx", -1)
+
+        if target_idx != current_idx:
+            logger.info(
+                "Slideshow %s: anchored resync SNAP from idx=%d to idx=%d "
+                "(remaining_ms=%d)",
+                ss["name"], current_idx, target_idx, remaining_ms,
+            )
+            return self._play_anchored_slide(ss, target_idx, remaining_ms)
+
+        # Same target slide.  If this is a play_to_end video that has
+        # overrun the cycle by more than the tolerance, force-advance.
+        # The pending key depends on which backend dispatched the slide
+        # — mpv writes ``pending_play_to_end``; chromium writes
+        # ``pending_play_to_end_chromium``.
+        if self._use_chromium_backend and self._chromium_player:
+            pending = ss.get("pending_play_to_end_chromium")
+            pending_key = "pending_play_to_end_chromium"
+        else:
+            pending = ss.get("pending_play_to_end")
+            pending_key = "pending_play_to_end"
+        cycle_ms = int(ss.get("cycle_duration_ms") or 0)
+        if pending is not None and cycle_ms > 0:
+            overrun_tolerance = max(
+                2 * _RESYNC_CAP_MS, cycle_ms // 4, 10_000,
+            )
+            armed_at: Optional[datetime] = pending.get("armed_at")
+            slide = ss["slides"][current_idx] if 0 <= current_idx < len(ss["slides"]) else None
+            slide_dur = int((slide or {}).get("duration_ms") or 0)
+            if armed_at is not None and slide_dur > 0:
+                elapsed_since_arm = (
+                    datetime.now(timezone.utc) - armed_at
+                ).total_seconds() * 1000
+                if elapsed_since_arm > slide_dur + overrun_tolerance:
+                    logger.warning(
+                        "Slideshow %s: play_to_end overrun (slide=%s "
+                        "elapsed_ms=%.0f slide_dur=%d tolerance=%d) "
+                        "— force-advancing",
+                        ss["name"], pending.get("slide_name"),
+                        elapsed_since_arm, slide_dur, overrun_tolerance,
+                    )
+                    if self._use_chromium_backend and self._chromium_player:
+                        self._cancel_play_to_end_chromium_watchdog()
+                        try:
+                            self._chromium_player.stop()
+                        except Exception:
+                            logger.exception(
+                                "Slideshow %s: chromium stop raised "
+                                "during anchored overrun force-advance",
+                                ss["name"],
+                            )
+                    else:
+                        self._stop_mpv()
+                    ss[pending_key] = None
+                    # Advance by re-running the anchored math at "now".
+                    new_target = self._resolve_anchored_target(ss)
+                    if new_target is not None:
+                        return self._play_anchored_slide(ss, *new_target)
+                    return self._play_next_slide()
+
+        # Same target, no overrun — just arm another tick.
+        tick_ms = min(max(remaining_ms, 1), _RESYNC_CAP_MS)
+        ss["timeout_id"] = GLib.timeout_add(
+            tick_ms, self._on_anchored_resync_tick, epoch,
+        )
+        return False
+
     def _play_next_slide(self) -> bool:
         """Advance to the next slide in the active slideshow.
 
         Loops back to the first slide when end is reached, honouring the
         slideshow-level loop_count.  Returns False so it can also be used
         as a one-shot GLib timeout callback.
+
+        For schema 1.1+ manifests with a usable wall-clock anchor this
+        dispatches to the anchored path (``_play_anchored_slide``) which
+        computes the target slide from ``now - anchor`` rather than just
+        incrementing the index.  Legacy 1.0 manifests (or anchored ones
+        where the wall clock hasn't caught up yet) take the original
+        relative-timer path below.
         """
         ss = self._slideshow
         if not ss:
             return False
+
+        # Phase 2: try the anchored path first when the manifest supports
+        # it.  ``_resolve_anchored_target`` returns None if we should fall
+        # back to the legacy chain — e.g. clock-skew guard active, no
+        # anchor, or degenerate cycle.
+        anchored = self._resolve_anchored_target(ss)
+        if anchored is not None:
+            return self._play_anchored_slide(ss, *anchored)
 
         if ss["index"] >= len(ss["slides"]):
             ss["loops_completed"] += 1
