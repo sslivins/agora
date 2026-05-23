@@ -63,6 +63,42 @@ SHELL_DIR = Path(__file__).resolve().parent / "shell"
 _SHELL_SWAY_RUNTIME_DIR = "/tmp/agora-sway-shell-run"
 _SHELL_SWAY_CONFIG_PATH = "/tmp/agora-sway-shell-run/sway.conf"
 
+# Process-wide flag so we only fire `plymouth quit` once per agora-player
+# lifetime. Subsequent kiosk restarts (e.g. after a webpage-mode bounce)
+# don't need to re-quit a plymouth that already exited.
+_plymouth_quit_done = False
+
+
+def _quit_plymouth() -> None:
+    """Tell Plymouth to release the DRM device before sway claims it.
+
+    Mirrors ``AgoraPlayer._quit_plymouth`` in player/service.py: under the
+    mpv backend that helper is called before every GStreamer/mpv pipeline
+    build, but the chromium backend never went through those code paths,
+    so plymouth was left holding DRM master and sway would silently fail
+    to come up — visible as a long-running splash that never advances.
+
+    ``--retain-splash`` keeps plymouth's last frame on the framebuffer
+    until chromium paints its first frame so there is no flash to black
+    during the handoff.
+    """
+    global _plymouth_quit_done
+    if _plymouth_quit_done:
+        return
+    _plymouth_quit_done = True
+    try:
+        subprocess.run(
+            ["/usr/bin/plymouth", "quit", "--retain-splash"],
+            timeout=5,
+            capture_output=True,
+        )
+        logger.info("ChromiumPlayer: plymouth quit (retained splash)")
+    except FileNotFoundError:
+        # Plymouth not installed (e.g. dev workstation, unit-test host).
+        pass
+    except Exception as e:
+        logger.debug("ChromiumPlayer: plymouth quit skipped: %s", e)
+
 
 class ChromiumPlayer:
     """Manage a persistent sway+chromium kiosk + shell control channel.
@@ -443,6 +479,12 @@ class ChromiumPlayer:
         sway's ``exec`` double-forks + setsids out of any process group.
         """
         self._stop_sway_kiosk()
+
+        # Plymouth holds DRM master across boot; sway will silently fail
+        # to acquire /dev/dri/cardX (looking like a frozen splash) until
+        # plymouth is told to release it. Idempotent across kiosk
+        # restarts.
+        _quit_plymouth()
 
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = _SHELL_SWAY_RUNTIME_DIR
