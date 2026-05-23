@@ -27,6 +27,19 @@ from shared.board import Board, alsa_device_string, alsa_device_string_gst, get_
 from hardware.display import PortStatus, get_display_probe  # noqa: E402
 from shared.models import CurrentState, DesiredState, PlaybackMode  # noqa: E402
 from shared.state import read_state, write_state  # noqa: E402
+from player.chromium_backend import ChromiumPlayer  # noqa: E402
+from player.slideshow_engine import (  # noqa: E402
+    AnchorStatus as _AnchorStatus,
+    CLOCK_SKEW_TOLERANCE_S as _CLOCK_SKEW_TOLERANCE_S,
+    PLAYER_MAX_MANIFEST_SCHEMA_VERSION as _PLAYER_MAX_MANIFEST_SCHEMA_VERSION,
+    RESYNC_CAP_MS as _RESYNC_CAP_MS,
+    is_forward_schema as _is_forward_schema,
+    locate_slide_at as _locate_slide_at,
+    parse_iso8601_utc as _parse_iso8601_utc,
+    parse_schema_version as _parse_schema_version,
+    read_slideshow_manifest as _read_slideshow_manifest_pure,
+    resolve_anchored_target as _resolve_anchored_target_pure,
+)
 
 logger = logging.getLogger("agora.player")
 
@@ -271,7 +284,7 @@ class AgoraPlayer:
     # ``started_at``) and use them to land on the correct slide after a
     # mid-cycle reboot.  Legacy 1.0 manifests still take the
     # relative-timer path.
-    PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.1"
+    PLAYER_MAX_MANIFEST_SCHEMA_VERSION = _PLAYER_MAX_MANIFEST_SCHEMA_VERSION
 
     # Class-level default so tests that bypass __init__ still see this
     # attribute as None (matches "not in a slideshow").
@@ -281,6 +294,12 @@ class AgoraPlayer:
     _applied_desired: Optional[DesiredState] = None
     _current_url: Optional[str] = None
     _slideshow_manifest_digest: Optional[str] = None
+    # Chromium-shell demo backend. Off by default; instances opted in
+    # via AGORA_PLAYER_BACKEND=chromium populate _chromium_player.
+    # Declared at class scope so tests that bypass __init__ see safe
+    # defaults and the existing mpv code paths remain untouched.
+    _use_chromium_backend: bool = False
+    _chromium_player = None  # type: ignore[var-annotated]
     # SHA-256 prefixes of slideshow manifests for which a forward
     # ``manifest_schema_version`` has already been logged.  Bounded by
     # the number of distinct slideshows the device sees; cleared on
@@ -289,6 +308,7 @@ class AgoraPlayer:
     # tests that build instances via ``__new__`` still see the
     # attribute name.
     _forward_schema_logged: Optional[set] = None
+    _coordinator = None  # type: ignore[var-annotated]
 
     IMAGE_PIPELINE_JPEG = (
         'filesrc location="{path}" ! '
@@ -327,6 +347,36 @@ class AgoraPlayer:
         self._board = get_board()
         self._display_probe = get_display_probe()
         self._player_backend = player_backend()
+
+        # ── Chromium player demo (opt-in, branch-only feature) ──
+        # When AGORA_PLAYER_BACKEND=chromium is set, image / video / splash
+        # / slideshow playback is routed through a persistent chromium
+        # kiosk + shell SPA instead of mpv. Streams and webpage assets
+        # keep their existing renderers (mpv-stream, sway+chromium for
+        # webpage assets) because the demo doesn't replace those. See
+        # player/shell/ and docs/chromium-player-demo.md.
+        self._use_chromium_backend = (
+            os.environ.get("AGORA_PLAYER_BACKEND") == "chromium"
+        )
+        self._chromium_player: Optional[ChromiumPlayer] = None
+        self._coordinator: Optional["Coordinator"] = None
+        if self._use_chromium_backend:
+            from player.coordinator import Coordinator
+            from shared.board import hdmi_port_count
+            n_ports = hdmi_port_count()
+            available_slots: tuple[str, ...] = ("A", "B") if n_ports >= 2 else ("A",)
+            self._coordinator = Coordinator(
+                base_path=self.base,
+                assets_dir=self.assets_dir,
+                available_slots=available_slots,
+                slot_a_paths_mode="legacy",
+                on_chromium_event=self._on_chromium_event_for_slot,
+            )
+        # Armed when ``apply_desired`` dispatches a scheduled finite-loop
+        # video through the chromium shell. ``_on_chromium_event`` clears
+        # it on the terminal ``ended`` event and transitions to splash.
+        # Single entry: only one scheduled asset can be live at once.
+        self._chromium_scheduled_pending: Optional[dict] = None
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self._mpv_process: Optional[subprocess.Popen] = None
@@ -409,25 +459,21 @@ class AgoraPlayer:
     def _read_slideshow_manifest(self, name: str) -> Optional[tuple[dict, str]]:
         """Read and validate a slideshow manifest from the assets dir.
 
-        Returns ``(parsed_dict, digest_hex)`` or ``None`` if missing/invalid.
-        ``digest_hex`` is the SHA-256 hex digest of the raw manifest bytes
-        and is used by ``_already_satisfied`` to detect manifest edits
-        between apply_desired calls (which would otherwise be invisible
-        because manifest contents are not part of DesiredState).
+        Thin wrapper around
+        :func:`player.slideshow_engine.read_slideshow_manifest` that
+        plugs in this instance's ``assets_dir`` and emits the existing
+        log message on unreadable / malformed manifests (the pure
+        helper is silent so softplayer can surface failures
+        differently).
         """
-        path = self.assets_dir / "slideshows" / f"{name}.json"
-        try:
-            raw = path.read_bytes()
-            data = json.loads(raw.decode("utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error("Slideshow manifest %s unreadable: %s", path, e)
-            return None
-        if not isinstance(data, dict):
-            return None
-        slides = data.get("slides")
-        if not isinstance(slides, list) or not slides:
-            return None
-        return data, hashlib.sha256(raw).hexdigest()
+        result = _read_slideshow_manifest_pure(self.assets_dir, name)
+        if result is None:
+            # Re-derive the path for the log message so behaviour matches
+            # the previous version exactly when the manifest is missing
+            # or malformed.
+            path = self.assets_dir / "slideshows" / f"{name}.json"
+            logger.error("Slideshow manifest %s unreadable or invalid", path)
+        return result
 
     def _cancel_slide_timeout(self) -> None:
         """Cancel any pending GLib slide-advance timeout."""
@@ -443,6 +489,7 @@ class AgoraPlayer:
         """Tear down slideshow state (cancel timeout, drop manifest)."""
         self._cancel_slide_timeout()
         self._cancel_play_to_end_watchdog()
+        self._cancel_play_to_end_chromium_watchdog()
         self._slideshow = None
         self._slideshow_manifest_digest = None
 
@@ -504,6 +551,7 @@ class AgoraPlayer:
             "timeout_id": None,
             "epoch": prev_epoch + 1,
             "pending_play_to_end": None,
+            "pending_play_to_end_chromium": None,
             # Misses-this-cycle counter guards against runaway recursion
             # when every slide in the manifest is missing on disk.
             "misses_this_cycle": 0,
@@ -538,53 +586,49 @@ class AgoraPlayer:
         """Return ``(target_idx, remaining_ms)`` for the anchored path,
         or ``None`` if we should take the legacy relative-timer path.
 
-        Falls back to legacy when:
+        Thin wrapper around
+        :func:`player.slideshow_engine.resolve_anchored_target` that:
 
-        * The manifest has no ``anchor`` (schema < 1.1, or 1.1 without
-          a parseable ``started_at``).
-        * The cycle is degenerate (no slides with positive duration).
-        * The wall clock is more than ``_CLOCK_SKEW_TOLERANCE_S`` before
-          the anchor — implies NTP hasn't converged yet.  We toggle
-          ``ss["clock_skew_active"]`` so the next tick re-evaluates and
-          we log the transition exactly once per slideshow start.
-
-        Note this is called from BOTH ``_play_next_slide`` (initial
-        dispatch and natural advance) AND ``_on_resync_tick`` (mid-slide
-        re-evaluation).  The function is pure w.r.t. ``ss`` (it only
-        mutates ``clock_skew_active`` for telemetry).
+        * extracts the slides/cycle/anchor from ``ss`` so callers can
+          continue passing the existing slideshow-state dict, and
+        * owns the clock-skew telemetry (mutates
+          ``ss["clock_skew_active"]`` and logs the transition exactly
+          once per direction).  The pure helper is silent so softplayer
+          can surface skew differently.
         """
-        anchor: Optional[datetime] = ss.get("anchor")
-        if anchor is None:
-            return None
-        slides = ss.get("slides") or []
-        cycle_ms = int(ss.get("cycle_duration_ms") or 0)
-        if not slides or cycle_ms <= 0:
-            return None
+        resolution = _resolve_anchored_target_pure(
+            slides=ss.get("slides") or [],
+            cycle_duration_ms=int(ss.get("cycle_duration_ms") or 0),
+            anchor=ss.get("anchor"),
+            clock_skew_tolerance_s=_CLOCK_SKEW_TOLERANCE_S,
+        )
 
-        now = datetime.now(timezone.utc)
-        skew_s = (anchor - now).total_seconds()
-        if skew_s > _CLOCK_SKEW_TOLERANCE_S:
-            # Wall clock is too far behind the anchor — likely a freshly
-            # booted Pi without an RTC, before NTP syncs.  Run the
-            # legacy relative-timer path until the clock catches up.
+        if resolution.status is _AnchorStatus.CLOCK_SKEW_BEHIND:
             if not ss.get("clock_skew_active"):
+                now = datetime.now(timezone.utc)
                 logger.info(
                     "Slideshow %s: clock-skew guard ACTIVE "
                     "(now=%s anchor=%s skew_s=%.0f) — using legacy timer chain",
-                    ss["name"], now.isoformat(), anchor.isoformat(), skew_s,
+                    ss["name"], now.isoformat(),
+                    ss["anchor"].isoformat() if ss.get("anchor") else "<none>",
+                    resolution.skew_s,
                 )
                 ss["clock_skew_active"] = True
             return None
-        if ss.get("clock_skew_active"):
+
+        if ss.get("clock_skew_active") and resolution.status is _AnchorStatus.OK:
+            now = datetime.now(timezone.utc)
             logger.info(
                 "Slideshow %s: clock-skew guard CLEARED (now=%s anchor=%s) "
                 "— switching to anchored playback",
-                ss["name"], now.isoformat(), anchor.isoformat(),
+                ss["name"], now.isoformat(),
+                ss["anchor"].isoformat() if ss.get("anchor") else "<none>",
             )
             ss["clock_skew_active"] = False
 
-        elapsed_ms = int((now - anchor).total_seconds() * 1000)
-        return _locate_slide_at(elapsed_ms, slides)
+        if resolution.status is _AnchorStatus.OK:
+            return resolution.target
+        return None
 
     def _play_anchored_slide(
         self, ss: dict, target_idx: int, remaining_ms: int,
@@ -650,7 +694,37 @@ class AgoraPlayer:
             slide_name, play_to_end, remaining_ms,
         )
 
-        if play_to_end:
+        if self._use_chromium_backend and self._chromium_player:
+            # Anchored dispatch through the chromium shell. Mirrors the
+            # chromium branch of ``_play_next_slide`` — but the resync
+            # tick (armed below) replaces the per-slide timeout for
+            # advance, so the shell does not need to know about anchoring.
+            slide_transition = slide.get("transition") or "cut"
+            slide_transition_ms = int(slide.get("transition_ms") or 600)
+            if play_to_end:
+                self._play_slide_to_end_chromium(
+                    slide, slide_name, path, ss,
+                    transition=slide_transition,
+                    transition_ms=slide_transition_ms,
+                )
+            elif is_video_slide:
+                self._chromium_player.show_video(
+                    path, loop=True, muted=False,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
+            else:
+                self._chromium_player.show_image(
+                    path,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=ss["name"],
+                started_at=datetime.now(timezone.utc),
+            )
+        elif play_to_end:
             # Reuse the existing IPC/respawn machinery — its watchdog
             # already covers the "mpv silently misbehaves" case.  The
             # resync tick below covers the wall-clock overrun case.
@@ -703,7 +777,15 @@ class AgoraPlayer:
 
         # Same target slide.  If this is a play_to_end video that has
         # overrun the cycle by more than the tolerance, force-advance.
-        pending = ss.get("pending_play_to_end")
+        # The pending key depends on which backend dispatched the slide
+        # — mpv writes ``pending_play_to_end``; chromium writes
+        # ``pending_play_to_end_chromium``.
+        if self._use_chromium_backend and self._chromium_player:
+            pending = ss.get("pending_play_to_end_chromium")
+            pending_key = "pending_play_to_end_chromium"
+        else:
+            pending = ss.get("pending_play_to_end")
+            pending_key = "pending_play_to_end"
         cycle_ms = int(ss.get("cycle_duration_ms") or 0)
         if pending is not None and cycle_ms > 0:
             overrun_tolerance = max(
@@ -724,8 +806,19 @@ class AgoraPlayer:
                         ss["name"], pending.get("slide_name"),
                         elapsed_since_arm, slide_dur, overrun_tolerance,
                     )
-                    self._stop_mpv()
-                    ss["pending_play_to_end"] = None
+                    if self._use_chromium_backend and self._chromium_player:
+                        self._cancel_play_to_end_chromium_watchdog()
+                        try:
+                            self._chromium_player.stop()
+                        except Exception:
+                            logger.exception(
+                                "Slideshow %s: chromium stop raised "
+                                "during anchored overrun force-advance",
+                                ss["name"],
+                            )
+                    else:
+                        self._stop_mpv()
+                    ss[pending_key] = None
                     # Advance by re-running the anchored math at "now".
                     new_target = self._resolve_anchored_target(ss)
                     if new_target is not None:
@@ -814,6 +907,53 @@ class AgoraPlayer:
             ss["name"], ss["index"], len(ss["slides"]),
             slide_name, play_to_end,
         )
+
+        # Chromium backend (demo): route slide playback through the shell.
+        # For the demo, play_to_end videos used to be best-effort with a
+        # fixed-duration timeout. Now we wire the shell's terminal
+        # "ended" event back into the slideshow sequencer so video slides
+        # advance on real end-of-file. Images and non-play_to_end videos
+        # still use the GLib timeout for slide expiry.
+        if self._use_chromium_backend and self._chromium_player:
+            # Per-slide transition is opt-in via the manifest; absent or
+            # unknown values fall back to "cut" (instant swap) on the
+            # shell side. transition_ms is the animation length, not the
+            # slide's on-screen duration (that's duration_ms below).
+            slide_transition = slide.get("transition") or "cut"
+            slide_transition_ms = int(slide.get("transition_ms") or 600)
+            if is_video_slide and play_to_end:
+                self._play_slide_to_end_chromium(
+                    slide, slide_name, path, ss,
+                    transition=slide_transition,
+                    transition_ms=slide_transition_ms,
+                )
+                return False
+            if is_video_slide:
+                # Slideshow videos loop within their fixed duration; the
+                # next-slide timeout drives advance.
+                self._chromium_player.show_video(
+                    path, loop=True, muted=False,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
+            else:
+                self._chromium_player.show_image(
+                    path,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
+            duration_ms = int(slide.get("duration_ms") or 0)
+            if duration_ms <= 0:
+                duration_ms = 10000
+            ss["timeout_id"] = GLib.timeout_add(
+                duration_ms, self._on_slide_timeout,
+            )
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=ss["name"],
+                started_at=datetime.now(timezone.utc),
+            )
+            return False
 
         if play_to_end:
             self._play_slide_to_end(slide, slide_name, path, ss)
@@ -915,6 +1055,85 @@ class AgoraPlayer:
         # _play_next_slide.
         self._stop_mpv()
         self._start_mpv(path, loop=False)
+
+    def _play_slide_to_end_chromium(
+        self,
+        slide: dict,
+        slide_name: str,
+        path: Path,
+        ss: dict,
+        *,
+        transition: str,
+        transition_ms: int,
+    ) -> None:
+        """Chromium equivalent of ``_play_slide_to_end``.
+
+        Sends a single-play (``loop=False``) ``show_video`` so the shell
+        emits an ``ended`` event on natural EOF, arms a slideshow-side
+        pending record matched against the asset URL, and starts a
+        watchdog so a misbehaving asset can't stall the show forever.
+        """
+        if not self._chromium_player:  # pragma: no cover — guarded by caller
+            return
+        asset_url = self._chromium_player.asset_url(path)
+        if asset_url is None:
+            logger.warning(
+                "Slideshow %s: asset %s not under assets dir — falling back to "
+                "timeout-driven advance",
+                ss.get("name"), path,
+            )
+            self._chromium_player.show_video(
+                path, loop=True, muted=False,
+                transition=transition, duration_ms=transition_ms,
+            )
+            duration_ms = int(slide.get("duration_ms") or 0)
+            if duration_ms <= 0:
+                duration_ms = 30000
+            ss["timeout_id"] = GLib.timeout_add(
+                duration_ms, self._on_slide_timeout,
+            )
+            self._update_current(
+                mode=PlaybackMode.PLAY,
+                asset=ss["name"],
+                started_at=datetime.now(timezone.utc),
+            )
+            return
+
+        self._chromium_player.show_video(
+            path, loop=False, muted=False,
+            transition=transition, duration_ms=transition_ms,
+        )
+
+        # Watchdog: 2× hinted duration with a 60s floor, capped at the
+        # hard cap so a misreported manifest can't stall the show.
+        duration_ms = int(slide.get("duration_ms") or 0)
+        if duration_ms > 0:
+            watchdog_ms = max(duration_ms * 2, 60_000)
+        else:
+            watchdog_ms = self._PLAY_TO_END_WATCHDOG_HARD_CAP_MS
+        watchdog_ms = min(watchdog_ms, self._PLAY_TO_END_WATCHDOG_HARD_CAP_MS)
+        epoch = ss["epoch"]
+        watchdog_id = GLib.timeout_add(
+            watchdog_ms, self._on_play_to_end_chromium_watchdog, epoch,
+        )
+        ss["pending_play_to_end_chromium"] = {
+            "slide_index": ss["index"] - 1,
+            "slide_name": slide_name,
+            "asset_url": asset_url,
+            "epoch": epoch,
+            "armed_at": datetime.now(timezone.utc),
+            "watchdog_id": watchdog_id,
+        }
+        self._update_current(
+            mode=PlaybackMode.PLAY,
+            asset=ss["name"],
+            started_at=datetime.now(timezone.utc),
+        )
+        logger.info(
+            "Slideshow %s: armed play_to_end via chromium shell "
+            "(slide=%s asset_url=%s watchdog=%dms)",
+            ss["name"], slide_name, asset_url, watchdog_ms,
+        )
 
     def _on_slide_timeout(self) -> bool:
         """GLib timeout callback for image slide expiry."""
@@ -2410,6 +2629,7 @@ class AgoraPlayer:
         # Clear any armed scheduled-pending so a stale event arriving from
         # the file we're about to replace can't re-trigger _show_splash.
         self._scheduled_pending = None
+        self._chromium_scheduled_pending = None
         self._stop_sway()
         error = self._pending_error
         self._pending_error = None
@@ -2418,8 +2638,21 @@ class AgoraPlayer:
             is_video = splash.suffix.lower() == ".mp4"
             self._current_path = splash
             self._current_mtime = splash.stat().st_mtime
-            # Use mpv on Pi 4/5 for both video and image splash, GStreamer on Zero 2 W
-            if self._player_backend == "mpv":
+            if self._use_chromium_backend and self._chromium_player:
+                # Tear down anything mpv/gstreamer left behind, then
+                # show via the shell. Splash always goes through
+                # show_splash regardless of image/video — videos in
+                # the shell auto-play muted with autoplay-policy=
+                # no-user-gesture-required.
+                self._teardown()
+                if is_video:
+                    self._chromium_player.show_video(
+                        splash, loop=True, muted=True, transition="cut",
+                    )
+                else:
+                    self._chromium_player.show_splash(splash)
+                logger.info("Showing splash via chromium shell: %s", splash.name)
+            elif self._player_backend == "mpv":
                 # Try seamless IPC switch first. Splash is always muted,
                 # regardless of whether the splash asset is an image or a
                 # video — only scheduled assets are allowed to produce audio.
@@ -2608,15 +2841,204 @@ class AgoraPlayer:
     def _pipeline_alive(self) -> bool:
         return self.pipeline is not None
 
+    def _chromium_alive(self) -> bool:
+        return bool(
+            self._use_chromium_backend
+            and self._chromium_player
+            and self._chromium_player.is_alive()
+        )
+
     def _renderer_alive(self) -> bool:
-        return self._mpv_alive() or self._sway_alive() or self._pipeline_alive()
+        return (
+            self._mpv_alive()
+            or self._sway_alive()
+            or self._pipeline_alive()
+            or self._chromium_alive()
+        )
+
+    def _on_chromium_event(self, payload: dict) -> None:
+        """Shell → daemon event callback (runs on the shell server thread).
+
+        Bridges into the GLib main loop via ``idle_add`` so the actual
+        handler reads/writes ``_slideshow`` and ``_chromium_scheduled_pending``
+        on the same thread as everything else that touches them.
+        """
+        logger.debug("chromium shell event: %s", payload)
+        try:
+            GLib.idle_add(self._handle_chromium_event_on_main, payload)
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("Failed to schedule chromium event handling")
+
+    def _on_chromium_event_for_slot(self, slot: str, payload: dict) -> None:
+        """Coordinator → daemon shell event callback (slot-aware).
+
+        For PR 2a only slot A is active, so we drop the slot id and
+        delegate to the existing single-slot callback. Future commits
+        that activate slot B will route by slot here.
+        """
+        if slot != "A":
+            logger.debug(
+                "chromium shell event for slot %s ignored (slot B not yet wired): %s",
+                slot, payload,
+            )
+            return
+        self._on_chromium_event(payload)
+
+    def _reconcile_slots_tick(self) -> bool:
+        """Periodic reconciliation of slot B against ``persist/devices.json``.
+
+        The cms_client persists bind/unbind decisions to that file; we
+        reflect them into the Coordinator here. Idempotent.
+
+        Always returns True so GLib re-arms the timeout.
+        """
+        try:
+            self._reconcile_slot_b()
+        except Exception:
+            logger.exception("slot reconciliation failed")
+        return True
+
+    def _reconcile_slot_b(self) -> None:
+        """Bring slot B up iff devices.json[B] has credentials, down otherwise."""
+        if not self._coordinator:
+            return
+        if "B" not in self._coordinator.available_slots:
+            return
+        from shared.devices_store import SLOT_B, read_slot
+        creds = read_slot(self.persist_dir, SLOT_B)
+        has_creds = creds is not None and bool(creds.get("api_key"))
+        currently_up = self._coordinator.has_slot("B")
+        if has_creds and not currently_up:
+            logger.info("slot reconciliation: activating slot B")
+            self._coordinator.activate_slot("B")
+        elif not has_creds and currently_up:
+            logger.info("slot reconciliation: deactivating slot B")
+            self._coordinator.deactivate_slot("B")
+
+    def _handle_chromium_event_on_main(self, payload: dict) -> bool:
+        """GLib idle callback: dispatch a single shell event.
+
+        Always returns False (one-shot). The payload is whatever the shell
+        sent over /ws (currently ``{event: "ready" | "ended" | "error",
+        asset?, completed_loops?, msg?}``).
+        """
+        try:
+            kind = payload.get("event") if isinstance(payload, dict) else None
+            if kind != "ended":
+                # "ready" / "error" / unknown — nothing to dispatch yet.
+                return False
+            asset_url = payload.get("asset")
+            if not isinstance(asset_url, str) or not asset_url:
+                logger.debug("chromium 'ended' with no asset url — ignoring")
+                return False
+            # Slideshow play_to_end takes priority — both pending dicts
+            # are scoped to different state machines and cannot be armed
+            # for the same asset simultaneously by construction.
+            if self._dispatch_chromium_ended_to_slideshow(asset_url):
+                return False
+            self._dispatch_chromium_ended_to_scheduled(asset_url)
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("Error handling chromium event %r", payload)
+        return False
+
+    def _dispatch_chromium_ended_to_slideshow(self, asset_url: str) -> bool:
+        """Return True iff the event matched a slideshow play_to_end claim.
+
+        On match, cancels the watchdog and advances the slideshow.
+        """
+        ss = self._slideshow
+        if not ss:
+            return False
+        pending = ss.get("pending_play_to_end_chromium")
+        if not pending:
+            return False
+        if pending.get("asset_url") != asset_url:
+            logger.debug(
+                "chromium ended ignored: asset mismatch (event=%s armed=%s)",
+                asset_url, pending.get("asset_url"),
+            )
+            return False
+        logger.info(
+            "chromium ended for slide %d (%s) — advancing",
+            pending["slide_index"], pending["slide_name"],
+        )
+        self._cancel_play_to_end_chromium_watchdog()
+        ss["pending_play_to_end_chromium"] = None
+        self._play_next_slide()
+        return True
+
+    def _dispatch_chromium_ended_to_scheduled(self, asset_url: str) -> None:
+        """Handle a terminal ``ended`` for a scheduled finite-loop video.
+
+        player.js owns the loop counting (it replays in-place to keep the
+        transition seamless) and only emits ``ended`` once the loop count
+        is exhausted. On match we drop the armed record and transition to
+        splash.
+        """
+        sp = self._chromium_scheduled_pending
+        if not sp:
+            return
+        if sp.get("asset_url") != asset_url:
+            logger.debug(
+                "chromium scheduled-ended ignored: asset mismatch "
+                "(event=%s armed=%s)",
+                asset_url, sp.get("asset_url"),
+            )
+            return
+        logger.info(
+            "chromium scheduled finite-loop completed for %s — splashing",
+            sp.get("asset_name"),
+        )
+        self._chromium_scheduled_pending = None
+        self._show_splash()
+
+    def _cancel_play_to_end_chromium_watchdog(self) -> None:
+        """Cancel any armed chromium play_to_end watchdog."""
+        ss = self._slideshow
+        if not ss:
+            return
+        pending = ss.get("pending_play_to_end_chromium")
+        if not pending:
+            return
+        wid = pending.get("watchdog_id")
+        if wid:
+            try:
+                GLib.source_remove(wid)
+            except Exception:
+                pass
+            pending["watchdog_id"] = None
+
+    def _on_play_to_end_chromium_watchdog(self, slideshow_epoch: int) -> bool:
+        """GLib timeout fired when a chromium play_to_end slide hasn't
+        emitted an ``ended`` event within the watchdog window. Advances
+        the slideshow so we never get stuck on a broken video. Returns
+        False (one-shot).
+        """
+        ss = self._slideshow
+        if not ss or ss.get("epoch") != slideshow_epoch:
+            return False
+        pending = ss.get("pending_play_to_end_chromium")
+        if not pending:
+            return False
+        logger.warning(
+            "chromium play_to_end watchdog fired for slide %d (%s) — advancing",
+            pending["slide_index"], pending["slide_name"],
+        )
+        pending["watchdog_id"] = None
+        ss["pending_play_to_end_chromium"] = None
+        self._play_next_slide()
+        return False
 
     def _is_showing_splash(self) -> bool:
         """True iff the current renderer state is the splash file."""
         splash = self._find_splash()
         if not splash or self._current_path != splash:
             return False
-        if not (self._mpv_alive() or self._pipeline_alive()):
+        if self._use_chromium_backend:
+            renderer_ok = self._chromium_alive()
+        else:
+            renderer_ok = self._mpv_alive() or self._pipeline_alive()
+        if not renderer_ok:
             return False
         # mtime invariant: if the splash file was replaced under us we
         # must rebuild so the new artwork is rendered.
@@ -2741,6 +3163,8 @@ class AgoraPlayer:
                     return False
             except OSError:
                 return False
+            if self._use_chromium_backend:
+                return self._chromium_alive()
             return self._mpv_alive() or self._pipeline_alive()
         return False
 
@@ -2865,6 +3289,68 @@ class AgoraPlayer:
             self._health_retries = 0
             is_video = path.suffix.lower() == ".mp4"
             self._loops_completed = 0
+
+            # Chromium backend (demo): route image/video through the shell.
+            # Streams stay on mpv; webpage assets fall back to the sway
+            # path (handled by an earlier branch in this function).
+            if self._use_chromium_backend and self._chromium_player:
+                self._teardown()
+                # Clear any stale armed scheduled-pending so a late event
+                # from a previously-armed asset can't fire _show_splash
+                # after we've moved on.
+                self._chromium_scheduled_pending = None
+                self._current_path = path
+                try:
+                    self._current_mtime = path.stat().st_mtime
+                except OSError:
+                    self._current_mtime = None
+                if is_video:
+                    # Finite-loop is owned by player.js: we hand it
+                    # loop_count and the shell counts down, replays
+                    # in-place, then emits a terminal "ended" we use
+                    # to flip to splash.
+                    finite_loop_count = (
+                        int(desired.loop_count)
+                        if desired.loop_count is not None and desired.loop_count > 0
+                        else None
+                    )
+                    self._chromium_player.show_video(
+                        path,
+                        loop=bool(desired.loop) and finite_loop_count is None,
+                        muted=False,
+                        loop_count=finite_loop_count,
+                    )
+                    if finite_loop_count is not None:
+                        asset_url = self._chromium_player.asset_url(path)
+                        if asset_url is not None:
+                            self._chromium_scheduled_pending = {
+                                "asset_url": asset_url,
+                                "asset_name": desired.asset,
+                                "target_count": finite_loop_count,
+                                "armed_at": datetime.now(timezone.utc),
+                            }
+                            logger.info(
+                                "Chromium scheduled finite-loop armed: %s "
+                                "loop_count=%d asset_url=%s",
+                                desired.asset, finite_loop_count, asset_url,
+                            )
+                        else:
+                            logger.warning(
+                                "Chromium scheduled %s: asset not under "
+                                "assets_dir — loop_count semantics will "
+                                "fire-and-forget (no splash on completion)",
+                                desired.asset,
+                            )
+                else:
+                    self._chromium_player.show_image(path)
+                self._update_current(
+                    mode=PlaybackMode.PLAY,
+                    asset=desired.asset,
+                    started_at=datetime.now(timezone.utc),
+                )
+                if self._chromium_alive():
+                    self._applied_desired = desired.model_copy(deep=True)
+                return
 
             # Dispatch to mpv on Pi 4/5 (video and images), GStreamer on Zero 2 W
             if self._player_backend == "mpv":
@@ -3150,6 +3636,19 @@ class AgoraPlayer:
         # reconnects, so it's safe to run before the first mpv is spawned.
         self._start_mpv_event_listener()
 
+        # Chromium player demo: bring up shell server + kiosk early so
+        # the first apply_desired can hand off image/video without
+        # falling back to mpv. The Coordinator handles sway + per-slot
+        # chromium kiosks; slot A is always activated at start(). For
+        # back-compat with the (large) existing call surface that
+        # references ``self._chromium_player``, we alias it to slot A's
+        # ChromiumPlayer after start.
+        if self._coordinator:
+            self._coordinator.start()
+            slot_a = self._coordinator.slots.get("A")
+            if slot_a is not None:
+                self._chromium_player = slot_a.chromium_player
+
         # Apply initial state (may show splash, which can take seconds)
         self.apply_desired()
 
@@ -3166,12 +3665,21 @@ class AgoraPlayer:
         # display_connected in current.json stays fresh during splash/idle.
         GLib.timeout_add_seconds(10, self._probe_display_tick)
 
+        # Periodic slot-B reconciliation: cms_client persists bind/unbind
+        # decisions to devices.json; we read that on a tick and bring
+        # slot B up/down to match. Cheap (one stat + maybe one read).
+        if self._coordinator:
+            GLib.timeout_add_seconds(5, self._reconcile_slots_tick)
+
         # Signal handlers for clean shutdown
         def on_shutdown(signum, frame):
             logger.info("Received signal %d, shutting down", signum)
             self._running = False
             self._stop_mpv_event_listener()
             self._teardown()
+            if self._coordinator:
+                self._coordinator.stop()
+                self._chromium_player = None
             self.loop.quit()
 
         signal.signal(signal.SIGTERM, on_shutdown)
@@ -3184,4 +3692,7 @@ class AgoraPlayer:
         finally:
             self._stop_mpv_event_listener()
             self._teardown()
+            if self._coordinator:
+                self._coordinator.stop()
+                self._chromium_player = None
             logger.info("Agora Player stopped")
