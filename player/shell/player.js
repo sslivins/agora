@@ -93,6 +93,30 @@
       v.addEventListener("error", () => {
         send({ event: "error", asset: cmd.url, msg: "video load failed" });
       });
+      // Wall-clock anchored seek. When the slideshow engine restarts
+      // mid-cycle it tells the shell how far into the video to start
+      // (so a slideshow stays in sync across player restarts instead
+      // of replaying every video from t=0). Must wait for
+      // ``loadedmetadata`` -- HTMLMediaElement.currentTime can't be
+      // assigned before duration is known.
+      const startOffsetMs = Number.isFinite(cmd.start_offset_ms)
+        ? Math.max(0, cmd.start_offset_ms) : 0;
+      if (startOffsetMs > 0) {
+        v.addEventListener("loadedmetadata", () => {
+          try {
+            const dur = v.duration;
+            const target = startOffsetMs / 1000;
+            // Clamp into [0, dur). If dur is unknown (Infinity for live
+            // streams) just trust the request. Leaving a small epsilon
+            // below dur so the browser doesn't immediately fire ended.
+            if (Number.isFinite(dur) && dur > 0) {
+              v.currentTime = Math.min(target, Math.max(0, dur - 0.05));
+            } else {
+              v.currentTime = target;
+            }
+          } catch (_) { /* ignore -- play from start */ }
+        }, { once: true });
+      }
       return v;
     }
     // Default: image (show_image, show_splash)
