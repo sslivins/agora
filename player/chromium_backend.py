@@ -280,6 +280,7 @@ class ChromiumPlayer:
         transition: str = "cut",
         duration_ms: int = DEFAULT_TRANSITION_MS,
         loop_count: Optional[int] = None,
+        start_offset_ms: int = 0,
     ) -> None:
         url = self._asset_url(path)
         if url is None:
@@ -301,6 +302,14 @@ class ChromiumPlayer:
         # looping — otherwise the protocol stays backward-compatible.
         if loop_count is not None and loop_count > 0:
             payload["loop_count"] = int(loop_count)
+        # start_offset_ms drives wall-clock anchored seek-on-resume in
+        # the shell: the slideshow engine computes how far into the
+        # current video slide we should be (based on manifest
+        # ``started_at`` + per-slide durations) and the shell sets
+        # ``v.currentTime`` after loadedmetadata. Omit when zero so the
+        # protocol stays backward-compatible with older shell builds.
+        if start_offset_ms and start_offset_ms > 0:
+            payload["start_offset_ms"] = int(start_offset_ms)
         self._enqueue(payload)
 
     def show_splash(self, path: Path) -> None:
