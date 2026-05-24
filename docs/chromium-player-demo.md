@@ -1,26 +1,28 @@
-# Chromium Player Backend — Demo
+# Chromium Player Backend
 
-Status: **experimental demo, branch `feat/chromium-player-demo`** — not for production, not for merge.
+Status: **default backend** for image, video, splash, and slideshow playback on production Pis.
 
 ## What this is
 
-A second playback renderer for the agora player. Instead of driving mpv (video)
+The primary playback renderer for the agora player. Instead of driving mpv (video)
 and GStreamer (images/splash) directly, the player runs an in-process FastAPI
 server, launches **one** chromium-in-sway kiosk pointed at it, and drives
 playback by sending JSON commands over a WebSocket to a small SPA ("the shell").
 
-Goal: prototype richer still-image transitions (crossfade today, Ken Burns / wipe
-/ slide / etc. trivially next) without re-spawning a renderer every slide.
+Goal: a single persistent renderer that supports richer transitions
+(cut/fade/fade_black/dissolve/push/wipe/zoom today, more later) without
+re-spawning a process every slide.
 
-Default behaviour is unchanged. The chromium backend only activates when the
-environment variable `AGORA_PLAYER_BACKEND=chromium` is set on the
-`agora-player` service.
+The chromium backend is enabled by default.  Set the environment variable
+`AGORA_PLAYER_BACKEND=mpv` on the `agora-player` service to fall back to
+the legacy mpv / gstreamer code paths (kept around for board bring-up and
+as a safety net).
 
 ## Architecture
 
 ```
 agora-player (Python process)
-├── existing supervisor + mpv/gstreamer code paths (unchanged, still the default)
+├── legacy mpv/gstreamer code paths (opt-in via AGORA_PLAYER_BACKEND=mpv)
 └── ChromiumPlayer (player/chromium_backend.py)
     ├── uvicorn thread serving:
     │     GET  /                 →  player/shell/index.html
@@ -89,31 +91,25 @@ source of truth for transition selection. New named transitions are
   no layer swap) and emits a terminal `ended` that the daemon converts
   to a splash transition.
 
-## Enabling on a Pi 5
+## Opting back into mpv
 
-1. Push the branch's player files onto the device (or build a debian package
-   from the branch).
-2. Add a systemd drop-in:
+The chromium backend is the default on new images.  If you need to fall
+back to the legacy mpv / gstreamer path on a specific device (e.g. for
+board bring-up or to triage a chromium-only regression), add a systemd
+drop-in:
 
    ```bash
    sudo mkdir -p /etc/systemd/system/agora-player.service.d/
-   sudo tee /etc/systemd/system/agora-player.service.d/chromium.conf <<'EOF'
+   sudo tee /etc/systemd/system/agora-player.service.d/mpv.conf <<'EOF'
    [Service]
-   Environment=AGORA_PLAYER_BACKEND=chromium
+   Environment=AGORA_PLAYER_BACKEND=mpv
    EOF
    sudo systemctl daemon-reload
    sudo systemctl restart agora-player
    ```
 
-3. Watch logs: `journalctl -u agora-player -f`. On startup you should see
-   `chromium player backend enabled (port=8780)` and then chromium's stderr.
-4. Confirm the kiosk window appears with the black shell background.
-5. From the CMS, push an image asset and a video asset (HEVC if you want
-   to exercise hw decode) at a test device in this group. You should see
-   crossfade between them.
-
-To roll back: delete the drop-in and `systemctl restart agora-player`. The
-process returns to the mpv code path with no further changes.
+To return to the chromium backend, delete the drop-in and `systemctl
+restart agora-player`.
 
 ## Running the unit tests
 

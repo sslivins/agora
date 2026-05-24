@@ -67,7 +67,8 @@ class Coordinator:
     """Singleton orchestrator for sway + per-slot SlotStates.
 
     Constructed once per :class:`AgoraPlayer` instance when the
-    chromium backend is enabled (``AGORA_PLAYER_BACKEND=chromium``).
+    chromium backend is enabled (the default; opt out via
+    ``AGORA_PLAYER_BACKEND=mpv``).
     """
 
     def __init__(

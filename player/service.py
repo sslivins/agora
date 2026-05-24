@@ -294,8 +294,8 @@ class AgoraPlayer:
     _applied_desired: Optional[DesiredState] = None
     _current_url: Optional[str] = None
     _slideshow_manifest_digest: Optional[str] = None
-    # Chromium-shell demo backend. Off by default; instances opted in
-    # via AGORA_PLAYER_BACKEND=chromium populate _chromium_player.
+    # Chromium-shell backend (default).  Opt-out via
+    # AGORA_PLAYER_BACKEND=mpv to fall back to the legacy mpv path.
     # Declared at class scope so tests that bypass __init__ see safe
     # defaults and the existing mpv code paths remain untouched.
     _use_chromium_backend: bool = False
@@ -348,15 +348,18 @@ class AgoraPlayer:
         self._display_probe = get_display_probe()
         self._player_backend = player_backend()
 
-        # ── Chromium player demo (opt-in, branch-only feature) ──
-        # When AGORA_PLAYER_BACKEND=chromium is set, image / video / splash
-        # / slideshow playback is routed through a persistent chromium
-        # kiosk + shell SPA instead of mpv. Streams and webpage assets
-        # keep their existing renderers (mpv-stream, sway+chromium for
-        # webpage assets) because the demo doesn't replace those. See
-        # player/shell/ and docs/chromium-player-demo.md.
+        # ── Chromium player (default backend) ──
+        # The chromium kiosk + shell SPA is the default playback path for
+        # images, videos, splash, and slideshows.  Set
+        # ``AGORA_PLAYER_BACKEND=mpv`` to fall back to the legacy mpv /
+        # gstreamer pipeline (kept around for board bring-up and as a
+        # safety net while the chromium backend stabilises).  Streams and
+        # webpage assets keep their existing renderers (mpv-stream,
+        # sway+chromium for webpage assets) because the chromium backend
+        # doesn't replace those.  See player/shell/ and
+        # docs/chromium-player-demo.md.
         self._use_chromium_backend = (
-            os.environ.get("AGORA_PLAYER_BACKEND") == "chromium"
+            os.environ.get("AGORA_PLAYER_BACKEND", "chromium").lower() != "mpv"
         )
         self._chromium_player: Optional[ChromiumPlayer] = None
         self._coordinator: Optional["Coordinator"] = None
