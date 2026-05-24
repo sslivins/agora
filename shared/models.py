@@ -21,6 +21,16 @@ class DesiredState(BaseModel):
     expected_checksum: Optional[str] = None  # SHA-256 from CMS schedule
     url: Optional[str] = None  # Webpage URL for Cage+Chromium rendering
     asset_type: Optional[str] = None  # "video", "image", "webpage", "stream"
+    # Wall-clock anchor for slideshow playback (agora#226). When set, the
+    # player uses ``(now - schedule_anchor_at) mod cycle_duration`` to
+    # decide which slide should be on screen, instead of starting from
+    # slide 0 on every fresh dispatch. cms_client populates this from
+    # the active schedule's ``start_time`` (in the schedule's timezone,
+    # normalized to UTC) so the anchor is the same on every device
+    # watching the same schedule -- giving free multi-display sync. Old
+    # players ignore the field; new players fall back to the manifest's
+    # ``started_at`` (and then to legacy timer-chain) when unset.
+    schedule_anchor_at: Optional[datetime] = None
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
