@@ -1113,3 +1113,51 @@ class TestAnchoredPlayback:
         # Still on slide 0; no extra loadfile call.
         assert ss["anchored_current_idx"] == 0
         player._loadfile_mpv.assert_not_called()
+
+    def test_chromium_anchored_video_passes_start_offset_ms(self, mpv_player):
+        """When the chromium backend is active and we anchored-dispatch
+        a video slide partway through its window, ``show_video`` is
+        called with ``start_offset_ms = duration_ms - remaining_ms``
+        so the browser seeks to the in-progress position instead of
+        replaying from t=0."""
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        # 60s slide, anchored 25s ago -> offset == 25_000 ms.
+        from datetime import datetime, timedelta, timezone
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=25)
+        self._write_anchored(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video", "duration_ms": 60_000,
+             "play_to_end": False},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/v.mp4"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_video.assert_called_once()
+        kwargs = player._chromium_player.show_video.call_args.kwargs
+        # Offset must be within one second of 25_000 ms (test scheduling
+        # jitter -- the wall clock advances between _write_anchored
+        # and _start_slideshow).
+        assert 24_000 <= kwargs["start_offset_ms"] <= 26_000
+
+    def test_chromium_anchored_image_does_not_pass_start_offset(self, mpv_player):
+        """Image slides ignore the seek concept -- offset should be 0."""
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        from datetime import datetime, timedelta, timezone
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=25)
+        self._write_anchored(player, "Show", [
+            {"name": "a.png", "asset_type": "image", "duration_ms": 60_000,
+             "play_to_end": False},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/a.png"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_image.assert_called_once()
+        # show_video must not have been used for an image slide.
+        player._chromium_player.show_video.assert_not_called()
