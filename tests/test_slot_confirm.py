@@ -743,6 +743,86 @@ class TestSlotConfirm:
         assert status.ok is False
         assert status.next_action == "strike"
 
+    def test_not_yet_aged_within_deferral_window_still_defers(self) -> None:
+        # Bookend to test_not_yet_aged_defers_aggregator: even with the
+        # cutover logic in place, a fresh boot (well under the deferral
+        # cap) must still defer, never strike. The cutover only kicks in
+        # AFTER the system has been up longer than max_deferral_seconds.
+        status = slot_confirm(
+            slot_state_fn=lambda: FakeStatus(running_slot=2, default_slot=1, tentative=True),
+            agora_service_fn=_services_not_yet_aged_check,
+            framebuffer_fn=lambda: _ok_check("framebuffer"),
+            data_writable_fn=lambda: _ok_check("data_writable"),
+            wps_connected_fn=lambda: _ok_check("wps_connected"),
+            boot_age_fn=lambda: 90.0,  # 90s since boot, well under 30 min
+            max_deferral_seconds=30 * 60,
+        )
+        assert status.ok is False
+        assert status.next_action == "deferred"
+
+    def test_not_yet_aged_past_deferral_window_strikes(self) -> None:
+        # Catastrophic-failure defense: if the gate has been deferring
+        # so long that the system has been up longer than
+        # max_deferral_seconds and the agora-* services are STILL not
+        # aged, the slot is genuinely broken (e.g. the player is
+        # crash-looping and never accumulates the contiguous Active
+        # time the aging check requires). We must flip to "strike" so
+        # the strike counter advances and the device rolls back --
+        # otherwise the os-updater sits in tryboot_running forever and
+        # silently rejects every future upgrade dispatch.
+        status = slot_confirm(
+            slot_state_fn=lambda: FakeStatus(running_slot=2, default_slot=1, tentative=True),
+            agora_service_fn=_services_not_yet_aged_check,
+            framebuffer_fn=lambda: _ok_check("framebuffer"),
+            data_writable_fn=lambda: _ok_check("data_writable"),
+            wps_connected_fn=lambda: _ok_check("wps_connected"),
+            boot_age_fn=lambda: 45 * 60.0,  # 45 min since boot
+            max_deferral_seconds=30 * 60,  # cap at 30 min
+        )
+        assert status.ok is False
+        assert status.next_action == "strike"
+        assert status.running_slot == 2
+        assert status.tentative is True
+
+    def test_boot_age_fn_failure_is_lenient(self) -> None:
+        # If the boot_age_fn raises, we treat boot age as 0 (fresh) so
+        # we stay in the deferral branch rather than spuriously
+        # striking. The whole point of the cutover is to defend against
+        # *forever* deferral; one transient deferral when /proc/uptime
+        # is briefly unreadable is fine.
+        def bad_boot_age() -> float:
+            raise OSError("nope")
+
+        status = slot_confirm(
+            slot_state_fn=lambda: FakeStatus(running_slot=2, default_slot=1, tentative=True),
+            agora_service_fn=_services_not_yet_aged_check,
+            framebuffer_fn=lambda: _ok_check("framebuffer"),
+            data_writable_fn=lambda: _ok_check("data_writable"),
+            wps_connected_fn=lambda: _ok_check("wps_connected"),
+            boot_age_fn=bad_boot_age,
+            max_deferral_seconds=30 * 60,
+        )
+        assert status.next_action == "deferred"
+
+    def test_default_boot_age_reads_proc_uptime(self, tmp_path: Any) -> None:
+        # _default_boot_age reads /proc/uptime's first whitespace field
+        # as seconds-since-boot. Verify against a synthetic file so we
+        # don't depend on the host's real /proc/uptime.
+        fake_uptime = tmp_path / "uptime"
+        fake_uptime.write_text("123.45 6789.01\n")
+        assert scc._default_boot_age(str(fake_uptime)) == pytest.approx(123.45)
+
+    def test_default_boot_age_missing_file_returns_zero(self, tmp_path: Any) -> None:
+        # On any I/O or parse failure, _default_boot_age returns 0.0 so
+        # the gate defers rather than strikes. See its docstring.
+        missing = tmp_path / "does-not-exist"
+        assert scc._default_boot_age(str(missing)) == 0.0
+
+    def test_default_boot_age_malformed_returns_zero(self, tmp_path: Any) -> None:
+        bad = tmp_path / "uptime"
+        bad.write_text("garbage not-a-number\n")
+        assert scc._default_boot_age(str(bad)) == 0.0
+
     def test_runs_all_4_checks_in_order(self) -> None:
         order: list[str] = []
 

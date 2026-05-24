@@ -45,9 +45,11 @@ CLI:
 
 from slot_confirm.core import (
     DEFAULT_AGORA_SERVICES,
+    DEFAULT_BOOT_AGE_PATH,
     DEFAULT_CMS_STATUS_PATH,
     DEFAULT_DATA_PROBE_DIR,
     DEFAULT_FRAMEBUFFER_DEVICE,
+    DEFAULT_MAX_DEFERRAL_SECONDS,
     DEFAULT_MIN_ACTIVE_SECONDS,
     CheckResult,
     ConfirmStatus,
@@ -62,9 +64,11 @@ from slot_confirm.core import (
 __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_AGORA_SERVICES",
+    "DEFAULT_BOOT_AGE_PATH",
     "DEFAULT_CMS_STATUS_PATH",
     "DEFAULT_DATA_PROBE_DIR",
     "DEFAULT_FRAMEBUFFER_DEVICE",
+    "DEFAULT_MAX_DEFERRAL_SECONDS",
     "DEFAULT_MIN_ACTIVE_SECONDS",
     "CheckResult",
     "ConfirmStatus",
