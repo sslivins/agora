@@ -1161,3 +1161,63 @@ class TestAnchoredPlayback:
         player._chromium_player.show_image.assert_called_once()
         # show_video must not have been used for an image slide.
         player._chromium_player.show_video.assert_not_called()
+
+    def test_chromium_play_to_end_overrun_keeps_kiosk_alive(self, mpv_player):
+        """Regression: play_to_end overrun on the chromium backend used
+        to call ``ChromiumPlayer.stop()`` (full kiosk + shell server
+        teardown), which orphaned every subsequent ``show_*`` command
+        and left the device frozen on the runaway frame.  The overrun
+        path must call ``stop_playback()`` instead -- which clears the
+        layer via ``{"cmd":"stop"}`` but leaves the kiosk + WS alive
+        for the next slide.
+        """
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        (player.assets_dir / "images" / "n.png").touch()
+
+        from datetime import datetime, timedelta, timezone
+        # Anchor far in the past so the resync tick will compute a
+        # different target slide and treat the still-armed pending
+        # video as an overrun.
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self._write_anchored(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video", "duration_ms": 10_000,
+             "play_to_end": True},
+            {"name": "n.png", "asset_type": "image", "duration_ms": 10_000,
+             "play_to_end": False},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.side_effect = (
+            lambda p: "/assets/" + Path(p).name
+        )
+
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 99
+            player._start_slideshow("Show", None)
+            ss = player._slideshow
+            # Force a clearly-overrun ``armed_at`` so the tick fires the
+            # overrun branch deterministically (the slideshow may have
+            # landed past slide 0 already; if so, manually re-arm).
+            ss["pending_play_to_end_chromium"] = {
+                "slide_index": 0,
+                "slide_name": "v.mp4",
+                "armed_at": datetime.now(timezone.utc) - timedelta(minutes=5),
+                "asset_url": "/assets/v.mp4",
+            }
+            # Reset the call log -- only the overrun-triggered calls
+            # should appear.
+            player._chromium_player.reset_mock()
+            player._on_anchored_resync_tick(ss["epoch"])
+
+        # The fix: stop_playback() (clears layers via WS, kiosk stays
+        # alive); stop() (full teardown) must NOT be called.
+        assert player._chromium_player.stop_playback.called, (
+            "overrun branch must call stop_playback() to clear the "
+            "current video without tearing down the kiosk"
+        )
+        assert not player._chromium_player.stop.called, (
+            "overrun branch must NOT call stop() -- that kills the "
+            "kiosk + shell server and orphans every subsequent show_*"
+        )
