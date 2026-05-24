@@ -1806,7 +1806,40 @@ class CMSClient:
 
         # Fast path: slideshow + every slide already cached with matching checksums.
         if self._has_complete_slideshow(asset_name, expected_checksum, slides):
-            logger.info("Slideshow already cached and complete: %s", asset_name)
+            # Even on the fast path we may need to rewrite the manifest:
+            # the slide list is identical (so ``checksum`` matches and the
+            # files are all present) but the schema-1.1 envelope fields
+            # (``manifest_schema_version``, ``started_at``,
+            # ``cycle_duration_ms``) can change without changing the slide
+            # checksum. A device that cached the slideshow before the CMS
+            # started emitting 1.1 would otherwise stay stuck on a 1.0
+            # manifest forever, defeating wall-clock anchored playback.
+            existing = self._read_slideshow_manifest(asset_name) or {}
+            envelope_changed = (
+                existing.get("manifest_schema_version") != manifest_schema_version
+                or existing.get("started_at") != started_at
+                or existing.get("cycle_duration_ms") != cycle_duration_ms
+            )
+            if envelope_changed:
+                logger.info(
+                    "Slideshow %s: envelope changed "
+                    "(schema %s->%s, started_at %s->%s) -- rewriting manifest",
+                    asset_name,
+                    existing.get("manifest_schema_version"),
+                    manifest_schema_version,
+                    existing.get("started_at"),
+                    started_at,
+                )
+                self._write_slideshow_manifest(
+                    asset_name=asset_name,
+                    expected_checksum=expected_checksum,
+                    manifest_schema_version=manifest_schema_version,
+                    cycle_duration_ms=cycle_duration_ms,
+                    started_at=started_at,
+                    slides=slides,
+                )
+            else:
+                logger.info("Slideshow already cached and complete: %s", asset_name)
             await self._touch_slideshow_slides(asset_name, slides)
             await ws.send(json.dumps({
                 "type": "asset_ack",
@@ -1882,37 +1915,14 @@ class CMSClient:
 
         # All slides verified. Write the slideshow manifest with per-slide
         # checksums so the completeness check has all the data it needs.
-        manifest_payload = {
-            "name": asset_name,
-            "checksum": expected_checksum,
-            "manifest_schema_version": manifest_schema_version,
-            "cycle_duration_ms": cycle_duration_ms,
-            "started_at": started_at,
-            "slides": [
-                {
-                    "name": s["asset_name"],
-                    "asset_type": s.get("asset_type", ""),
-                    "checksum": s.get("checksum", ""),
-                    "size_bytes": s.get("size_bytes", 0),
-                    "duration_ms": s.get("duration_ms", 0),
-                    "play_to_end": bool(s.get("play_to_end", False)),
-                    # Per-slide transition (Phase 1a of agora#226).  Persisted
-                    # verbatim so the chromium-player branch can read it back;
-                    # the mpv player ignores anything other than ``cut``.
-                    # Defaults match the wire schema defaults.
-                    "transition": s.get("transition", "cut"),
-                    "transition_ms": int(s.get("transition_ms", 600)),
-                }
-                for s in slides
-            ],
-        }
-        self.settings.slideshows_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path = self.settings.slideshows_dir / f"{asset_name}.json"
-        atomic_write(manifest_path, json.dumps(manifest_payload, indent=2))
-        manifest_size = manifest_path.stat().st_size
-
-        rel_path = str(manifest_path.relative_to(self.settings.assets_dir))
-        self.asset_manager.register(asset_name, rel_path, manifest_size, expected_checksum)
+        self._write_slideshow_manifest(
+            asset_name=asset_name,
+            expected_checksum=expected_checksum,
+            manifest_schema_version=manifest_schema_version,
+            cycle_duration_ms=cycle_duration_ms,
+            started_at=started_at,
+            slides=slides,
+        )
         await self._touch_slideshow_slides(asset_name, slides)
 
         # Re-trigger desired state if player is waiting for this slideshow
@@ -1933,6 +1943,53 @@ class CMSClient:
             "asset_name": asset_name,
             "checksum": expected_checksum,
         }))
+
+    def _write_slideshow_manifest(
+        self,
+        *,
+        asset_name: str,
+        expected_checksum: str,
+        manifest_schema_version: str,
+        cycle_duration_ms: int | None,
+        started_at: str | None,
+        slides: list[dict],
+    ) -> None:
+        """Atomically (re)write a slideshow manifest under
+        ``<slideshows_dir>/<name>.json``.
+
+        Called both from the slow path (after slide downloads) and from
+        the fast path when the schema-1.1 envelope fields have changed
+        on a cached slideshow. ``slides`` is the on-the-wire descriptor
+        list (with ``asset_name`` keys), not the persisted shape.
+        """
+        manifest_payload = {
+            "name": asset_name,
+            "checksum": expected_checksum,
+            "manifest_schema_version": manifest_schema_version,
+            "cycle_duration_ms": cycle_duration_ms,
+            "started_at": started_at,
+            "slides": [
+                {
+                    "name": s["asset_name"],
+                    "asset_type": s.get("asset_type", ""),
+                    "checksum": s.get("checksum", ""),
+                    "size_bytes": s.get("size_bytes", 0),
+                    "duration_ms": s.get("duration_ms", 0),
+                    "play_to_end": bool(s.get("play_to_end", False)),
+                    "transition": s.get("transition", "cut"),
+                    "transition_ms": int(s.get("transition_ms", 600)),
+                }
+                for s in slides
+            ],
+        }
+        self.settings.slideshows_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = self.settings.slideshows_dir / f"{asset_name}.json"
+        atomic_write(manifest_path, json.dumps(manifest_payload, indent=2))
+        manifest_size = manifest_path.stat().st_size
+        rel_path = str(manifest_path.relative_to(self.settings.assets_dir))
+        self.asset_manager.register(
+            asset_name, rel_path, manifest_size, expected_checksum,
+        )
 
     async def _touch_slideshow_slides(self, _asset_name: str, slides: list[dict]) -> None:
         """Bump LRU timestamps for every slide source in a slideshow."""

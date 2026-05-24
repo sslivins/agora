@@ -405,6 +405,144 @@ class TestSlideshowFetch:
         assert any(m["type"] == "asset_ack" and m["checksum"] == "stable-hash" for m in sent)
 
     @pytest.mark.asyncio
+    async def test_fast_path_rewrites_manifest_when_envelope_changes(self, cms_client):
+        """Regression for the wall-clock-anchor staleness bug: a device
+        that cached a slideshow under schema 1.0 (no ``started_at``)
+        and then receives a re-publish under schema 1.1 must rewrite
+        the manifest with the new envelope fields, even though the
+        slide list (and therefore the slideshow ``checksum``) hasn't
+        changed and no slide downloads are needed.
+
+        Before the fix, the fast path returned an ACK without touching
+        the manifest, leaving the device stuck on a 1.0 manifest
+        forever -- which made the player's anchored-playback branch
+        silently fall back to a free-running timer chain.
+        """
+        b1, b2 = b"img-bytes-aaaa", b"img-bytes-bbbb"
+        slide1 = _make_slide("img1.jpg", b1, asset_type="image", duration_ms=60000)
+        slide2 = _make_slide("img2.jpg", b2, asset_type="image", duration_ms=60000)
+        # Pre-seed cache for both slide sources
+        (cms_client.settings.images_dir / "img1.jpg").write_bytes(b1)
+        (cms_client.settings.images_dir / "img2.jpg").write_bytes(b2)
+        cms_client.asset_manager.register(
+            "img1.jpg", "images/img1.jpg", len(b1), _sha256(b1),
+        )
+        cms_client.asset_manager.register(
+            "img2.jpg", "images/img2.jpg", len(b2), _sha256(b2),
+        )
+        # Pre-seed a STALE schema-1.0 manifest (no envelope fields).
+        manifest_path = (
+            cms_client.settings.slideshows_dir / "MyShow.slideshow.json"
+        )
+        manifest_path.write_text(json.dumps({
+            "name": "MyShow.slideshow",
+            "checksum": "stable-hash",
+            "slides": [
+                {"name": "img1.jpg", "asset_type": "image",
+                 "checksum": _sha256(b1), "size_bytes": len(b1),
+                 "duration_ms": 60000, "play_to_end": False},
+                {"name": "img2.jpg", "asset_type": "image",
+                 "checksum": _sha256(b2), "size_bytes": len(b2),
+                 "duration_ms": 60000, "play_to_end": False},
+            ],
+        }))
+        cms_client.asset_manager.register(
+            "MyShow.slideshow", "slideshows/MyShow.slideshow.json",
+            manifest_path.stat().st_size, "stable-hash",
+        )
+        slide1["checksum"] = _sha256(b1)
+        slide2["checksum"] = _sha256(b2)
+
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "MyShow.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "stable-hash",
+            "size_bytes": 0,
+            # CMS now emits schema 1.1 envelope fields
+            "manifest_schema_version": "1.1",
+            "cycle_duration_ms": 120000,
+            "started_at": "2026-05-23T23:29:41.155Z",
+            "slides": [slide1, slide2],
+        }
+        fake_aiohttp, fake_session = _patch_aiohttp({})
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        # No slide downloads happened (fast path).
+        assert fake_session.calls == []
+        # ACK still sent.
+        sent = [json.loads(c.args[0]) for c in cms_client._ws.send.call_args_list]
+        assert any(
+            m["type"] == "asset_ack" and m["checksum"] == "stable-hash"
+            for m in sent
+        )
+        # Manifest on disk has been rewritten with the new envelope.
+        rewritten = json.loads(manifest_path.read_text())
+        assert rewritten["manifest_schema_version"] == "1.1"
+        assert rewritten["started_at"] == "2026-05-23T23:29:41.155Z"
+        assert rewritten["cycle_duration_ms"] == 120000
+
+    @pytest.mark.asyncio
+    async def test_fast_path_no_rewrite_when_envelope_unchanged(self, cms_client):
+        """When the on-disk manifest already has the correct schema-1.1
+        envelope, the fast path should NOT rewrite (avoids touching
+        atime/mtime and the asset manager for every CMS sync).
+        """
+        b1 = b"img-bytes"
+        slide1 = _make_slide("img.jpg", b1, asset_type="image", duration_ms=5000)
+        (cms_client.settings.images_dir / "img.jpg").write_bytes(b1)
+        cms_client.asset_manager.register(
+            "img.jpg", "images/img.jpg", len(b1), _sha256(b1),
+        )
+        manifest_path = (
+            cms_client.settings.slideshows_dir / "Stable.slideshow.json"
+        )
+        # Manifest already at schema 1.1 with the same envelope the CMS
+        # will send -- the fast path should treat this as a no-op
+        # (no rewrite).
+        existing_payload = {
+            "name": "Stable.slideshow",
+            "checksum": "h",
+            "manifest_schema_version": "1.1",
+            "cycle_duration_ms": 5000,
+            "started_at": "2026-05-23T23:29:41.155Z",
+            "slides": [
+                {"name": "img.jpg", "asset_type": "image",
+                 "checksum": _sha256(b1), "size_bytes": len(b1),
+                 "duration_ms": 5000, "play_to_end": False,
+                 "transition": "cut", "transition_ms": 600},
+            ],
+        }
+        manifest_path.write_text(json.dumps(existing_payload, indent=2))
+        original_bytes = manifest_path.read_bytes()
+        cms_client.asset_manager.register(
+            "Stable.slideshow", "slideshows/Stable.slideshow.json",
+            manifest_path.stat().st_size, "h",
+        )
+        slide1["checksum"] = _sha256(b1)
+
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "Stable.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "manifest_schema_version": "1.1",
+            "cycle_duration_ms": 5000,
+            "started_at": "2026-05-23T23:29:41.155Z",
+            "slides": [slide1],
+        }
+        fake_aiohttp, _ = _patch_aiohttp({})
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        # File contents identical -- no rewrite.
+        assert manifest_path.read_bytes() == original_bytes
+
+    @pytest.mark.asyncio
     async def test_partial_cache_only_fetches_missing(self, cms_client):
         b1, b2 = b"on-disk-bytes", b"need-this-bytes"
         slide1 = _make_slide("cached.mp4", b1, asset_type="video")
