@@ -6,6 +6,7 @@ trigger a pipeline rebuild — that causes a visible screen flicker.
 """
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -207,7 +208,11 @@ class TestPlayerSkipRebuild:
 
         import player.service as ps
 
-        player = ps.AgoraPlayer(base_path=str(tmp_path))
+        # These tests validate the mpv/GStreamer pipeline rebuild logic
+        # specifically, so force the legacy mpv backend regardless of
+        # the global default (chromium is now the default backend).
+        with patch.dict(os.environ, {"AGORA_PLAYER_BACKEND": "mpv"}):
+            player = ps.AgoraPlayer(base_path=str(tmp_path))
         player.state_dir.mkdir(parents=True, exist_ok=True)
         # Create asset directories and a test image
         (tmp_path / "assets" / "images").mkdir(parents=True, exist_ok=True)
