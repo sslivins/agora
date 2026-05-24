@@ -22,17 +22,33 @@ DefaultDependencies=yes
 # Restart=/RestartSec= per-unit instance, but the StartLimit* knobs that
 # bound the total restart budget belong to the unit's lifecycle. When
 # they were misplaced in [Service] (pre-#193) systemd silently ignored
-# them and emitted a warning at unit-load time. Move here to actually
-# enforce the bounded retry budget the comment in [Service] promised.
-StartLimitBurst=10
-StartLimitIntervalSec=600
+# them and emitted a warning at unit-load time.
+#
+# `StartLimitBurst=0` disables the systemd-side burst budget entirely
+# (per systemd.unit(5): "If the rate limit is set to zero, no limit is
+# applied"). We do NOT want systemd to ever stop retrying this unit on
+# its own -- if it does, agora-os-updater stays stuck in
+# `tryboot_running` forever and silently rejects every future upgrade
+# dispatch, which is catastrophic.
+#
+# The terminal cutover for "this slot is permanently bad, give up and
+# strike" is enforced inside slot_confirm itself via
+# DEFAULT_MAX_DEFERRAL_SECONDS (see core.py): once the system has been
+# up long enough that we've been deferring instead of deciding, the
+# gate flips next_action="deferred" -> "strike" so the strike counter
+# advances and the device rolls back. The systemd unit's only job is
+# to keep firing the gate until it can decide.
+StartLimitBurst=0
 
 [Service]
-# `oneshot` so the unit runs once after boot and exits; the gate's job
-# is a single decision, not a long-running daemon. Combined with
-# `Restart=on-failure` below, this gives us a bounded retry budget for
-# the one case in `--auto` where the right answer really is "try again
-# in a moment": services not yet aged (bug #209).
+# `oneshot` so the unit runs once and exits; the gate's job is a
+# single decision, not a long-running daemon. Combined with
+# `Restart=on-failure` below, this gives us an unbounded retry loop
+# for the one case in `--auto` where the right answer really is "try
+# again in a moment": services not yet aged (bug #209). The terminal
+# decision (strike a permanently broken slot) is made inside the gate
+# itself once the system has been up longer than
+# DEFAULT_MAX_DEFERRAL_SECONDS.
 Type=oneshot
 ExecStart=/usr/bin/python3 -m slot_confirm --auto
 WorkingDirectory=/opt/agora/src
@@ -48,25 +64,26 @@ Environment=AGORA_BASE=/opt/agora
 #        to do.)
 #   75 → deferred (EX_TEMPFAIL). The agora-* services are up and
 #        healthy but haven't reached the ≥5 min Active threshold yet
-#        — the normal boot race, see bug #209. NOT a strike: this is
-#        an *expected* transient that the retry budget below covers.
-#        systemd sees failure, sleeps RestartSec, retries; eventually
-#        the services age past the threshold and we exit 0 with a
-#        promote or strike, OR StartLimitBurst runs out and the unit
-#        stops with a real failure.
+#        — the normal boot race, see bug #209. NOT a strike *yet*:
+#        this is an expected transient that the retry policy below
+#        covers. systemd sees failure, sleeps RestartSec, retries
+#        forever. The gate itself flips deferred→strike once the
+#        system has been up longer than DEFAULT_MAX_DEFERRAL_SECONDS
+#        (see slot_confirm/core.py); that path returns 0 and breaks
+#        the loop.
 #   2  → error (slot_state() raised, etc.). systemd retries the same
 #        way as 75 — also a transient condition (e.g. systemctl-show
-#        RPC timeout, status file briefly missing) — until the burst
-#        budget runs out.
+#        RPC timeout, status file briefly missing).
 #
 # `--check` exits 1 on a "gate-failed" result; the unit does not run
 # --check so that branch never reaches systemd.
 #
-# Budget math: RestartSec=45s × StartLimitBurst=10 = 450s ≈ 7.5 min,
-# which covers the 5-min service-age window with margin. StartLimit*
-# live in [Unit] above; see the comment there for why.
+# Retry policy: Restart=on-failure + RestartSec=60 + no burst cap (see
+# StartLimitBurst=0 in [Unit] above). The gate is responsible for
+# deciding when to stop deferring; systemd is only responsible for
+# keeping it ticking.
 Restart=on-failure
-RestartSec=45
+RestartSec=60
 
 StandardOutput=journal
 StandardError=journal

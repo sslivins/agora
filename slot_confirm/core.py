@@ -55,6 +55,31 @@ DEFAULT_DATA_PROBE_DIR: str = "/data/agora"
 #: "disconnected" | "error", ...}``.
 DEFAULT_CMS_STATUS_PATH: str = "/opt/agora/state/cms_status.json"
 
+#: Maximum total time the gate is allowed to keep returning
+#: ``"deferred"`` before flipping over to ``"strike"`` instead.
+#:
+#: Background: post-tryboot, systemd fires this unit every
+#: ``RestartSec`` seconds (see ``agora-slot-mgr.service``) and the gate
+#: returns ``"deferred"`` while the agora-* services haven't reached the
+#: ``min_active_seconds`` bar. Without an upper bound, a slot that
+#: NEVER stabilises (e.g. the player crash-loops permanently) would
+#: defer forever, the os-updater would stay stuck in
+#: ``tryboot_running``, and CMS upgrade dispatches would be silently
+#: rejected -- the failure mode that motivated this constant.
+#:
+#: 30 minutes gives a healthy device plenty of headroom past the 5-min
+#: service-age window even when the player restarts a few times during
+#: early boot. Past that, the gate concludes "this slot is broken" and
+#: returns ``"strike"`` so the strike counter advances and the device
+#: rolls back to the previous good slot.
+DEFAULT_MAX_DEFERRAL_SECONDS: int = 30 * 60
+
+
+#: Path to the kernel-maintained system-uptime file. Used by
+#: :func:`_default_boot_age` to bound how long the gate will defer
+#: before striking.
+DEFAULT_BOOT_AGE_PATH: str = "/proc/uptime"
+
 
 # ── Types ───────────────────────────────────────────────────────────────────
 
@@ -127,6 +152,7 @@ class ConfirmStatus:
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 NowFn = Callable[[], datetime]
 MonotonicNowFn = Callable[[], float]
+BootAgeFn = Callable[[], float]
 FrameOpener = Callable[[str], Any]
 ProbeWriter = Callable[[str, bytes], None]
 StatusReader = Callable[[str], str]
@@ -165,6 +191,31 @@ def _default_monotonic_now() -> float:
     negative age and a spurious slot-confirm strike. See bug #197.
     """
     return time.monotonic()
+
+
+def _default_boot_age(path: str = DEFAULT_BOOT_AGE_PATH) -> float:
+    """Default source for "how long has this kernel been up?" in seconds.
+
+    Reads ``/proc/uptime``, whose first whitespace-separated field is
+    seconds-since-boot as a float. Used by :func:`slot_confirm` to bound
+    how long the gate may keep returning ``"deferred"`` before flipping
+    over to ``"strike"`` (see :data:`DEFAULT_MAX_DEFERRAL_SECONDS`).
+
+    On any I/O or parse failure we return ``0.0`` rather than raising:
+    "we just booted" is the lenient interpretation and keeps the gate
+    deferring (the systemd Restart loop will fire us again). The
+    catastrophic failure mode this whole code path defends against is
+    deferring *forever*; a transient read failure that leaves us
+    deferring for one more cycle is not interesting.
+    """
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            first = fh.readline().split()
+        if not first:
+            return 0.0
+        return float(first[0])
+    except (OSError, ValueError):
+        return 0.0
 
 
 def _parse_systemd_monotonic_us(raw: str) -> Optional[int]:
@@ -705,6 +756,8 @@ def slot_confirm(
     framebuffer_fn: Optional[Callable[[], CheckResult]] = None,
     data_writable_fn: Optional[Callable[[], CheckResult]] = None,
     wps_connected_fn: Optional[Callable[[], CheckResult]] = None,
+    boot_age_fn: Optional[BootAgeFn] = None,
+    max_deferral_seconds: int = DEFAULT_MAX_DEFERRAL_SECONDS,
 ) -> ConfirmStatus:
     """Run the slot-confirm 4-check gate against the current boot.
 
@@ -716,13 +769,34 @@ def slot_confirm(
          confirm; the device is already on the default slot).
     2. Tentative → run all 4 checks and aggregate.
        * Every check passed → ``next_action="promote"``.
-       * Any check failed → ``next_action="strike"``.
+       * Only failure is "services not yet aged" (bug #209) AND boot
+         age ≤ ``max_deferral_seconds`` → ``next_action="deferred"``
+         (systemd will fire us again).
+       * Only failure is "services not yet aged" AND boot age >
+         ``max_deferral_seconds`` → ``next_action="strike"``. A slot
+         that has gone this long without its services stabilising is
+         broken; advance the strike counter so the device rolls back
+         to the previous good slot instead of sitting stuck in
+         ``tryboot_running`` forever (see
+         :data:`DEFAULT_MAX_DEFERRAL_SECONDS`).
+       * Any other check failed → ``next_action="strike"``.
 
     Each ``*_fn`` parameter overrides the corresponding check; useful
     for tests and for callers that want to short-circuit one of the
     pillars (e.g. a headless test rig with no framebuffer).
+
+    Parameters
+    ----------
+    boot_age_fn
+        Returns seconds-since-boot as a float. Injection seam for tests
+        and for callers that want a different "elapsed since tryboot"
+        source. Defaults to reading ``/proc/uptime``.
+    max_deferral_seconds
+        See :data:`DEFAULT_MAX_DEFERRAL_SECONDS`. Pass a smaller value in
+        tests to exercise the cutover branch without sleeping.
     """
     slot_state_fn = slot_state_fn or _default_slot_state
+    boot_age_fn = boot_age_fn or _default_boot_age
     running, tentative, err = _safe_slot_info(slot_state_fn)
 
     if err:
@@ -773,8 +847,26 @@ def slot_confirm(
         # for a transient, expected condition. Recommend the caller
         # try again in a few seconds; the systemd unit's Restart=
         # policy does exactly that.
-        next_action = "deferred"
-        ok = False
+        #
+        # ...unless we've been deferring for too long. If the system
+        # has been up longer than `max_deferral_seconds` and we are
+        # STILL only deferring, the slot is not transiently slow --
+        # it's broken (e.g. the player is crash-looping and never
+        # accumulates the contiguous Active time the aging check
+        # requires). Flip to strike so the strike counter advances
+        # and the device rolls back. Without this cutover the
+        # os-updater stays in tryboot_running forever and silently
+        # rejects every future upgrade dispatch.
+        try:
+            boot_age = float(boot_age_fn())
+        except Exception:  # noqa: BLE001
+            boot_age = 0.0
+        if boot_age > max_deferral_seconds:
+            next_action = "strike"
+            ok = False
+        else:
+            next_action = "deferred"
+            ok = False
     else:
         next_action = "strike"
         ok = False
