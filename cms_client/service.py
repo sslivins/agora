@@ -16,6 +16,7 @@ import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import websockets
 
@@ -260,6 +261,64 @@ def _schedule_matches_now(entry: dict, now: datetime) -> bool:
             return False
 
     return True
+
+
+def _compute_schedule_anchor_for_today(
+    entry: dict,
+    local_now: datetime,
+    tz_name: str,
+) -> Optional[datetime]:
+    """Compute the wall-clock anchor for an active schedule entry.
+
+    The anchor is the wall-clock instant when the *current* occurrence
+    of the schedule began. Devices on the same schedule + timezone
+    compute the identical anchor, which is the mechanism that keeps
+    multi-display venues in sync without any per-device coordination.
+
+    Caller contract: ``entry`` must already match ``_schedule_matches_now``
+    at ``local_now`` -- this helper does NOT re-validate the date /
+    days_of_week / start_time-end_time window. It only computes the
+    anchor instant once the caller has chosen this entry as the winner.
+
+    Handles three shapes:
+
+    * Same-day schedule (start <= end on the clock face): anchor is
+      today_local at start_time.
+    * Midnight-spanning schedule (start > end) and we're in the
+      pre-midnight half: anchor is today at start_time.
+    * Midnight-spanning schedule and we're in the post-midnight tail
+      (``cur < end``): anchor is yesterday at start_time. Otherwise
+      every device's anchor would silently move forward at midnight
+      mid-cycle.
+
+    Returns ``None`` when ``start_time`` is missing, ``tz_name`` is
+    unparseable, or any other malformed-entry case -- callers should
+    treat ``None`` as "no schedule anchor available; fall back to
+    manifest started_at / legacy timer chain".
+    """
+    start_time_s = entry.get("start_time")
+    if not start_time_s:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        h, m, s = _parse_time(start_time_s)
+        tz = ZoneInfo(tz_name) if tz_name else timezone.utc
+        local_anchor = datetime(
+            local_now.year, local_now.month, local_now.day, h, m, s, tzinfo=tz,
+        )
+        # Detect post-midnight tail of a midnight-spanning window: anchor
+        # belongs to *yesterday* so elapsed-time math doesn't reset at 00:00.
+        end_time_s = entry.get("end_time") or ""
+        if end_time_s:
+            eh, em, es = _parse_time(end_time_s)
+            start_secs = h * 3600 + m * 60 + s
+            end_secs = eh * 3600 + em * 60 + es
+            cur_secs = local_now.hour * 3600 + local_now.minute * 60 + local_now.second
+            if start_secs > end_secs and cur_secs < end_secs:
+                local_anchor -= timedelta(days=1)
+        return local_anchor.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def _schedule_starts_within_hours(entry: dict, now: datetime, hours: int) -> bool:
@@ -1079,6 +1138,18 @@ class CMSClient:
             asset_type = winner.get("asset_type")
             new_schedule_id = winner.get("id")
             new_schedule_name = winner.get("name", "")
+            # Wall-clock anchor for slideshow playback (agora#226).
+            # Computed once from the winning schedule's start_time +
+            # today's date in the sync payload's timezone, normalized
+            # to UTC. Stamped on every scheduled DesiredState so the
+            # player (and softplayer) can land on the correct slide
+            # for the current cycle position without needing the CMS
+            # to emit a manifest envelope. None for entries that have
+            # no start_time (defensive); player falls back to legacy
+            # timer chain in that case.
+            schedule_anchor_at = _compute_schedule_anchor_for_today(
+                winner, local_now, tz_name,
+            )
 
             # Webpage schedule — render URL via Cage+Chromium, no file on disk
             if winner.get("asset_type") == "webpage" and winner.get("url"):
@@ -1120,7 +1191,7 @@ class CMSClient:
                 except OSError:
                     pass  # DNS resolution failed — let Chromium handle the error
 
-                state_key = ("webpage", url)
+                state_key = ("webpage", url, schedule_anchor_at.isoformat() if schedule_anchor_at else None)
                 if self._last_eval_state == state_key:
                     return
 
@@ -1132,6 +1203,7 @@ class CMSClient:
                     url=url,
                     loop=False,
                     loop_count=None,
+                    schedule_anchor_at=schedule_anchor_at,
                 )
                 write_state(self.settings.desired_state_path, desired)
                 self._last_eval_state = state_key
@@ -1190,7 +1262,7 @@ class CMSClient:
                 except OSError:
                     pass  # DNS resolution failed — let mpv handle the error
 
-                state_key = ("stream", url)
+                state_key = ("stream", url, schedule_anchor_at.isoformat() if schedule_anchor_at else None)
                 if self._last_eval_state == state_key:
                     return
 
@@ -1203,6 +1275,7 @@ class CMSClient:
                     asset_type="stream",
                     loop=False,
                     loop_count=None,
+                    schedule_anchor_at=schedule_anchor_at,
                 )
                 write_state(self.settings.desired_state_path, desired)
                 self._last_eval_state = state_key
@@ -1234,7 +1307,10 @@ class CMSClient:
                     self._last_eval_state = ("waiting", asset, checksum)
                 return
 
-            state_key = ("play", asset, checksum, loop_count, asset_type)
+            state_key = (
+                "play", asset, checksum, loop_count, asset_type,
+                schedule_anchor_at.isoformat() if schedule_anchor_at else None,
+            )
             if self._last_eval_state == state_key:
                 return
 
@@ -1248,6 +1324,7 @@ class CMSClient:
                 loop=True,
                 loop_count=loop_count,
                 expected_checksum=checksum,
+                schedule_anchor_at=schedule_anchor_at,
             )
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(asset)

@@ -527,17 +527,29 @@ class AgoraPlayer:
                 digest[:8],
             )
             self._forward_schema_logged.add(digest)
-        # Wall-clock anchor (agora#226 Phase 2).  Only meaningful when
-        # the manifest is schema 1.1+ AND carries a parseable
-        # ``started_at`` AND the local wall clock is plausibly past it
-        # (clock-skew guard for pre-NTP boot).  If any precondition
-        # fails we fall back to the legacy relative-timer path; the
-        # anchor is rechecked each tick so a Pi whose clock syncs
-        # mid-playback transitions into anchored mode at the next tick.
-        anchor_dt = _parse_iso8601_utc(manifest.get("started_at") or "")
-        if anchor_dt is not None and _parse_schema_version(schema_version) < (1, 1):
-            # Defensive: ``started_at`` is only meaningful for 1.1+.
-            anchor_dt = None
+        # Wall-clock anchor (agora#226 Phase 2 / schedule-derived
+        # extension). Preferred source is ``current_desired.schedule_anchor_at``
+        # — computed device-side by cms_client from the winning
+        # schedule's ``start_time`` + today's date in the venue's
+        # timezone. Falling back to the manifest's ``started_at`` keeps
+        # the old wire-format and ad-hoc / default-asset paths working,
+        # since neither has a schedule context. If neither source
+        # produces a usable anchor the legacy relative-timer path runs.
+        anchor_dt = None
+        anchor_source = None
+        desired_anchor = getattr(self.current_desired, "schedule_anchor_at", None) \
+            if self.current_desired is not None else None
+        if desired_anchor is not None:
+            anchor_dt = desired_anchor
+            anchor_source = "schedule"
+        else:
+            manifest_anchor = _parse_iso8601_utc(manifest.get("started_at") or "")
+            if manifest_anchor is not None and _parse_schema_version(schema_version) < (1, 1):
+                # Defensive: ``started_at`` is only meaningful for 1.1+.
+                manifest_anchor = None
+            if manifest_anchor is not None:
+                anchor_dt = manifest_anchor
+                anchor_source = "manifest"
         # ``epoch`` is bumped each time a slideshow starts so a stale
         # play_to_end watchdog or late mpv event from a prior slideshow
         # cannot drive the new one.
@@ -575,8 +587,10 @@ class AgoraPlayer:
         self._slideshow_manifest_digest = digest
         self._loops_completed = 0
         logger.info(
-            "Slideshow start: name=%s slides=%d loop_count=%s epoch=%d digest=%s",
+            "Slideshow start: name=%s slides=%d loop_count=%s epoch=%d digest=%s anchor_source=%s anchor=%s",
             name, len(slides), loop_count, self._slideshow["epoch"], digest[:8],
+            anchor_source or "none",
+            anchor_dt.isoformat() if anchor_dt else "none",
         )
         self._play_next_slide()
 
@@ -3090,7 +3104,11 @@ class AgoraPlayer:
         if kind == "webpage":
             return a.url == b.url
         if kind == "slideshow":
-            return a.asset == b.asset and a.loop_count == b.loop_count
+            return (
+                a.asset == b.asset
+                and a.loop_count == b.loop_count
+                and getattr(a, "schedule_anchor_at", None) == getattr(b, "schedule_anchor_at", None)
+            )
         if kind == "file":
             return (
                 a.asset == b.asset

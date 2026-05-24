@@ -14,7 +14,12 @@ sys.modules.setdefault("websockets", MagicMock())
 sys.modules.setdefault("websockets.asyncio", MagicMock())
 sys.modules.setdefault("websockets.asyncio.client", MagicMock())
 
-from cms_client.service import _parse_time, _schedule_matches_now, _schedule_starts_within_hours
+from cms_client.service import (
+    _compute_schedule_anchor_for_today,
+    _parse_time,
+    _schedule_matches_now,
+    _schedule_starts_within_hours,
+)
 
 
 # ── _parse_time tests ──
@@ -266,3 +271,76 @@ class TestScheduleStartsWithinHours:
         entry = self._entry(days_of_week=None)
         now = datetime(2026, 3, 28, 10, 0)
         assert _schedule_starts_within_hours(entry, now, 24) is True
+
+
+# ── _compute_schedule_anchor_for_today tests ──
+
+
+class TestComputeScheduleAnchorForToday:
+    def test_basic_same_day(self):
+        """Anchor is today_local at start_time, normalized to UTC."""
+        entry = {"start_time": "09:00:00", "end_time": "17:00:00"}
+        # 2026-03-28 10:00 local in America/Los_Angeles (PDT, UTC-7)
+        local_now = datetime(2026, 3, 28, 10, 0, 0)
+        anchor = _compute_schedule_anchor_for_today(entry, local_now, "America/Los_Angeles")
+        assert anchor is not None
+        # 09:00 PDT == 16:00 UTC on 2026-03-28
+        assert anchor == datetime(2026, 3, 28, 16, 0, 0, tzinfo=timezone.utc)
+
+    def test_with_seconds_in_start_time(self):
+        entry = {"start_time": "05:53:42", "end_time": "06:13:02"}
+        local_now = datetime(2026, 5, 24, 6, 0, 0)
+        anchor = _compute_schedule_anchor_for_today(entry, local_now, "America/Los_Angeles")
+        assert anchor is not None
+        assert anchor.astimezone(timezone.utc) == datetime(
+            2026, 5, 24, 12, 53, 42, tzinfo=timezone.utc,
+        )
+
+    def test_midnight_spanning_pre_midnight(self):
+        """start 23:00 end 02:00, currently 23:30 — anchor today 23:00."""
+        entry = {"start_time": "23:00:00", "end_time": "02:00:00"}
+        local_now = datetime(2026, 3, 28, 23, 30, 0)
+        anchor = _compute_schedule_anchor_for_today(entry, local_now, "UTC")
+        assert anchor == datetime(2026, 3, 28, 23, 0, 0, tzinfo=timezone.utc)
+
+    def test_midnight_spanning_post_midnight(self):
+        """start 23:00 end 02:00, currently 00:30 — anchor YESTERDAY 23:00."""
+        entry = {"start_time": "23:00:00", "end_time": "02:00:00"}
+        local_now = datetime(2026, 3, 29, 0, 30, 0)
+        anchor = _compute_schedule_anchor_for_today(entry, local_now, "UTC")
+        assert anchor == datetime(2026, 3, 28, 23, 0, 0, tzinfo=timezone.utc)
+
+    def test_recurring_schedule_anchors_today_not_start_date(self):
+        """Weekly recurring: anchor is today's date, not original start_date."""
+        entry = {
+            "start_time": "09:00",
+            "end_time": "10:00",
+            "start_date": "2026-01-01",
+            "days_of_week": [1, 3, 5],
+        }
+        local_now = datetime(2026, 3, 30, 9, 30, 0)  # Monday
+        anchor = _compute_schedule_anchor_for_today(entry, local_now, "UTC")
+        assert anchor == datetime(2026, 3, 30, 9, 0, 0, tzinfo=timezone.utc)
+
+    def test_missing_start_time_returns_none(self):
+        entry = {"end_time": "10:00"}
+        local_now = datetime(2026, 3, 28, 9, 30, 0)
+        assert _compute_schedule_anchor_for_today(entry, local_now, "UTC") is None
+
+    def test_unknown_timezone_returns_none(self):
+        entry = {"start_time": "09:00", "end_time": "10:00"}
+        local_now = datetime(2026, 3, 28, 9, 30, 0)
+        assert _compute_schedule_anchor_for_today(entry, local_now, "Not/A_Real_Zone") is None
+
+    def test_empty_timezone_falls_back_to_utc(self):
+        entry = {"start_time": "09:00", "end_time": "10:00"}
+        local_now = datetime(2026, 3, 28, 9, 30, 0)
+        anchor = _compute_schedule_anchor_for_today(entry, local_now, "")
+        assert anchor == datetime(2026, 3, 28, 9, 0, 0, tzinfo=timezone.utc)
+
+    def test_missing_end_time_uses_start_only(self):
+        """No end_time means we can't detect midnight-span; anchor=today_start."""
+        entry = {"start_time": "09:00"}
+        local_now = datetime(2026, 3, 28, 9, 30, 0)
+        anchor = _compute_schedule_anchor_for_today(entry, local_now, "UTC")
+        assert anchor == datetime(2026, 3, 28, 9, 0, 0, tzinfo=timezone.utc)
