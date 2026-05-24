@@ -838,7 +838,17 @@ class AgoraPlayer:
                     if self._use_chromium_backend and self._chromium_player:
                         self._cancel_play_to_end_chromium_watchdog()
                         try:
-                            self._chromium_player.stop()
+                            # ``stop_playback`` clears the shell's video
+                            # layer via a ``{"cmd":"stop"}`` over the WS;
+                            # do NOT call ``stop()`` here -- that tears
+                            # down the kiosk + shell server entirely, and
+                            # the subsequent ``_play_next_slide`` would
+                            # then issue ``show_*`` commands into a dead
+                            # WebSocket (slideshow appears frozen on the
+                            # last frame until process restart).  Matches
+                            # the mpv branch below, which only kills the
+                            # current mpv subprocess.
+                            self._chromium_player.stop_playback()
                         except Exception:
                             logger.exception(
                                 "Slideshow %s: chromium stop raised "
