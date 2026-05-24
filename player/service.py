@@ -715,17 +715,32 @@ class AgoraPlayer:
             # advance, so the shell does not need to know about anchoring.
             slide_transition = slide.get("transition") or "cut"
             slide_transition_ms = int(slide.get("transition_ms") or 600)
+            # Anchored video seek-on-resume: when the wall clock says
+            # we're partway through this slide's window, tell the shell
+            # to seek the video to the corresponding currentTime so a
+            # restarted / late-joining player lines up with the rest of
+            # the wall (instead of replaying every video from t=0). The
+            # shell does sub-millisecond ``video.currentTime`` math and
+            # the browser snaps to the nearest decodable frame. Only
+            # meaningful for videos; images ignore the field.
+            slide_duration_ms = int(slide.get("duration_ms") or 0)
+            start_offset_ms = (
+                max(0, slide_duration_ms - remaining_ms)
+                if is_video_slide and slide_duration_ms > 0 else 0
+            )
             if play_to_end:
                 self._play_slide_to_end_chromium(
                     slide, slide_name, path, ss,
                     transition=slide_transition,
                     transition_ms=slide_transition_ms,
+                    start_offset_ms=start_offset_ms,
                 )
             elif is_video_slide:
                 self._chromium_player.show_video(
                     path, loop=True, muted=False,
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
+                    start_offset_ms=start_offset_ms,
                 )
             else:
                 self._chromium_player.show_image(
@@ -1079,6 +1094,7 @@ class AgoraPlayer:
         *,
         transition: str,
         transition_ms: int,
+        start_offset_ms: int = 0,
     ) -> None:
         """Chromium equivalent of ``_play_slide_to_end``.
 
@@ -1099,6 +1115,7 @@ class AgoraPlayer:
             self._chromium_player.show_video(
                 path, loop=True, muted=False,
                 transition=transition, duration_ms=transition_ms,
+                start_offset_ms=start_offset_ms,
             )
             duration_ms = int(slide.get("duration_ms") or 0)
             if duration_ms <= 0:
@@ -1116,6 +1133,7 @@ class AgoraPlayer:
         self._chromium_player.show_video(
             path, loop=False, muted=False,
             transition=transition, duration_ms=transition_ms,
+            start_offset_ms=start_offset_ms,
         )
 
         # Watchdog: 2× hinted duration with a 60s floor, capped at the
