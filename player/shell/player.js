@@ -6,18 +6,20 @@
  *
  * Protocol (server -> client):
  *   {"cmd":"show_image","url":"/assets/images/foo.jpg",
- *    "transition":"fade"|"cut","duration_ms":600}
+ *    "transition":"<mode>","duration_ms":600}
  *   {"cmd":"show_video","url":"/assets/videos/bar.mp4",
- *    "loop":true,"muted":false,"transition":"fade","duration_ms":600}
+ *    "loop":true,"muted":false,"transition":"<mode>","duration_ms":600}
  *   {"cmd":"show_video","url":"/assets/videos/bar.mp4",
- *    "loop":false,"loop_count":3,"muted":false,"transition":"fade",
+ *    "loop":false,"loop_count":3,"muted":false,"transition":"<mode>",
  *    "duration_ms":600}
  *   {"cmd":"show_splash","url":"/assets/splash/default.png"}
  *   {"cmd":"stop"}
  *
- * Transitions: "fade" runs the crossfade for `duration_ms`; "cut" swaps
- * instantly. Missing or unrecognized values fall back to "cut" with a
- * console.warn — the CMS is the source of truth, the shell never guesses.
+ * Transition modes (<mode> above): "cut" | "fade" | "fade_black" |
+ * "dissolve" | "push" | "wipe" | "zoom" — see swapTo() docstring for
+ * the per-mode semantics. Missing or unrecognized values fall back to
+ * "cut" with a log line; the CMS is the source of truth, the shell
+ * never guesses.
  *
  * loop_count (videos only): when > 0, the shell plays the video N times
  * in-place (no layer swap between iterations, so the loop is seamless)
@@ -131,14 +133,30 @@
   /**
    * Swap to the inactive layer with a transition.
    * Returns the new active element so caller can attach handlers if needed.
+   *
+   * Supported transitions (CMS-driven, see cms.schemas.asset.SLIDE_TRANSITIONS):
+   *
+   *   cut          Instant swap (durMs forced to 0).
+   *   fade         Crossfade (opacity-only). Default if mode is missing.
+   *   fade_black   Two-stage: outgoing fades to 0 over durMs/2, then
+   *                incoming fades up over durMs/2. Gives a brief black
+   *                pause; "scene change" feel.
+   *   dissolve     Crossfade + outgoing scales 1.00 -> 1.05 (Ken Burns).
+   *   push         Incoming slides in from the right, outgoing slides
+   *                off to the left.
+   *   wipe         Incoming reveals L->R via clip-path inset.
+   *   zoom         Incoming scales 0.9 -> 1.0 + opacity 0 -> 1.
+   *
+   * Unknown values fall back to cut.
    */
   function swapTo(cmd) {
     const next = 1 - activeIdx;
     const cur = layers[activeIdx];
     const nxt = layers[next];
 
-    // Resolve the transition. CMS-driven; default and unknown both → "cut".
-    const KNOWN_TRANSITIONS = ["fade", "cut"];
+    const KNOWN_TRANSITIONS = [
+      "cut", "fade", "fade_black", "dissolve", "push", "wipe", "zoom",
+    ];
     let mode = cmd.transition;
     if (!mode) {
       mode = "cut";
@@ -146,7 +164,15 @@
       log("unknown transition '" + mode + "', falling back to cut");
       mode = "cut";
     }
-    const durMs = mode === "fade" ? (cmd.duration_ms || 600) : 0;
+    const durMs = mode === "cut" ? 0 : (cmd.duration_ms || 600);
+
+    // Clear any per-mode classes left over from the previous transition.
+    const TX_CLASSES = [
+      "tx-fade", "tx-fade_black", "tx-dissolve", "tx-push", "tx-wipe", "tx-zoom",
+      "tx-incoming", "tx-outgoing",
+    ];
+    [cur, nxt].forEach((l) => TX_CLASSES.forEach((c) => l.classList.remove(c)));
+
     nxt.style.setProperty("--transition-ms", durMs + "ms");
     cur.style.setProperty("--transition-ms", durMs + "ms");
     nxt.classList.toggle("no-transition", durMs === 0);
@@ -157,13 +183,41 @@
     const el = buildElement(cmd);
     nxt.appendChild(el);
 
-    // Force a layout flush so the transition runs.
-    // eslint-disable-next-line no-unused-expressions
-    nxt.offsetHeight;
+    if (mode === "fade_black" && durMs > 0) {
+      // Two-stage sequenced fade through the black stage background.
+      // Stage 1: outgoing fades to 0 over durMs/2 (incoming stays at 0).
+      // Stage 2: incoming fades to 1 over durMs/2.
+      const half = Math.max(1, Math.floor(durMs / 2));
+      cur.style.setProperty("--transition-ms", half + "ms");
+      nxt.style.setProperty("--transition-ms", half + "ms");
+      // Don't promote the incoming layer yet — first phase is the
+      // outgoing fade-out only.
+      cur.classList.remove("active");
+      // After stage 1, promote the incoming layer (which is still at
+      // opacity 0) to fade it up.
+      setTimeout(() => {
+        nxt.classList.add("active");
+      }, half);
+    } else {
+      // Single-stage transitions: tag both layers with the mode class
+      // (so per-mode CSS rules apply) and flip .active in a layout
+      // flush so the browser sees both states and animates between.
+      if (mode !== "cut" && mode !== "fade") {
+        const txClass = "tx-" + mode;
+        cur.classList.add(txClass);
+        nxt.classList.add(txClass);
+        cur.classList.add("tx-outgoing");
+        nxt.classList.add("tx-incoming");
+      }
 
-    // Promote the new layer.
-    nxt.classList.add("active");
-    cur.classList.remove("active");
+      // Force a layout flush so the transition runs.
+      // eslint-disable-next-line no-unused-expressions
+      nxt.offsetHeight;
+
+      // Promote the new layer.
+      nxt.classList.add("active");
+      cur.classList.remove("active");
+    }
     activeIdx = next;
 
     // After the transition, tear down the now-hidden layer to free memory
@@ -180,6 +234,9 @@
           }
           cur.removeChild(child);
         }
+        // Strip mode classes from the now-hidden layer so the next
+        // transition starts from a clean slate.
+        TX_CLASSES.forEach((c) => cur.classList.remove(c));
       }
     }, cleanupDelay);
 

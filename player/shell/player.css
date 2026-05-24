@@ -19,15 +19,26 @@ html, body {
 /*
  * Two stacked layers. The active one is opaque; the inactive one stays
  * fully transparent so transitioning into it is a clean fade-in.
+ *
+ * The ``transition`` property covers every animatable hand-off we use:
+ * opacity for fade / fade_black, transform for push / dissolve / zoom,
+ * clip-path for wipe. Per-mode classes below (``tx-*``) override the
+ * initial / target state on the incoming layer; the ``transition``
+ * declaration here is what actually drives the animation.
  */
 .layer {
   position: absolute;
   inset: 0;
   opacity: 0;
-  transition: opacity var(--transition-ms, 600ms) ease-in-out;
+  transition:
+    opacity var(--transition-ms, 600ms) ease-in-out,
+    transform var(--transition-ms, 600ms) ease-in-out,
+    clip-path var(--transition-ms, 600ms) ease-in-out;
   display: flex;
   align-items: center;
   justify-content: center;
+  /* So translateX / scale animations stay inside the viewport box. */
+  will-change: opacity, transform, clip-path;
 }
 
 .layer.active {
@@ -48,3 +59,60 @@ html, body {
 .layer.no-transition {
   transition: none !important;
 }
+
+/* ── Per-mode transition rules ──
+ *
+ * For each mode we set: the OUTGOING layer's exit state (when ``.active``
+ * is removed) and the INCOMING layer's entry state (the inactive
+ * snapshot before ``.active`` is added). The swap is driven by the JS
+ * toggling ``.active`` after a layout flush; CSS does the rest.
+ */
+
+/* fade (default) — uses the .layer / .layer.active rules above unchanged. */
+
+/* push: incoming slides in from the right, outgoing slides off to the left.
+ * Opacity stays at 1 throughout so we never see the black gutter. */
+.layer.tx-push { opacity: 1; }
+.layer.tx-push:not(.active) {
+  transform: translateX(100%);
+}
+.layer.tx-push.active {
+  transform: translateX(0);
+}
+.layer.tx-push.tx-outgoing:not(.active) {
+  /* Drive the outgoing layer off-screen to the left rather than the
+   * default off-stage-right (which is the incoming entry state). */
+  transform: translateX(-100%);
+}
+
+/* wipe: incoming reveals itself L→R via a clip-path inset.  Outgoing
+ * stays put — the wipe IS the transition; we don't need to also move
+ * the outgoing layer. */
+.layer.tx-wipe { opacity: 1; }
+.layer.tx-wipe:not(.active) {
+  clip-path: inset(0 100% 0 0);
+}
+.layer.tx-wipe.active {
+  clip-path: inset(0 0 0 0);
+}
+.layer.tx-wipe.tx-outgoing { clip-path: inset(0 0 0 0); }
+
+/* dissolve (Ken Burns): crossfade + outgoing slowly scales up to 1.05. */
+.layer.tx-dissolve.tx-outgoing:not(.active) {
+  transform: scale(1.05);
+}
+.layer.tx-dissolve.tx-incoming.active {
+  transform: scale(1);
+}
+
+/* zoom: incoming scales 0.9 → 1.0 while fading 0 → 1. */
+.layer.tx-zoom:not(.active) {
+  transform: scale(0.9);
+}
+.layer.tx-zoom.active {
+  transform: scale(1);
+}
+
+/* fade_black is sequenced JS-side (two half-duration fades through the
+ * black stage background) — no extra CSS needed here. */
+
