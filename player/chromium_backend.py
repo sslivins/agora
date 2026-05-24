@@ -7,9 +7,11 @@ A single sway+chromium subprocess (wrapped in a transient systemd scope)
 is launched in kiosk mode pointing at that server, and the daemon drives
 the shell over the WebSocket with JSON commands.
 
-This is an opt-in alternative to mpv, intended to make rich image
-transitions and unified image/video rendering easy to iterate on.
-Enable by setting environment variable AGORA_PLAYER_BACKEND=chromium.
+This is the default playback backend on production Pis, intended to
+make rich image transitions and unified image/video rendering easy to
+iterate on.
+Opt out via environment variable AGORA_PLAYER_BACKEND=mpv to fall back
+to the legacy mpv path.
 
 The protocol is documented in ``player/shell/README.md``.
 
