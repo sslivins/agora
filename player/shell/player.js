@@ -183,6 +183,27 @@
     const el = buildElement(cmd);
     nxt.appendChild(el);
 
+    // Hardware-overlay workaround for the Pi: on chromium-rpi the
+    // <video> element is promoted to a DRM overlay plane that bypasses
+    // the page compositor, so CSS opacity / transform / clip-path on
+    // the parent layer can't fade it.  The result is the new asset
+    // crossfades in *behind* the still-fully-opaque video plane, and
+    // only becomes visible when the cleanup timer (durMs+100) tears
+    // the <video> element down — which looks like "the transition
+    // didn't run" to the eye.  Softplayer doesn't hit this because
+    // its chromium composites video in GL.
+    //
+    // Snapshot the current video frame to a <canvas> and swap it in
+    // for the <video> element BEFORE we kick off the transition.
+    // The canvas is page-composited and opacity / transform behave
+    // normally.  If drawImage fails (some hw-decoded paths produce
+    // an unreadable surface), fall back to releasing the overlay
+    // synchronously so the transition at least cuts cleanly instead
+    // of holding the old video frame visible.
+    if (mode !== "cut" && durMs > 0) {
+      _freezeOutgoingVideo(cur);
+    }
+
     if (mode === "fade_black" && durMs > 0) {
       // Two-stage sequenced fade through the black stage background.
       // Stage 1: outgoing fades to 0 over durMs/2 (incoming stays at 0).
@@ -202,12 +223,33 @@
       // Single-stage transitions: tag both layers with the mode class
       // (so per-mode CSS rules apply) and flip .active in a layout
       // flush so the browser sees both states and animates between.
+      //
+      // CRITICAL: per-mode tx-* classes change transformable
+      // properties (transform, clip-path).  Adding them while the
+      // layer's `transition:` rule is live causes the browser to
+      // run a spurious entry-state animation (e.g. the incoming
+      // layer animates from scale(1) → scale(0.9) just to *reach*
+      // the zoom entry state) BEFORE the real transition fires on
+      // the .active flip.  The user-visible result is a fade then
+      // a zoom (two back-to-back animations), not a single combined
+      // zoom-and-fade.  We work around by temporarily disabling
+      // transitions while we commit the entry-state classes, flushing
+      // layout, and only then re-enabling transitions + flipping
+      // .active.  "fade" doesn't need this (no entry-state class)
+      // and "cut" doesn't transition at all.
       if (mode !== "cut" && mode !== "fade") {
         const txClass = "tx-" + mode;
+        cur.classList.add("no-transition");
+        nxt.classList.add("no-transition");
         cur.classList.add(txClass);
         nxt.classList.add(txClass);
         cur.classList.add("tx-outgoing");
         nxt.classList.add("tx-incoming");
+        // Commit entry states with transitions off.
+        // eslint-disable-next-line no-unused-expressions
+        nxt.offsetHeight;
+        cur.classList.remove("no-transition");
+        nxt.classList.remove("no-transition");
       }
 
       // Force a layout flush so the transition runs.
@@ -241,6 +283,46 @@
     }, cleanupDelay);
 
     return el;
+  }
+
+  /**
+   * Replace any <video> in the outgoing layer with a <canvas> snapshot
+   * of its current frame.  See the call site in swapTo for the full
+   * rationale (Pi hardware-overlay punch-through).  Best-effort:
+   * silently no-ops if there's no video, and if drawImage fails the
+   * video element is released anyway so the transition isn't blocked
+   * by a stuck overlay plane.
+   */
+  function _freezeOutgoingVideo(layer) {
+    if (!layer) return;
+    const v = layer.querySelector("video");
+    if (!v) return;
+    let snapshotOk = false;
+    try {
+      const w = v.videoWidth || v.clientWidth || layer.clientWidth || 1920;
+      const h = v.videoHeight || v.clientHeight || layer.clientHeight || 1080;
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(v, 0, 0, w, h);
+      // Inherit the same fit/sizing as <img>/<video> in player.css.
+      canvas.style.width = "100%";
+      canvas.style.height = "100%";
+      canvas.style.objectFit = "contain";
+      canvas.style.background = "#000";
+      try { v.pause(); v.removeAttribute("src"); v.load(); } catch (_) {}
+      layer.replaceChild(canvas, v);
+      snapshotOk = true;
+    } catch (e) {
+      log("freeze snapshot failed: " + e);
+    }
+    if (!snapshotOk) {
+      // drawImage refused (hw overlay frame unreadable).  Release the
+      // overlay plane synchronously so the transition isn't masked.
+      try { v.pause(); v.removeAttribute("src"); v.load(); } catch (_) {}
+      try { layer.removeChild(v); } catch (_) {}
+    }
   }
 
   function clearAll() {
