@@ -75,6 +75,22 @@ LOGS_UPLOAD_MAX_BYTES = 22_020_096  # 21 MiB
 # tens of MB at most over a local network.
 LOGS_UPLOAD_TIMEOUT = 60.0
 
+# Default set of systemd units the CMS pulls when it asks the Pi for
+# logs without specifying ``services``.  Covers every agora-* unit
+# installed by the .deb (see ``debian/agora.install``) so the Settings
+# "Download logs" button captures OTA / slot-promote / watchdog data
+# without the operator having to remember to ask by name.
+DEFAULT_LOG_SERVICES = [
+    "agora-api",
+    "agora-cms-client",
+    "agora-fleet-provision",
+    "agora-os-updater",
+    "agora-player",
+    "agora-provision",
+    "agora-slot-mgr",
+    "agora-watchdog",
+]
+
 # Reconnect backoff: 2s, 4s, 8s, ... capped at 60s
 RECONNECT_BASE = 2
 RECONNECT_MAX = 60
@@ -2475,9 +2491,7 @@ class CMSClient:
         cannot carry because ``ws.send(bytes)`` is unsupported.
         """
         request_id = msg.get("request_id", "")
-        services = msg.get("services") or [
-            "agora-player", "agora-api", "agora-cms-client", "agora-provision",
-        ]
+        services = msg.get("services") or list(DEFAULT_LOG_SERVICES)
         since = msg.get("since", "24h")
         logger.info("Log request %s: services=%s since=%s", request_id, services, since)
 

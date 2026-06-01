@@ -39,6 +39,7 @@ sys.modules.setdefault("aiohttp", MagicMock())
 
 from cms_client.service import (  # noqa: E402
     CMSClient,
+    DEFAULT_LOG_SERVICES,
     LOGS_JSON_MAX_BYTES,
     LOGS_UPLOAD_MAX_BYTES,
     PROTOCOL_VERSION,
@@ -371,6 +372,62 @@ def test_build_logs_tar_gz_roundtrip():
     assert blob[:2] == b"\x1f\x8b"
     extracted = _extract_tar_gz(blob)
     assert extracted == {"agora-api.log": "hello", "agora-player.log": "world"}
+
+
+def test_default_log_services_covers_every_installed_unit():
+    """Regression test for the gap that left agora-os-updater,
+    agora-slot-mgr, agora-watchdog, and agora-fleet-provision out of
+    the default capture set, forcing operators to ask for them by name
+    (or via the assistant) whenever an OTA / slot promote / watchdog
+    issue needed root-causing.
+
+    The intent is: if a new ``agora-*.service`` unit is added under
+    ``systemd/`` (and packaged in the .deb), it MUST also be in the
+    default journal capture list -- otherwise the Settings "Download
+    logs" button quietly omits its output.
+    """
+    systemd_dir = Path(__file__).resolve().parent.parent / "systemd"
+    installed_units = sorted(
+        p.stem for p in systemd_dir.glob("agora-*.service")
+    )
+    assert installed_units, "expected at least one agora-*.service unit"
+    missing = set(installed_units) - set(DEFAULT_LOG_SERVICES)
+    assert not missing, (
+        f"DEFAULT_LOG_SERVICES is missing units that are installed by the "
+        f".deb (and so would be silently omitted from Settings -> Download "
+        f"logs): {sorted(missing)}.  Add them to DEFAULT_LOG_SERVICES in "
+        f"cms_client/service.py."
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_logs_with_no_services_uses_default_set(tmp_path):
+    """When the CMS does not specify ``services``, the Pi must fan
+    journalctl out over every unit in ``DEFAULT_LOG_SERVICES`` -- not
+    a stale hard-coded subset.
+    """
+    client = _make_client(tmp_path)
+    ws = MagicMock()
+    ws.send = AsyncMock()
+
+    queried: list[str] = []
+
+    def fake_run(cmd, *a, **kw):
+        # cmd is ["journalctl", "-u", <service>, "--since=...", ...]
+        queried.append(cmd[2])
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = "ok"
+        r.stderr = ""
+        return r
+
+    with patch("cms_client.service.subprocess.run", side_effect=fake_run):
+        await client._handle_request_logs(
+            {"request_id": "rdef", "since": "1h"},  # no "services" key
+            ws,
+        )
+
+    assert sorted(queried) == sorted(DEFAULT_LOG_SERVICES)
 
 
 def test_logs_api_base_falls_back_to_active_ws_url(tmp_path):
