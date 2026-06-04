@@ -85,6 +85,29 @@ def test_show_splash_uses_cut_transition(cp):
     }]
 
 
+def test_show_html_emits_expected_command(cp):
+    sent = _capture_commands(cp)
+    bundle = cp.assets_dir / "composed" / "composed-abc.html"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text("<!doctype html><h1>hi</h1>", encoding="utf-8")
+
+    cp.show_html(bundle)
+
+    assert len(sent) == 1
+    cmd = sent[0]
+    assert cmd["cmd"] == "show_html"
+    assert cmd["url"] == "/assets/composed/composed-abc.html"
+    assert cmd["transition"] == "cut"
+
+
+def test_show_html_outside_sandbox_is_dropped(cp, tmp_path):
+    sent = _capture_commands(cp)
+    naughty = tmp_path / "naughty.html"
+    naughty.write_text("<h1>nope</h1>", encoding="utf-8")
+    cp.show_html(naughty)
+    assert sent == []
+
+
 def test_show_image_defaults_to_cut_transition(cp):
     sent = _capture_commands(cp)
     img = cp.assets_dir / "images" / "foo.jpg"

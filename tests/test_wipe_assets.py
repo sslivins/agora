@@ -136,6 +136,7 @@ class TestWipeAssetsHandler:
 
         client.asset_manager.rebuild_from_disk.assert_called_once_with(
             settings.videos_dir, settings.images_dir, settings.splash_dir,
+            settings.composed_dir,
         )
 
     @pytest.mark.asyncio

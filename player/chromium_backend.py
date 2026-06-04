@@ -326,6 +326,24 @@ class ChromiumPlayer:
             "duration_ms": 0,
         })
 
+    def show_html(
+        self,
+        path: Path,
+        transition: str = "cut",
+        duration_ms: int = DEFAULT_TRANSITION_MS,
+    ) -> None:
+        """Render a local HTML bundle (e.g. composed slide) in an iframe."""
+        url = self._asset_url(path)
+        if url is None:
+            logger.warning("ChromiumPlayer.show_html: not under assets dir: %s", path)
+            return
+        self._enqueue({
+            "cmd": "show_html",
+            "url": url,
+            "transition": transition,
+            "duration_ms": duration_ms,
+        })
+
     def stop_playback(self) -> None:
         self._enqueue({"cmd": "stop"})
 

@@ -301,6 +301,23 @@ class TestRebuildFromDisk:
         assert manager.has_asset("gone.mp4") is False
         assert manager.total_size_bytes == 0
 
+    def test_rebuild_discovers_composed_files(self, manager):
+        """Files in composed/ should be picked up when composed_dir is passed."""
+        bundle = manager.assets_dir / "composed" / "composed-x.html"
+        bundle.parent.mkdir(parents=True)
+        bundle.write_bytes(b"<!doctype html>")
+
+        manager.rebuild_from_disk(
+            manager.assets_dir / "videos",
+            manager.assets_dir / "images",
+            manager.assets_dir / "splash",
+            manager.assets_dir / "composed",
+        )
+
+        assert manager.has_asset("composed-x.html") is True
+        rel = manager.get_all()["composed-x.html"]["path"].replace("\\", "/")
+        assert rel == "composed/composed-x.html"
+
     def test_rebuild_keeps_existing_files(self, manager):
         """Manifest entries for files still on disk are preserved."""
         video = manager.assets_dir / "videos" / "still_here.mp4"

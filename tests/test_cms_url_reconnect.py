@@ -49,6 +49,7 @@ def _make_settings(tmp_path: Path, initial_cms_url: str = "") -> object:
         videos_dir = assets / "videos"
         images_dir = assets / "images"
         splash_dir = assets / "splash"
+        composed_dir = assets / "composed"
         asset_budget_mb = 100
         device_name = "test-device"
 

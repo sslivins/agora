@@ -197,7 +197,7 @@ async def settings_page(
 
     # Device info
     asset_count = 0
-    for subdir in [settings.videos_dir, settings.images_dir]:
+    for subdir in [settings.videos_dir, settings.images_dir, settings.composed_dir]:
         if subdir.exists():
             asset_count += sum(1 for f in subdir.iterdir() if f.is_file())
 

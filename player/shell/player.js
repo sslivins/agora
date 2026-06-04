@@ -13,6 +13,8 @@
  *    "loop":false,"loop_count":3,"muted":false,"transition":"<mode>",
  *    "duration_ms":600}
  *   {"cmd":"show_splash","url":"/assets/splash/default.png"}
+ *   {"cmd":"show_html","url":"/assets/composed/page.html",
+ *    "transition":"<mode>","duration_ms":600}
  *   {"cmd":"stop"}
  *
  * Transition modes (<mode> above): "cut" | "fade" | "fade_black" |
@@ -120,6 +122,20 @@
         }, { once: true });
       }
       return v;
+    }
+    if (cmd.cmd === "show_html") {
+      // Composed slide: render the local HTML bundle in an iframe so the
+      // shell document keeps its WebSocket connection. sandbox allows
+      // scripts (clock/ticker widgets) but not top-level navigation or
+      // popup escape from kiosk.
+      const f = document.createElement("iframe");
+      f.src = cmd.url;
+      f.setAttribute("sandbox", "allow-scripts allow-same-origin");
+      f.style.cssText = "width:100%;height:100%;border:0;display:block;background:#000";
+      f.addEventListener("error", () => {
+        send({ event: "error", asset: cmd.url, msg: "html load failed" });
+      });
+      return f;
     }
     // Default: image (show_image, show_splash)
     const img = document.createElement("img");
@@ -344,6 +360,7 @@
     switch (cmd.cmd) {
       case "show_image":
       case "show_splash":
+      case "show_html":
         swapTo(cmd);
         break;
       case "show_video":
