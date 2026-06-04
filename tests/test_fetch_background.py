@@ -35,6 +35,7 @@ def client(tmp_path):
     c.device_id = "d1"
     c.asset_manager = MagicMock()
     c._fetch_tasks = {}
+    c._inflight_fetches = {}
     c._fetch_lock = asyncio.Lock()
     return c
 

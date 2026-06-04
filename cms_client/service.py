@@ -103,6 +103,11 @@ EVAL_INTERVAL = 15      # seconds between local schedule evaluations
 PLAYER_WATCH_INTERVAL = 2  # seconds between player-mode checks for end-of-stream
 FETCH_INTERVAL = 60     # seconds between proactive fetch checks
 FETCH_LOOKAHEAD_HOURS = 24  # how far ahead to look for missing assets
+# Safety net for the in-flight fetch_request de-dupe: if a request was sent
+# but no fetch_asset reply ever arrived (e.g. a dropped message), allow a
+# re-request after this many seconds. Active downloads suppress re-requests
+# independently (via _fetch_tasks), so this never interrupts a long download.
+FETCH_REQUEST_DEDUPE_TTL = 90  # seconds
 AUTH_REJECTED_RETRY = 10    # seconds to wait before retrying after auth rejection
 
 
@@ -378,6 +383,13 @@ class CMSClient:
         # ``_fetch_lock`` so AssetManager eviction math stays correct.
         self._fetch_tasks: dict[str, asyncio.Task] = {}
         self._fetch_lock = asyncio.Lock()
+        # Outstanding fetch_request de-dupe, keyed by asset_name → monotonic
+        # send time. Three uncoordinated emitters (direct sync eval, woken
+        # eval loop, proactive fetch loop) would otherwise each ask the CMS
+        # for the same still-missing asset every cycle. Suppressed while a
+        # request awaits its fetch_asset reply (within FETCH_REQUEST_DEDUPE_TTL)
+        # or a download for the asset is active (_fetch_tasks).
+        self._inflight_fetches: dict[str, float] = {}
         # Bootstrap v2 state (only populated when settings.bootstrap_v2 is true)
         self._bootstrap_identity = None  # shared.bootstrap_identity.DeviceIdentity
         self._bootstrap_pairing_secret: str | None = None
@@ -719,6 +731,10 @@ class CMSClient:
 
         async with transport as ws:
             self._ws = ws
+            # Fresh connection: drop stale in-flight markers so a missing
+            # asset is re-requested immediately rather than waiting out the
+            # TTL of a request that died with the previous socket.
+            self._inflight_fetches.clear()
             logger.info("WebSocket connected (transport=%s)", transport_mode)
 
             auth_token = _read_auth_token(self.settings.auth_token_path)
@@ -1425,8 +1441,64 @@ class CMSClient:
         self._current_schedule_name = None
         self._current_asset = None
 
+    def _should_send_fetch_request(self, asset_name: str) -> bool:
+        """Decide whether a ``fetch_request`` for ``asset_name`` should be sent.
+
+        De-dupes the three uncoordinated request emitters (direct sync eval,
+        woken eval loop, proactive fetch loop) so the device asks the CMS for
+        a still-missing asset at most once per outstanding request. Returns
+        False (suppress) while either:
+
+        * a download task for the asset is already active (``_fetch_tasks``), or
+        * a prior request is still awaiting its ``fetch_asset`` reply, i.e. the
+          in-flight marker is younger than ``FETCH_REQUEST_DEDUPE_TTL``.
+
+        When it returns True it records the send time so subsequent emitters
+        in the same cycle are suppressed. Keyed by name only: a checksum change
+        on the same name is bounded-delayed behind an active download for the
+        old bytes, which the next cycle corrects.
+        """
+        task = self._fetch_tasks.get(asset_name)
+        if task is not None and not task.done():
+            return False
+        ts = self._inflight_fetches.get(asset_name)
+        if ts is not None and (time.monotonic() - ts) < FETCH_REQUEST_DEDUPE_TTL:
+            return False
+        self._inflight_fetches[asset_name] = time.monotonic()
+        return True
+
+    async def _send_fetch_request(self, asset_name: str) -> bool:
+        """Send a single de-duped ``fetch_request`` for ``asset_name``.
+
+        Returns True iff a request was actually put on the wire. Re-raises
+        ``websockets.ConnectionClosed`` so iterating callers can stop early;
+        the in-flight marker is cleared on any send failure so the next cycle
+        retries.
+        """
+        ws = self._ws
+        if not ws:
+            return False
+        if not self._should_send_fetch_request(asset_name):
+            return False
+        msg = json.dumps({
+            "type": "fetch_request",
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "asset": asset_name,
+        })
+        try:
+            await ws.send(msg)
+            return True
+        except websockets.ConnectionClosed:
+            self._inflight_fetches.pop(asset_name, None)
+            raise
+        except Exception:
+            self._inflight_fetches.pop(asset_name, None)
+            logger.exception("Error requesting asset %s", asset_name)
+            return False
+
     def _request_asset_fetch(self, asset_name: str) -> None:
-        """Fire-and-forget a fetch_request for a missing asset via WebSocket."""
+        """Fire-and-forget a de-duped fetch_request for a missing asset."""
         ws = self._ws
         if not ws:
             return
@@ -1434,13 +1506,16 @@ class CMSClient:
             loop = asyncio.get_event_loop()
         except RuntimeError:
             return
-        msg = json.dumps({
-            "type": "fetch_request",
-            "protocol_version": PROTOCOL_VERSION,
-            "device_id": self.device_id,
-            "asset": asset_name,
-        })
-        loop.create_task(ws.send(msg))
+
+        async def _go() -> None:
+            try:
+                await self._send_fetch_request(asset_name)
+            except Exception:
+                logger.debug(
+                    "fetch_request send failed for %s", asset_name, exc_info=True,
+                )
+
+        loop.create_task(_go())
 
     def _send_playback_event(self, event_type: str, schedule_id: str,
                              schedule_name: str, asset: str) -> None:
@@ -1583,17 +1658,9 @@ class CMSClient:
             else:
                 logger.info("Requesting missing asset: %s", asset_name)
             try:
-                request_msg = {
-                    "type": "fetch_request",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "device_id": self.device_id,
-                    "asset": asset_name,
-                }
-                await ws.send(json.dumps(request_msg))
+                await self._send_fetch_request(asset_name)
             except websockets.ConnectionClosed:
                 break
-            except Exception:
-                logger.exception("Error requesting asset %s", asset_name)
 
     # ── Direct commands ──
 
@@ -1640,6 +1707,11 @@ class CMSClient:
         if not asset_name:
             logger.warning("Invalid fetch_asset message: missing asset_name")
             return
+        # Reply received — the outstanding request is satisfied. Drop the
+        # in-flight marker; suppression of further requests is now owned by
+        # the download task tracked in _fetch_tasks below (so a long download
+        # isn't re-requested, and a failed one is retried once the task ends).
+        self._inflight_fetches.pop(asset_name, None)
         prior = self._fetch_tasks.get(asset_name)
         if prior is not None and not prior.done():
             prior.cancel()

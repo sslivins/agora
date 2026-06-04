@@ -61,6 +61,7 @@ def cms_client(tmp_path):
     client._ws = AsyncMock()
     client._fetch_lock = asyncio.Lock()
     client._fetch_tasks = {}
+    client._inflight_fetches = {}
     client._current_schedule_id = None
     client._current_schedule_name = None
     client._current_asset = None
