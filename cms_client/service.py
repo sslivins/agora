@@ -44,7 +44,7 @@ PROTOCOL_VERSION = 2
 # - "slideshow_v1": this firmware understands ``asset_type=slideshow``
 #   on FETCH_ASSET messages, fetches the manifest+slides, and stores
 #   them under ``assets/slideshows/<name>/``.
-DEVICE_CAPABILITIES = ["slideshow_v1"]
+DEVICE_CAPABILITIES = ["slideshow_v1", "composed_siblings_v1"]
 
 # Bootstrap v2 renewal policy (issue #420 stage B.3).
 # Minimum delay between JWT refreshes on the renewal task, so a clock
@@ -1697,6 +1697,16 @@ class CMSClient:
             await self._handle_fetch_slideshow(msg, ws)
             return
 
+        # Composed slides may carry a "siblings" list (Phase 1D, capability
+        # ``composed_siblings_v1``) — referenced media (videos/images) the
+        # bundle HTML loads from local cache. When present, route to the
+        # sibling-aware handler. Composed bundles without siblings (older
+        # CMS, or composed slides with no media) keep the simple path so
+        # this is fully backward compatible.
+        if asset_type == "composed" and msg.get("siblings"):
+            await self._handle_fetch_composed(msg, ws)
+            return
+
         if not asset_name or not download_url:
             logger.warning("Invalid fetch_asset message: missing fields")
             return
@@ -2149,6 +2159,353 @@ class CMSClient:
             if not slide_name:
                 return False
             if not self.asset_manager.has_asset(slide_name, slide_checksum):
+                return False
+        return True
+
+    # ── Composed-slide sibling fetch (capability: composed_siblings_v1) ──
+
+    @staticmethod
+    def _is_safe_sibling_name(name: str) -> bool:
+        """Reject sibling asset names that could escape the cache dir.
+
+        Sibling names land on disk as files under ``videos_dir`` /
+        ``images_dir`` etc. We require a flat filename — no path
+        separators, no NUL, no ``..``, and ``Path(name).name == name``
+        so ``Path`` traversal can't surprise us.
+        """
+        if not isinstance(name, str) or not name:
+            return False
+        if "/" in name or "\\" in name or "\x00" in name:
+            return False
+        if name in (".", "..") or ".." in name.split("/") or ".." in name.split("\\"):
+            return False
+        # Reject anything that, when round-tripped through Path, no
+        # longer looks like a single basename.
+        try:
+            if Path(name).name != name:
+                return False
+        except Exception:
+            return False
+        return True
+
+    async def _handle_fetch_composed(self, msg: dict, ws) -> None:
+        """Fetch a composed-slide bundle + its referenced sibling media.
+
+        The composed bundle is a single self-contained HTML file. Any
+        non-inline media it references (videos in v1) is delivered as
+        ``siblings`` so the device can cache each one alongside the
+        bundle. The bundle HTML loads siblings by local cache URL
+        (e.g. ``/assets/videos/foo.mp4``) served by the player shell.
+
+        Like the slideshow handler: dedupe missing siblings, bulk-evict
+        for the combined byte budget while protecting scheduled assets
+        and the in-flight sibling names, download siblings, then
+        download the bundle, write a ``.deps.json`` sidecar, ACK.
+        """
+        asset_name = msg.get("asset_name", "")
+        download_url = msg.get("download_url", "")
+        expected_checksum = msg.get("checksum", "")
+        siblings = msg.get("siblings") or []
+
+        if not asset_name or not download_url:
+            logger.warning(
+                "Invalid composed fetch_asset: missing asset_name/download_url"
+            )
+            await ws.send(json.dumps({
+                "type": "fetch_failed",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "asset": asset_name,
+                "reason": "invalid_composed_payload",
+            }))
+            return
+
+        if not isinstance(siblings, list):
+            logger.warning("Invalid composed fetch_asset for %s: siblings not a list", asset_name)
+            await ws.send(json.dumps({
+                "type": "fetch_failed",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "asset": asset_name,
+                "reason": "invalid_composed_payload",
+            }))
+            return
+
+        # Validate sibling descriptors up front (shape + path-traversal guard).
+        for i, sib in enumerate(siblings):
+            if not isinstance(sib, dict):
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "invalid_sibling_descriptor",
+                    "sibling_position": i,
+                }))
+                return
+            sib_name = sib.get("asset_name")
+            sib_url = sib.get("download_url")
+            if not sib_name or not sib_url:
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "invalid_sibling_descriptor",
+                    "sibling_position": i,
+                }))
+                return
+            if not self._is_safe_sibling_name(sib_name):
+                logger.warning(
+                    "Composed %s: rejecting unsafe sibling name %r",
+                    asset_name, sib_name,
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "invalid_sibling_name",
+                    "sibling_asset": sib_name,
+                }))
+                return
+
+        # Fast path: bundle + every sibling already cached with matching checksums.
+        if self._has_complete_composed(asset_name, expected_checksum, siblings):
+            # Rewrite sidecar if the sibling set drifted (e.g. CMS changed a
+            # sibling's checksum without renaming it). Cheap to do always.
+            existing = self._read_composed_sidecar(asset_name) or {}
+            if existing.get("siblings") != [
+                {
+                    "name": s["asset_name"],
+                    "asset_type": s.get("asset_type", "video"),
+                    "checksum": s.get("checksum", ""),
+                    "size_bytes": s.get("size_bytes", 0),
+                }
+                for s in siblings
+            ]:
+                self._write_composed_sidecar(asset_name, expected_checksum, siblings)
+            else:
+                logger.info("Composed already cached and complete: %s", asset_name)
+            await self._touch_composed_siblings(asset_name, siblings)
+            await ws.send(json.dumps({
+                "type": "asset_ack",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "asset_name": asset_name,
+                "checksum": expected_checksum,
+            }))
+            return
+
+        # Dedupe siblings still needed by (name, checksum).
+        unique_missing: dict[tuple[str, str], dict] = {}
+        for sib in siblings:
+            key = (sib["asset_name"], sib.get("checksum", ""))
+            if key in unique_missing:
+                continue
+            if self.asset_manager.has_asset(sib["asset_name"], sib.get("checksum") or None):
+                continue
+            unique_missing[key] = sib
+
+        bundle_size = msg.get("size_bytes", 0) or 0
+        sibling_bytes = sum(s.get("size_bytes", 0) for s in unique_missing.values())
+        total_bytes = bundle_size + sibling_bytes
+
+        # Bulk evict for bundle + missing siblings together. Protect
+        # scheduled assets, the bundle name itself, and every sibling
+        # name we're about to bring in so we don't evict ourselves.
+        if total_bytes > 0:
+            scheduled_assets = self._get_scheduled_asset_names()
+            sync_data = self._read_schedule_cache()
+            default_asset = sync_data.get("default_asset") if sync_data else None
+            protected = (
+                scheduled_assets
+                | {asset_name}
+                | {s["asset_name"] for s in siblings}
+            )
+            ok = self.asset_manager.evict_for(total_bytes, protected, default_asset)
+            if not ok:
+                logger.error(
+                    "Cannot fit composed %s (%d bytes total): budget=%dMB",
+                    asset_name, total_bytes, self.asset_manager.budget_mb,
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "insufficient_storage",
+                    "budget_mb": self.asset_manager.budget_mb,
+                    "available_mb": self.asset_manager.available_bytes // (1024 * 1024),
+                    "required_mb": total_bytes // (1024 * 1024),
+                }))
+                return
+
+        # Download missing siblings first — the bundle is useless without them.
+        for sib in unique_missing.values():
+            actual = await self._download_one_asset(
+                sib["asset_name"],
+                sib.get("asset_type", "video"),
+                sib["download_url"],
+                sib.get("checksum", ""),
+            )
+            if actual is None:
+                logger.error(
+                    "Composed %s: sibling %s download failed",
+                    asset_name, sib["asset_name"],
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "sibling_download_failed",
+                    "sibling_asset": sib["asset_name"],
+                }))
+                return
+
+        # Download bundle itself (always — fast path above already short-circuited
+        # the cached case).
+        actual_bundle = await self._download_one_asset(
+            asset_name, "composed", download_url, expected_checksum,
+        )
+        if actual_bundle is None:
+            logger.error("Composed %s: bundle download failed", asset_name)
+            await ws.send(json.dumps({
+                "type": "fetch_failed",
+                "protocol_version": PROTOCOL_VERSION,
+                "device_id": self.device_id,
+                "asset": asset_name,
+                "reason": "bundle_download_failed",
+            }))
+            return
+
+        # Persist sidecar so future fast-path checks + eviction-protection
+        # can reconstruct the sibling list without the wire message.
+        self._write_composed_sidecar(asset_name, actual_bundle, siblings)
+        await self._touch_composed_siblings(asset_name, siblings)
+
+        # Re-trigger desired state if player is waiting for this composed asset.
+        desired = read_state(self.settings.desired_state_path, DesiredState)
+        if desired.asset == asset_name:
+            logger.info(
+                "Re-applying desired state for just-downloaded composed: %s",
+                asset_name,
+            )
+            desired.timestamp = datetime.now(timezone.utc)
+            write_state(self.settings.desired_state_path, desired)
+
+        logger.info(
+            "Composed fetched: %s (%d siblings, %d unique downloads)",
+            asset_name, len(siblings), len(unique_missing),
+        )
+        await ws.send(json.dumps({
+            "type": "asset_ack",
+            "protocol_version": PROTOCOL_VERSION,
+            "device_id": self.device_id,
+            "asset_name": asset_name,
+            "checksum": actual_bundle,
+        }))
+
+    def _write_composed_sidecar(
+        self,
+        asset_name: str,
+        expected_checksum: str,
+        siblings: list[dict],
+    ) -> None:
+        """Atomically write ``<composed_dir>/<name>.deps.json``.
+
+        Sibling files live in their own type-routed dirs (videos_dir /
+        images_dir) — the sidecar only records names + checksums so the
+        device can verify completeness and protect siblings from
+        eviction. ``.deps.json`` (not ``.json``) avoids any chance of
+        colliding with the bundle's own ``.html`` file if a user names
+        their composed slide oddly.
+        """
+        payload = {
+            "name": asset_name,
+            "checksum": expected_checksum,
+            "siblings": [
+                {
+                    "name": s["asset_name"],
+                    "asset_type": s.get("asset_type", "video"),
+                    "checksum": s.get("checksum", ""),
+                    "size_bytes": s.get("size_bytes", 0),
+                }
+                for s in siblings
+            ],
+        }
+        self.settings.composed_dir.mkdir(parents=True, exist_ok=True)
+        sidecar_path = self.settings.composed_dir / f"{asset_name}.deps.json"
+        atomic_write(sidecar_path, json.dumps(payload, indent=2))
+
+    def _read_composed_sidecar(self, asset_name: str) -> dict | None:
+        """Read and parse a composed sidecar. Returns None if missing/corrupt."""
+        path = self.settings.composed_dir / f"{asset_name}.deps.json"
+        try:
+            data = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if not isinstance(data.get("siblings"), list):
+            return None
+        return data
+
+    def _is_composed_asset(self, asset_name: str) -> bool:
+        """True iff `asset_name` is registered as a composed bundle on this device."""
+        entry = self.asset_manager.get(asset_name)
+        if not isinstance(entry, dict):
+            return False
+        path = entry.get("path", "")
+        return isinstance(path, str) and path.startswith("composed/")
+
+    async def _touch_composed_siblings(self, _asset_name: str, siblings: list[dict]) -> None:
+        """Bump LRU timestamps for every sibling referenced by a composed bundle."""
+        seen: set[str] = set()
+        for sib in siblings:
+            name = sib.get("asset_name") or sib.get("name")
+            if name and name not in seen:
+                self.asset_manager.touch(name)
+                seen.add(name)
+
+    def _has_complete_composed(
+        self,
+        asset_name: str,
+        expected_checksum: str,
+        siblings: list[dict] | None = None,
+    ) -> bool:
+        """A composed slide is complete only when:
+
+        - the bundle is registered with a matching checksum,
+        - the sidecar parses and matches that checksum,
+        - every referenced sibling is in the asset_manager with a matching checksum.
+
+        If ``siblings`` is provided (e.g. fresh from a FETCH_ASSET
+        message), it is used as the authoritative list; otherwise the
+        sidecar's list is used.
+        """
+        if not self.asset_manager.has_asset(asset_name, expected_checksum):
+            return False
+        sidecar = self._read_composed_sidecar(asset_name)
+        if sidecar is None:
+            return False
+        if expected_checksum and sidecar.get("checksum") != expected_checksum:
+            return False
+        if siblings is not None:
+            sibling_list = [
+                {"name": s["asset_name"], "checksum": s.get("checksum") or None}
+                for s in siblings
+            ]
+        else:
+            sibling_list = [
+                {"name": s.get("name"), "checksum": s.get("checksum") or None}
+                for s in sidecar.get("siblings", [])
+            ]
+        for sib in sibling_list:
+            if not sib["name"]:
+                return False
+            if not self.asset_manager.has_asset(sib["name"], sib["checksum"]):
                 return False
         return True
 
@@ -2762,6 +3119,17 @@ class CMSClient:
                 slide_name = slide.get("name") or slide.get("asset_name")
                 if slide_name:
                     names.add(slide_name)
+        # Expand composed slides → sibling sources (Phase 1D)
+        for asset in list(names):
+            if not self._is_composed_asset(asset):
+                continue
+            sidecar = self._read_composed_sidecar(asset)
+            if sidecar is None:
+                continue
+            for sib in sidecar.get("siblings", []):
+                sib_name = sib.get("name") or sib.get("asset_name")
+                if sib_name:
+                    names.add(sib_name)
         if default_asset:
             # Caller may use default_asset as a separate protection axis;
             # leave it in `names` as well for safety but don't double-add.
