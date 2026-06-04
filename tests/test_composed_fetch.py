@@ -194,6 +194,54 @@ class TestComposedFetch:
         assert not [m for m in sent if m["type"] == "fetch_failed"]
 
     @pytest.mark.asyncio
+    async def test_happy_path_cms_wire_format_uses_name_key(self, cms_client):
+        """CMS protocol (cms/schemas/protocol.py Sibling model) sends
+        siblings keyed as ``name``, not ``asset_name``.  Earlier firmware
+        drafts only accepted ``asset_name`` and silently dropped real
+        CMS messages on the floor.  This test pins the wire format:
+        siblings with only ``name`` populated must work end-to-end."""
+        bundle_body = b"<html>composed wire-format test</html>"
+        sib_body = b"sibling-video-payload"
+        sib_url = "http://cms.test/wire-clip.mp4"
+        # Real CMS wire format: key is "name", no "asset_name"
+        siblings = [{
+            "name": "wire-clip.mp4",
+            "asset_type": "video",
+            "download_url": sib_url,
+            "checksum": _sha256(sib_body),
+            "size_bytes": len(sib_body),
+        }]
+        bundle_url = "http://cms.test/wire.html"
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "wire.html",
+            "asset_type": "composed",
+            "download_url": bundle_url,
+            "checksum": _sha256(bundle_body),
+            "size_bytes": len(bundle_body),
+            "siblings": siblings,
+        }
+        fake_aiohttp, _ = _patch_aiohttp({
+            bundle_url: bundle_body,
+            sib_url: sib_body,
+        })
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        # Both files landed
+        assert (cms_client.settings.composed_dir / "wire.html").read_bytes() == bundle_body
+        assert (cms_client.settings.videos_dir / "wire-clip.mp4").read_bytes() == sib_body
+
+        # Sidecar emitted with "name" key (matches CMS schema)
+        sidecar = json.loads((cms_client.settings.composed_dir / "wire.html.deps.json").read_text())
+        assert sidecar["siblings"][0]["name"] == "wire-clip.mp4"
+
+        # ACK on bundle, no fetch_failed
+        sent = [json.loads(c.args[0]) for c in cms_client._ws.send.call_args_list]
+        assert any(m["type"] == "asset_ack" for m in sent)
+        assert not [m for m in sent if m["type"] == "fetch_failed"]
+
+    @pytest.mark.asyncio
     async def test_no_siblings_uses_simple_path(self, cms_client):
         """Composed asset with no siblings keeps the legacy
         ``_download_one_asset`` path so the change is fully backward
