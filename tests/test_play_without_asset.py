@@ -90,6 +90,8 @@ def cms_client(tmp_path):
     client.device_id = "test-device"
     client.asset_manager = MagicMock()
     client._ws = AsyncMock()
+    client._fetch_tasks = {}
+    client._inflight_fetches = {}
     client._last_eval_state = None
     client._current_schedule_id = None
     client._current_schedule_name = None

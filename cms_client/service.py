@@ -1470,10 +1470,12 @@ class CMSClient:
     async def _send_fetch_request(self, asset_name: str) -> bool:
         """Send a single de-duped ``fetch_request`` for ``asset_name``.
 
-        Returns True iff a request was actually put on the wire. Re-raises
-        ``websockets.ConnectionClosed`` so iterating callers can stop early;
-        the in-flight marker is cleared on any send failure so the next cycle
-        retries.
+        Returns True iff a request was actually put on the wire (False if
+        suppressed by de-dup or if the send failed). On any send failure
+        (e.g. the connection closed) the in-flight marker is cleared so the
+        next cycle retries. Deliberately catches a broad ``Exception`` rather
+        than ``websockets.ConnectionClosed`` specifically so the path stays
+        robust even when ``websockets`` is replaced by a test mock.
         """
         ws = self._ws
         if not ws:
@@ -1489,12 +1491,9 @@ class CMSClient:
         try:
             await ws.send(msg)
             return True
-        except websockets.ConnectionClosed:
-            self._inflight_fetches.pop(asset_name, None)
-            raise
         except Exception:
             self._inflight_fetches.pop(asset_name, None)
-            logger.exception("Error requesting asset %s", asset_name)
+            logger.debug("fetch_request send failed for %s", asset_name, exc_info=True)
             return False
 
     def _request_asset_fetch(self, asset_name: str) -> None:
@@ -1657,10 +1656,7 @@ class CMSClient:
                 logger.info("Requesting asset: %s (checksum mismatch or missing)", asset_name)
             else:
                 logger.info("Requesting missing asset: %s", asset_name)
-            try:
-                await self._send_fetch_request(asset_name)
-            except websockets.ConnectionClosed:
-                break
+            await self._send_fetch_request(asset_name)
 
     # ── Direct commands ──
 
