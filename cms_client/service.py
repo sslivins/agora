@@ -2231,9 +2231,25 @@ class CMSClient:
             }))
             return
 
+        # Normalize sibling descriptor keys.  CMS wire format uses "name"
+        # (cms/schemas/protocol.py Sibling); earlier firmware drafts used
+        # "asset_name".  Accept either by populating both so downstream
+        # readers (cache fast-path, dedupe, download loop, sidecar writer)
+        # all work regardless of which key the sender used.
+        for sib in siblings:
+            if isinstance(sib, dict):
+                if "asset_name" not in sib and "name" in sib:
+                    sib["asset_name"] = sib["name"]
+                elif "name" not in sib and "asset_name" in sib:
+                    sib["name"] = sib["asset_name"]
+
         # Validate sibling descriptors up front (shape + path-traversal guard).
         for i, sib in enumerate(siblings):
             if not isinstance(sib, dict):
+                logger.warning(
+                    "Composed %s: sibling[%d] is not a dict (got %s)",
+                    asset_name, i, type(sib).__name__,
+                )
                 await ws.send(json.dumps({
                     "type": "fetch_failed",
                     "protocol_version": PROTOCOL_VERSION,
@@ -2246,6 +2262,10 @@ class CMSClient:
             sib_name = sib.get("asset_name")
             sib_url = sib.get("download_url")
             if not sib_name or not sib_url:
+                logger.warning(
+                    "Composed %s: sibling[%d] missing name/download_url; keys=%r",
+                    asset_name, i, sorted(sib.keys()),
+                )
                 await ws.send(json.dumps({
                     "type": "fetch_failed",
                     "protocol_version": PROTOCOL_VERSION,
