@@ -155,7 +155,13 @@ class AssetManager:
 
         return self.available_bytes >= needed_bytes
 
-    def rebuild_from_disk(self, videos_dir: Path, images_dir: Path, splash_dir: Path) -> None:
+    def rebuild_from_disk(
+        self,
+        videos_dir: Path,
+        images_dir: Path,
+        splash_dir: Path,
+        composed_dir: Path | None = None,
+    ) -> None:
         """Scan asset directories and rebuild manifest for files not already tracked."""
         import hashlib
 
@@ -166,7 +172,10 @@ class AssetManager:
             del self._manifest[name]
             logger.info("Pruned stale manifest entry: %s", name)
 
-        for dir_path in [videos_dir, images_dir, splash_dir]:
+        scan_dirs = [videos_dir, images_dir, splash_dir]
+        if composed_dir is not None:
+            scan_dirs.append(composed_dir)
+        for dir_path in scan_dirs:
             if not dir_path.exists():
                 continue
             for file_path in dir_path.iterdir():

@@ -393,6 +393,7 @@ class CMSClient:
         # Rebuild manifest from disk on startup (catches manually added/removed files)
         self.asset_manager.rebuild_from_disk(
             settings.videos_dir, settings.images_dir, settings.splash_dir,
+            settings.composed_dir,
         )
 
     def _get_cms_url(self) -> str:
@@ -1783,6 +1784,8 @@ class CMSClient:
                 target_dir = self.settings.videos_dir
             elif asset_type == "image":
                 target_dir = self.settings.images_dir
+            elif asset_type == "composed":
+                target_dir = self.settings.composed_dir
             else:
                 # Fallback: route by file extension (expanded list)
                 ext = Path(asset_name).suffix.lower()
@@ -1790,6 +1793,8 @@ class CMSClient:
                     target_dir = self.settings.videos_dir
                 elif ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
                     target_dir = self.settings.images_dir
+                elif ext in (".html", ".htm"):
+                    target_dir = self.settings.composed_dir
                 else:
                     # Default to videos/ — player searches there (never root assets/)
                     target_dir = self.settings.videos_dir
@@ -2466,6 +2471,7 @@ class CMSClient:
         # Reinitialise the asset manager so in-memory state matches disk
         self.asset_manager.rebuild_from_disk(
             self.settings.videos_dir, self.settings.images_dir, self.settings.splash_dir,
+            self.settings.composed_dir,
         )
 
         logger.info("Asset wipe complete (reason: %s)", reason)

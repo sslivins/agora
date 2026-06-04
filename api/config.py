@@ -82,6 +82,10 @@ class Settings(BaseSettings):
         return self.assets_dir / "slideshows"
 
     @property
+    def composed_dir(self) -> Path:
+        return self.assets_dir / "composed"
+
+    @property
     def state_dir(self) -> Path:
         return self.agora_base / "state"
 

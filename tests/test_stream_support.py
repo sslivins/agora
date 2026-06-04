@@ -112,6 +112,8 @@ class TestDownloadRouting:
         settings.images_dir.mkdir()
         settings.splash_dir = tmp_path / "assets" / "splash"
         settings.splash_dir.mkdir()
+        settings.composed_dir = tmp_path / "assets" / "composed"
+        settings.composed_dir.mkdir()
         settings.manifest_path = tmp_path / "state" / "assets.json"
         settings.manifest_path.parent.mkdir(parents=True)
         settings.schedule_path = tmp_path / "state" / "schedule.json"
@@ -143,12 +145,16 @@ class TestDownloadRouting:
             return client.settings.videos_dir
         elif asset_type == "image":
             return client.settings.images_dir
+        elif asset_type == "composed":
+            return client.settings.composed_dir
         else:
             ext = Path(asset_name).suffix.lower()
             if ext in (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts"):
                 return client.settings.videos_dir
             elif ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
                 return client.settings.images_dir
+            elif ext in (".html", ".htm"):
+                return client.settings.composed_dir
             else:
                 return client.settings.videos_dir
 
@@ -196,6 +202,16 @@ class TestDownloadRouting:
         """WebP files should route to images/."""
         target = self._get_target_dir_for_asset_type(tmp_path, "", "photo.webp")
         assert target.name == "images"
+
+    def test_composed_asset_type_routes_to_composed(self, tmp_path):
+        """asset_type='composed' → composed/ directory."""
+        target = self._get_target_dir_for_asset_type(tmp_path, "composed", "composed-abc.html")
+        assert target.name == "composed"
+
+    def test_html_extension_routes_to_composed(self, tmp_path):
+        """HTML files (no asset_type) should route to composed/ via extension fallback."""
+        target = self._get_target_dir_for_asset_type(tmp_path, "", "page.html")
+        assert target.name == "composed"
 
 
 # ── CMS client: stream schedule evaluation ──────────────────────

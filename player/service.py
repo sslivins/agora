@@ -451,7 +451,7 @@ class AgoraPlayer:
     # ── Asset resolution ──
 
     def _resolve_asset(self, name: str) -> Optional[Path]:
-        for subdir in ["videos", "images", "splash"]:
+        for subdir in ["videos", "images", "splash", "composed"]:
             path = self.assets_dir / subdir / name
             if path.is_file():
                 return path
@@ -3337,6 +3337,7 @@ class AgoraPlayer:
             self.current_desired = desired
             self._health_retries = 0
             is_video = path.suffix.lower() == ".mp4"
+            is_composed = desired.asset_type == "composed"
             self._loops_completed = 0
 
             # Chromium backend (demo): route image/video through the shell.
@@ -3353,7 +3354,9 @@ class AgoraPlayer:
                     self._current_mtime = path.stat().st_mtime
                 except OSError:
                     self._current_mtime = None
-                if is_video:
+                if is_composed:
+                    self._chromium_player.show_html(path)
+                elif is_video:
                     # Finite-loop is owned by player.js: we hand it
                     # loop_count and the shell counts down, replays
                     # in-place, then emits a terminal "ended" we use
