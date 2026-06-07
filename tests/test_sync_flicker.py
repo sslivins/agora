@@ -115,26 +115,46 @@ class TestSyncDedup:
         assert state2.timestamp == ts1, "desired.json was rewritten for same schedule winner"
 
     @pytest.mark.asyncio
-    async def test_replaced_default_asset_triggers_rewrite(self, tmp_path):
-        """Same asset name but different checksum should rewrite desired.json."""
+    async def test_replaced_default_asset_plays_through_then_swaps(self, tmp_path):
+        """Replacing the bytes of the currently-displayed default asset must
+        NOT flicker to splash. The device plays the current version through
+        the background download and swaps once the new checksum lands.
+
+        (Previously this asserted an immediate splash rewrite; play-through-
+        update changed that — see tests/test_play_through_update.py.)"""
         client = self._make_client(tmp_path, assets=[("image.jpg", "aaa")])
 
         await client._handle_sync(
             self._sync_data(default_asset="image.jpg", default_asset_checksum="aaa")
         )
         state1 = read_state(client.settings.desired_state_path, DesiredState)
+        assert state1.mode == PlaybackMode.PLAY
         ts1 = state1.timestamp
 
-        # Same name, different checksum (asset was replaced on CMS)
+        # Same name, new checksum (asset replaced on CMS); new bytes not on
+        # disk yet. The old version is still on disk and on screen.
         await client._handle_sync(
             self._sync_data(default_asset="image.jpg", default_asset_checksum="bbb")
         )
         state2 = read_state(client.settings.desired_state_path, DesiredState)
-        assert state2.timestamp != ts1, "desired.json should be rewritten for changed checksum"
+        # No flicker — keep playing the old bytes, desired.json untouched.
+        assert state2.mode == PlaybackMode.PLAY
+        assert state2.asset == "image.jpg"
+        assert state2.timestamp == ts1, "must not flip to splash mid-download"
+
+        # Download completes — new checksum now on disk → swap.
+        client.asset_manager.register("image.jpg", "videos/image.jpg", 1024, "bbb")
+        data = json.loads(client.settings.schedule_path.read_text())
+        client._evaluate_schedule(data)
+        state3 = read_state(client.settings.desired_state_path, DesiredState)
+        assert state3.mode == PlaybackMode.PLAY
+        assert state3.expected_checksum == "bbb"
+        assert state3.timestamp != ts1, "should swap once new bytes land"
 
     @pytest.mark.asyncio
-    async def test_replaced_schedule_asset_triggers_rewrite(self, tmp_path):
-        """Same schedule asset name but different checksum should trigger rewrite."""
+    async def test_replaced_schedule_asset_plays_through_then_swaps(self, tmp_path):
+        """Replacing the bytes of the currently-displayed scheduled asset
+        must NOT flicker to splash; it plays through then swaps."""
         client = self._make_client(tmp_path, assets=[("video.mp4", "checksum_old")])
         schedules_v1 = [
             {
@@ -157,11 +177,24 @@ class TestSyncDedup:
 
         await client._handle_sync(self._sync_data(schedules=schedules_v1))
         state1 = read_state(client.settings.desired_state_path, DesiredState)
+        assert state1.mode == PlaybackMode.PLAY
         ts1 = state1.timestamp
 
+        # New checksum, bytes not on disk yet → play through, no splash.
         await client._handle_sync(self._sync_data(schedules=schedules_v2))
         state2 = read_state(client.settings.desired_state_path, DesiredState)
-        assert state2.timestamp != ts1, "desired.json should be rewritten for changed asset checksum"
+        assert state2.mode == PlaybackMode.PLAY
+        assert state2.asset == "video.mp4"
+        assert state2.timestamp == ts1, "must not flip to splash mid-download"
+
+        # New bytes land → swap.
+        client.asset_manager.register("video.mp4", "videos/video.mp4", 2048, "checksum_new")
+        data = json.loads(client.settings.schedule_path.read_text())
+        client._evaluate_schedule(data)
+        state3 = read_state(client.settings.desired_state_path, DesiredState)
+        assert state3.mode == PlaybackMode.PLAY
+        assert state3.expected_checksum == "checksum_new"
+        assert state3.timestamp != ts1, "should swap once new bytes land"
 
     @pytest.mark.asyncio
     async def test_eval_loop_no_rewrite(self, tmp_path):
