@@ -1162,6 +1162,35 @@ class TestAnchoredPlayback:
         # show_video must not have been used for an image slide.
         player._chromium_player.show_video.assert_not_called()
 
+    def test_chromium_anchored_composed_routes_to_show_html(self, mpv_player):
+        """A composed slideshow member must dispatch through
+        ``show_html`` (self-contained bundle in the shell iframe), not
+        ``show_image`` (which would render a broken-image icon) or
+        ``show_video``."""
+        player, svc = mpv_player
+        (player.assets_dir / "composed").mkdir()
+        (player.assets_dir / "composed" / "c.html").touch()
+        from datetime import datetime, timedelta, timezone
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=5)
+        self._write_anchored(player, "Show", [
+            {"name": "c.html", "asset_type": "composed", "duration_ms": 60_000,
+             "play_to_end": False},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/c.html"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_html.assert_called_once()
+        # Composed members are not images or videos.
+        player._chromium_player.show_image.assert_not_called()
+        player._chromium_player.show_video.assert_not_called()
+        # The bundle path on disk is what gets handed to show_html.
+        args, kwargs = player._chromium_player.show_html.call_args
+        passed = args[0] if args else kwargs.get("path")
+        assert str(passed).endswith("c.html")
+
     def test_chromium_play_to_end_overrun_keeps_kiosk_alive(self, mpv_player):
         """Regression: play_to_end overrun on the chromium backend used
         to call ``ChromiumPlayer.stop()`` (full kiosk + shell server

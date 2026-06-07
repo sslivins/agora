@@ -45,7 +45,16 @@ PROTOCOL_VERSION = 2
 # - "slideshow_v1": this firmware understands ``asset_type=slideshow``
 #   on FETCH_ASSET messages, fetches the manifest+slides, and stores
 #   them under ``assets/slideshows/<name>/``.
-DEVICE_CAPABILITIES = ["slideshow_v1", "composed_siblings_v1"]
+# - "composed_siblings_v1": this firmware fetches a composed-slide
+#   bundle plus its referenced ``siblings`` media and renders the
+#   bundle HTML via the chromium ``show_html`` path.
+# - "slideshow_composed_v1": this firmware accepts composed slides
+#   (``asset_type=composed``) as members *inside* a slideshow manifest
+#   — downloading each composed member's bundle + per-slide siblings,
+#   persisting them, and rendering the member via ``show_html`` in the
+#   slideshow loop. The CMS gates composed-bearing slideshows on this
+#   flag so pre-feature firmware never receives one.
+DEVICE_CAPABILITIES = ["slideshow_v1", "composed_siblings_v1", "slideshow_composed_v1"]
 
 # Bootstrap v2 renewal policy (issue #420 stage B.3).
 # Minimum delay between JWT refreshes on the renewal task, so a clock
@@ -2099,6 +2108,86 @@ class CMSClient:
                 }))
                 return
 
+        # Composed slide members (capability ``slideshow_composed_v1``) carry
+        # a ``siblings`` list of referenced media the bundle HTML loads from
+        # the local cache (e.g. ``/assets/videos/foo.mp4``). Normalize +
+        # validate them exactly like the standalone composed handler so the
+        # budget / eviction / download / sidecar logic below can treat a
+        # composed member uniformly.  Normalization mutates each slide's
+        # ``siblings`` in place to populate both ``name`` and ``asset_name``.
+        for i, slide in enumerate(slides):
+            if slide.get("asset_type") != "composed":
+                continue
+            sibs = slide.get("siblings") or []
+            if not isinstance(sibs, list):
+                logger.warning(
+                    "Slideshow %s: composed slide %d siblings not a list", asset_name, i,
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "invalid_composed_payload",
+                    "slide_position": i,
+                }))
+                return
+            for sib in sibs:
+                if isinstance(sib, dict):
+                    if "asset_name" not in sib and "name" in sib:
+                        sib["asset_name"] = sib["name"]
+                    elif "name" not in sib and "asset_name" in sib:
+                        sib["name"] = sib["asset_name"]
+            for j, sib in enumerate(sibs):
+                if not isinstance(sib, dict):
+                    logger.warning(
+                        "Slideshow %s: composed slide %d sibling[%d] not a dict",
+                        asset_name, i, j,
+                    )
+                    await ws.send(json.dumps({
+                        "type": "fetch_failed",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "device_id": self.device_id,
+                        "asset": asset_name,
+                        "reason": "invalid_sibling_descriptor",
+                        "slide_position": i,
+                        "sibling_position": j,
+                    }))
+                    return
+                sib_name = sib.get("asset_name")
+                sib_url = sib.get("download_url")
+                if not sib_name or not sib_url:
+                    logger.warning(
+                        "Slideshow %s: composed slide %d sibling[%d] missing "
+                        "name/download_url; keys=%r",
+                        asset_name, i, j, sorted(sib.keys()),
+                    )
+                    await ws.send(json.dumps({
+                        "type": "fetch_failed",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "device_id": self.device_id,
+                        "asset": asset_name,
+                        "reason": "invalid_sibling_descriptor",
+                        "slide_position": i,
+                        "sibling_position": j,
+                    }))
+                    return
+                if not self._is_safe_sibling_name(sib_name):
+                    logger.warning(
+                        "Slideshow %s: composed slide %d rejecting unsafe "
+                        "sibling name %r", asset_name, i, sib_name,
+                    )
+                    await ws.send(json.dumps({
+                        "type": "fetch_failed",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "device_id": self.device_id,
+                        "asset": asset_name,
+                        "reason": "invalid_sibling_name",
+                        "sibling_asset": sib_name,
+                    }))
+                    return
+            slide["siblings"] = sibs
+
         # Fast path: slideshow + every slide already cached with matching checksums.
         if self._has_complete_slideshow(asset_name, expected_checksum, slides):
             # Even on the fast path we may need to rewrite the manifest:
@@ -2156,16 +2245,49 @@ class CMSClient:
                 continue
             unique_missing[key] = slide
 
+        # Composed slide members reference sibling media (videos/images) the
+        # bundle HTML loads from the local cache. Dedup those across every
+        # composed slide by (name, checksum), skipping any already cached.
+        unique_missing_sibs: dict[tuple[str, str], dict] = {}
+        for slide in slides:
+            if slide.get("asset_type") != "composed":
+                continue
+            for sib in slide.get("siblings") or []:
+                sib_key = (sib["asset_name"], sib.get("checksum", ""))
+                if sib_key in unique_missing_sibs:
+                    continue
+                if self.asset_manager.has_asset(
+                    sib["asset_name"], sib.get("checksum") or None
+                ):
+                    continue
+                unique_missing_sibs[sib_key] = sib
+
         # Bulk eviction once for the sum of missing-slide bytes (the slideshow
-        # manifest itself is sub-1 KB JSON, ignored in budgeting).
-        if unique_missing:
-            total_bytes = sum(s.get("size_bytes", 0) for s in unique_missing.values())
+        # manifest itself is sub-1 KB JSON, ignored in budgeting). Composed
+        # sibling bytes are included so a composed-bearing slideshow is
+        # budgeted as a whole.
+        if unique_missing or unique_missing_sibs:
+            total_bytes = (
+                sum(s.get("size_bytes", 0) for s in unique_missing.values())
+                + sum(s.get("size_bytes", 0) for s in unique_missing_sibs.values())
+            )
             scheduled_assets = self._get_scheduled_asset_names()
             sync_data = self._read_schedule_cache()
             default_asset = sync_data.get("default_asset") if sync_data else None
-            # Slides we are about to download must also be protected during eviction
-            # so the loop doesn't evict siblings out from under us.
-            protected = scheduled_assets | {key[0] for key in unique_missing.keys()}
+            # Slides + composed siblings we are about to download must also be
+            # protected during eviction so the loop doesn't evict them out from
+            # under us.
+            sib_names = {
+                sib["asset_name"]
+                for slide in slides
+                if slide.get("asset_type") == "composed"
+                for sib in (slide.get("siblings") or [])
+            }
+            protected = (
+                scheduled_assets
+                | {key[0] for key in unique_missing.keys()}
+                | sib_names
+            )
 
             ok = self.asset_manager.evict_for(total_bytes, protected, default_asset)
             if not ok:
@@ -2182,6 +2304,30 @@ class CMSClient:
                     "budget_mb": self.asset_manager.budget_mb,
                     "available_mb": self.asset_manager.available_bytes // (1024 * 1024),
                     "required_mb": total_bytes // (1024 * 1024),
+                }))
+                return
+
+        # Download composed siblings first — a composed bundle is useless
+        # without the media it references.
+        for sib in unique_missing_sibs.values():
+            actual_sib = await self._download_one_asset(
+                sib["asset_name"],
+                sib.get("asset_type", "video"),
+                sib["download_url"],
+                sib.get("checksum", ""),
+            )
+            if actual_sib is None:
+                logger.error(
+                    "Slideshow %s: composed sibling %s download failed",
+                    asset_name, sib["asset_name"],
+                )
+                await ws.send(json.dumps({
+                    "type": "fetch_failed",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "device_id": self.device_id,
+                    "asset": asset_name,
+                    "reason": "sibling_download_failed",
+                    "sibling_asset": sib["asset_name"],
                 }))
                 return
 
@@ -2207,6 +2353,18 @@ class CMSClient:
                     "slide_asset": slide["asset_name"],
                 }))
                 return
+
+        # Composed slide members need a sidecar (so cold-start completeness +
+        # eviction-protection can reconstruct their sibling list) and an LRU
+        # touch on each sibling. Mirror the standalone composed handler.
+        for slide in slides:
+            if slide.get("asset_type") != "composed":
+                continue
+            sibs = slide.get("siblings") or []
+            self._write_composed_sidecar(
+                slide["asset_name"], slide.get("checksum", ""), sibs,
+            )
+            await self._touch_composed_siblings(slide["asset_name"], sibs)
 
         # All slides verified. Write the slideshow manifest with per-slide
         # checksums so the completeness check has all the data it needs.
@@ -2277,6 +2435,23 @@ class CMSClient:
                     "play_to_end": bool(s.get("play_to_end", False)),
                     "transition": s.get("transition", "cut"),
                     "transition_ms": int(s.get("transition_ms", 600)),
+                    # Composed members persist their sibling list so cold-start
+                    # completeness + eviction-protection survive a reboot.
+                    **(
+                        {
+                            "siblings": [
+                                {
+                                    "name": sib["asset_name"],
+                                    "asset_type": sib.get("asset_type", "video"),
+                                    "checksum": sib.get("checksum", ""),
+                                    "size_bytes": sib.get("size_bytes", 0),
+                                }
+                                for sib in (s.get("siblings") or [])
+                            ]
+                        }
+                        if s.get("asset_type") == "composed"
+                        else {}
+                    ),
                 }
                 for s in slides
             ],
@@ -2351,6 +2526,14 @@ class CMSClient:
                 return False
             if not self.asset_manager.has_asset(slide_name, slide_checksum):
                 return False
+            # Composed members additionally require their sidecar + every
+            # referenced sibling to be cached. Reuse the standalone composed
+            # completeness check, which reads the sidecar's own sibling list
+            # (persisted-shape ``name`` keys) so we don't depend on the
+            # in-message vs persisted descriptor shape here.
+            if slide.get("asset_type") == "composed":
+                if not self._has_complete_composed(slide_name, slide_checksum or ""):
+                    return False
         return True
 
     # ── Composed-slide sibling fetch (capability: composed_siblings_v1) ──

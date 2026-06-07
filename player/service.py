@@ -702,6 +702,7 @@ class AgoraPlayer:
 
         self._cancel_slide_timeout()
         is_video_slide = (slide.get("asset_type") == "video")
+        is_composed_slide = (slide.get("asset_type") == "composed")
         play_to_end = bool(slide.get("play_to_end")) and is_video_slide
 
         logger.info(
@@ -737,6 +738,15 @@ class AgoraPlayer:
                     transition=slide_transition,
                     transition_ms=slide_transition_ms,
                     start_offset_ms=start_offset_ms,
+                )
+            elif is_composed_slide:
+                # Composed members render as a self-contained HTML bundle
+                # in the shell iframe. The anchored resync tick (armed
+                # below) drives advance, same as images.
+                self._chromium_player.show_html(
+                    path,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
                 )
             elif is_video_slide:
                 self._chromium_player.show_video(
@@ -942,6 +952,7 @@ class AgoraPlayer:
 
         self._cancel_slide_timeout()
         is_video_slide = (slide.get("asset_type") == "video")
+        is_composed_slide = (slide.get("asset_type") == "composed")
         play_to_end = bool(slide.get("play_to_end")) and is_video_slide
 
         logger.info(
@@ -975,6 +986,14 @@ class AgoraPlayer:
                 # next-slide timeout drives advance.
                 self._chromium_player.show_video(
                     path, loop=True, muted=False,
+                    transition=slide_transition,
+                    duration_ms=slide_transition_ms,
+                )
+            elif is_composed_slide:
+                # Composed members render as a self-contained HTML bundle
+                # in the shell iframe; the next-slide timeout drives advance.
+                self._chromium_player.show_html(
+                    path,
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
                 )
