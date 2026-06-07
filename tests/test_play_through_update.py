@@ -42,7 +42,7 @@ def _make_client(tmp_path):
     return CMSClient(settings)
 
 
-def _schedule_sync(asset, checksum):
+def _schedule_sync(asset, checksum, asset_type="video"):
     """A sync payload with one always-active schedule for ``asset``."""
     return {
         "type": "sync",
@@ -55,7 +55,7 @@ def _schedule_sync(asset, checksum):
                 "priority": 1,
                 "asset": asset,
                 "asset_checksum": checksum,
-                "asset_type": "video",
+                "asset_type": asset_type,
                 "loop_count": None,
                 "start_time": "00:00:00",
                 "end_time": "23:59:59",
@@ -233,3 +233,141 @@ class TestDefaultPlayThroughUpdate:
         desired = _read_desired(client)
         assert desired.mode == PlaybackMode.SPLASH
         assert client._last_eval_state == ("waiting", "d.mp4", "B")
+
+
+# Composed slide bundles embed the content hash in the *filename*
+# (``composed-<uuid>-<hash>.html``), so every edit yields a brand-new
+# filename for the same logical slide. The play-through logic must match
+# on the logical id (filename minus the hash) rather than exact filename.
+_OLD_COMPOSED = "composed-83d695d2-1384-4e32-a898-0ed33233d439-601ed9272f72.html"
+_NEW_COMPOSED = "composed-83d695d2-1384-4e32-a898-0ed33233d439-23e37ab5afb8.html"
+_OTHER_COMPOSED = "composed-11111111-2222-3333-4444-555555555555-aaaaaaaaaaaa.html"
+
+
+class TestComposedPlayThroughUpdate:
+    def test_edit_currently_playing_composed_slide_does_not_splash(self, tmp_path):
+        client = _make_client(tmp_path)
+        client._request_asset_fetch = MagicMock()
+
+        # Device is showing the old composed bundle @ checksum A.
+        client.asset_manager.register(_OLD_COMPOSED, f"videos/{_OLD_COMPOSED}", 10, "A")
+        client._last_eval_state = ("play", _OLD_COMPOSED, "A", None, "composed", None)
+        client._displayed_asset = _OLD_COMPOSED
+        write_state(
+            client.settings.desired_state_path,
+            DesiredState(
+                mode=PlaybackMode.PLAY,
+                asset=_OLD_COMPOSED,
+                asset_type="composed",
+                loop=True,
+                expected_checksum="A",
+            ),
+        )
+
+        # Edit lands: NEW filename (new hash), checksum B, not on disk yet.
+        client._evaluate_schedule(
+            _schedule_sync(_NEW_COMPOSED, "B", asset_type="composed")
+        )
+
+        # Must keep playing the OLD bundle — no splash.
+        desired = _read_desired(client)
+        assert desired.mode == PlaybackMode.PLAY
+        assert desired.asset == _OLD_COMPOSED
+        # New bundle is requested.
+        client._request_asset_fetch.assert_called_with(_NEW_COMPOSED)
+        # Marker tracks the new (not-yet-on-disk) name.
+        assert client._last_eval_state == ("updating", _NEW_COMPOSED, "B")
+        # Still displaying the old bundle until the new one lands.
+        assert client._displayed_asset == _OLD_COMPOSED
+
+    def test_swaps_to_new_composed_bundle_once_download_completes(self, tmp_path):
+        client = _make_client(tmp_path)
+        client._request_asset_fetch = MagicMock()
+
+        client.asset_manager.register(_OLD_COMPOSED, f"videos/{_OLD_COMPOSED}", 10, "A")
+        client._last_eval_state = ("play", _OLD_COMPOSED, "A", None, "composed", None)
+        client._displayed_asset = _OLD_COMPOSED
+        write_state(
+            client.settings.desired_state_path,
+            DesiredState(
+                mode=PlaybackMode.PLAY,
+                asset=_OLD_COMPOSED,
+                asset_type="composed",
+                loop=True,
+                expected_checksum="A",
+            ),
+        )
+
+        # Edit → hold (no splash).
+        client._evaluate_schedule(
+            _schedule_sync(_NEW_COMPOSED, "B", asset_type="composed")
+        )
+        assert _read_desired(client).mode == PlaybackMode.PLAY
+        assert _read_desired(client).asset == _OLD_COMPOSED
+        assert client._last_eval_state == ("updating", _NEW_COMPOSED, "B")
+
+        # Download completes — new bundle on disk.
+        client.asset_manager.register(_NEW_COMPOSED, f"videos/{_NEW_COMPOSED}", 12, "B")
+        client._evaluate_schedule(
+            _schedule_sync(_NEW_COMPOSED, "B", asset_type="composed")
+        )
+
+        desired = _read_desired(client)
+        assert desired.mode == PlaybackMode.PLAY
+        assert desired.asset == _NEW_COMPOSED
+        assert desired.expected_checksum == "B"
+        assert client._last_eval_state[0] == "play"
+        assert client._last_eval_state[1] == _NEW_COMPOSED
+        # Tracking field advances to the now-on-screen bundle.
+        assert client._displayed_asset == _NEW_COMPOSED
+
+    def test_cold_composed_slide_still_splashes(self, tmp_path):
+        """First-ever composed slide (nothing on screen) → splash."""
+        client = _make_client(tmp_path)
+        client._request_asset_fetch = MagicMock()
+
+        client._evaluate_schedule(
+            _schedule_sync(_NEW_COMPOSED, "B", asset_type="composed")
+        )
+
+        desired = _read_desired(client)
+        assert desired.mode == PlaybackMode.SPLASH
+        client._request_asset_fetch.assert_called_with(_NEW_COMPOSED)
+        assert client._last_eval_state == ("waiting", _NEW_COMPOSED, "B")
+
+    def test_different_composed_slide_splashes(self, tmp_path):
+        """Switching to a *different* logical slide is a cold swap → splash."""
+        client = _make_client(tmp_path)
+        client._request_asset_fetch = MagicMock()
+
+        client.asset_manager.register(_OLD_COMPOSED, f"videos/{_OLD_COMPOSED}", 10, "A")
+        client._last_eval_state = ("play", _OLD_COMPOSED, "A", None, "composed", None)
+        client._displayed_asset = _OLD_COMPOSED
+        write_state(
+            client.settings.desired_state_path,
+            DesiredState(
+                mode=PlaybackMode.PLAY,
+                asset=_OLD_COMPOSED,
+                asset_type="composed",
+                loop=True,
+                expected_checksum="A",
+            ),
+        )
+
+        # A genuinely different composed slide (different uuid).
+        client._evaluate_schedule(
+            _schedule_sync(_OTHER_COMPOSED, "C", asset_type="composed")
+        )
+
+        desired = _read_desired(client)
+        assert desired.mode == PlaybackMode.SPLASH
+        assert client._last_eval_state == ("waiting", _OTHER_COMPOSED, "C")
+
+    def test_logical_asset_id_strips_composed_hash(self, tmp_path):
+        client = _make_client(tmp_path)
+        logical = "composed-83d695d2-1384-4e32-a898-0ed33233d439"
+        assert client._logical_asset_id(_OLD_COMPOSED) == logical
+        assert client._logical_asset_id(_NEW_COMPOSED) == logical
+        # Non-composed names are returned unchanged.
+        assert client._logical_asset_id("v.mp4") == "v.mp4"
+        assert client._logical_asset_id("image.png") == "image.png"

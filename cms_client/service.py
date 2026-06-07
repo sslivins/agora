@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -375,6 +376,15 @@ class CMSClient:
         self._current_schedule_id: str | None = None
         self._current_schedule_name: str | None = None
         self._current_asset: str | None = None
+        # Filename of the bundle actually on screen right now. Tracked
+        # separately from ``_last_eval_state`` because, during a hot edit,
+        # ``_last_eval_state`` advances to ("updating", <new-name>, ...)
+        # while the *old* bundle keeps playing through the background
+        # download. Composed slides embed their content hash in the
+        # filename, so an edit yields a brand-new filename — this field
+        # holds the on-screen name so play-through stays stable across the
+        # intermediate "updating" evals.
+        self._displayed_asset: str | None = None
         self._eval_wake = asyncio.Event()      # triggers immediate schedule re-eval
         self._last_player_mode: str | None = None
         # In-flight asset fetch tasks, keyed by asset_name. Fetch handlers run
@@ -1141,6 +1151,67 @@ class CMSClient:
             return False
         return st[0] in ("play", "default", "updating") and st[1] == asset
 
+    # Composed slide bundles are named ``composed-<uuid>-<hash>.html`` where
+    # <hash> is a content digest that changes on every edit. Matching the
+    # leading ``composed-<uuid>`` lets us recognise an edit as the *same
+    # logical slide* even though the filename changed.
+    _COMPOSED_BUNDLE_RE = re.compile(
+        r"^(composed-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})-[0-9a-fA-F]+\.html$"
+    )
+
+    def _logical_asset_id(self, asset: str) -> str:
+        """Stable identity for an asset across edits.
+
+        For composed slides, strips the trailing ``-<hash>.html`` so every
+        edit of the same slide maps to one id. For every other asset type
+        the filename is already stable across edits, so it's returned
+        unchanged.
+        """
+        m = self._COMPOSED_BUNDLE_RE.match(asset)
+        if m:
+            return m.group(1)
+        return asset
+
+    def _displayed_asset_name(self) -> str | None:
+        """Filename of the bundle currently on screen, or ``None``.
+
+        Prefers the explicit ``_displayed_asset`` tracking field (stable
+        across the 'updating' evals while a hot edit downloads), falling
+        back to ``_last_eval_state`` for paths that haven't recorded it.
+        """
+        displayed = getattr(self, "_displayed_asset", None)
+        if displayed is not None:
+            return displayed
+        st = self._last_eval_state
+        if (
+            isinstance(st, tuple)
+            and len(st) >= 2
+            and st[0] in ("play", "default", "updating")
+            and isinstance(st[1], str)
+        ):
+            return st[1]
+        return None
+
+    def _can_play_through_update(self, new_asset: str) -> bool:
+        """True if a hot edit can keep playing the current bytes while the
+        new bundle downloads in the background.
+
+        Handles two edit shapes:
+          * stable-filename assets (image/video): same filename, new
+            checksum.
+          * composed slides: a new filename for the same logical slide.
+
+        In both cases a prior version of the on-screen bundle must still be
+        on disk to keep showing it.
+        """
+        displayed = self._displayed_asset_name()
+        if not displayed:
+            return False
+        if self._logical_asset_id(displayed) != self._logical_asset_id(new_asset):
+            return False
+        return self.asset_manager.has_asset(displayed)
+
     def _evaluate_schedule(self, sync_data: dict) -> None:
         """Evaluate the cached schedule and update desired state."""
         schedules = sync_data.get("schedules", [])
@@ -1350,7 +1421,7 @@ class CMSClient:
                 # showing, keep playing it (leave desired.json untouched)
                 # while the new bundle downloads, then swap once it lands.
                 # Only a genuinely cold show splashes while fetching.
-                if self.asset_manager.has_asset(asset) and self._is_displaying_asset(asset):
+                if self._can_play_through_update(asset):
                     if self._last_eval_state != ("updating", asset, checksum):
                         logger.info(
                             "Schedule: asset %s edited, playing current "
@@ -1395,6 +1466,7 @@ class CMSClient:
             self._current_schedule_id = new_schedule_id
             self._current_schedule_name = new_schedule_name
             self._current_asset = asset
+            self._displayed_asset = asset
             if new_schedule_id:
                 self._send_playback_event(
                     "playback_started", new_schedule_id, new_schedule_name, asset,
@@ -1408,7 +1480,7 @@ class CMSClient:
                 self._request_asset_fetch(default_asset)
                 # Play-through-update (see scheduled branch above): keep
                 # showing the current default while its new bytes download.
-                if self.asset_manager.has_asset(default_asset) and self._is_displaying_asset(default_asset):
+                if self._can_play_through_update(default_asset):
                     if self._last_eval_state != ("updating", default_asset, default_checksum):
                         logger.info(
                             "Schedule: default asset %s edited, playing "
@@ -1450,6 +1522,7 @@ class CMSClient:
             write_state(self.settings.desired_state_path, desired)
             self.asset_manager.touch(default_asset)
             self._last_eval_state = state_key
+            self._displayed_asset = default_asset
             logger.info(
                 "Schedule: playing default asset %s%s",
                 default_asset,
@@ -1466,6 +1539,7 @@ class CMSClient:
             desired = DesiredState(mode=PlaybackMode.SPLASH)
             write_state(self.settings.desired_state_path, desired)
             self._last_eval_state = state_key
+            self._displayed_asset = None
             logger.info("Schedule: no active schedule, showing splash")
 
     def _end_current_playback(self) -> None:
