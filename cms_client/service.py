@@ -1127,6 +1127,20 @@ class CMSClient:
         except Exception:
             logger.debug("Failed to update splash config", exc_info=True)
 
+    def _is_displaying_asset(self, asset: str) -> bool:
+        """True if ``asset`` is what the device is currently showing.
+
+        Used to distinguish a *hot edit* of on-screen content (keep
+        playing the cached bytes while the new bundle downloads in the
+        background) from a *cold show* (splash while fetching). Inspects
+        ``_last_eval_state`` rather than ``_current_asset`` because the
+        default-asset PLAY path never sets ``_current_asset``.
+        """
+        st = self._last_eval_state
+        if not isinstance(st, tuple) or len(st) < 2:
+            return False
+        return st[0] in ("play", "default", "updating") and st[1] == asset
+
     def _evaluate_schedule(self, sync_data: dict) -> None:
         """Evaluate the cached schedule and update desired state."""
         schedules = sync_data.get("schedules", [])
@@ -1328,11 +1342,26 @@ class CMSClient:
                 return
 
             if not self.asset_manager.has_asset(asset, checksum):
-                # Asset not on device yet — request fetch and show splash
+                # New bytes for this asset aren't on disk yet — request
+                # them in the background.
+                self._request_asset_fetch(asset)
+                # Play-through-update: if a prior version of this same
+                # asset is already on disk AND it's what we're currently
+                # showing, keep playing it (leave desired.json untouched)
+                # while the new bundle downloads, then swap once it lands.
+                # Only a genuinely cold show splashes while fetching.
+                if self.asset_manager.has_asset(asset) and self._is_displaying_asset(asset):
+                    if self._last_eval_state != ("updating", asset, checksum):
+                        logger.info(
+                            "Schedule: asset %s edited, playing current "
+                            "version through background download of new bundle",
+                            asset,
+                        )
+                        self._last_eval_state = ("updating", asset, checksum)
+                    return
                 logger.info(
                     "Schedule: asset %s not on device, requesting fetch", asset,
                 )
-                self._request_asset_fetch(asset)
                 # Don't cache — retry on next eval when asset may have arrived
                 if self._last_eval_state != ("waiting", asset, checksum):
                     desired = DesiredState(mode=PlaybackMode.SPLASH)
@@ -1376,11 +1405,22 @@ class CMSClient:
             default_checksum = sync_data.get("default_asset_checksum")
 
             if not self.asset_manager.has_asset(default_asset, default_checksum):
+                self._request_asset_fetch(default_asset)
+                # Play-through-update (see scheduled branch above): keep
+                # showing the current default while its new bytes download.
+                if self.asset_manager.has_asset(default_asset) and self._is_displaying_asset(default_asset):
+                    if self._last_eval_state != ("updating", default_asset, default_checksum):
+                        logger.info(
+                            "Schedule: default asset %s edited, playing "
+                            "current version through background download",
+                            default_asset,
+                        )
+                        self._last_eval_state = ("updating", default_asset, default_checksum)
+                    return
                 logger.info(
                     "Schedule: default asset %s not on device, requesting fetch",
                     default_asset,
                 )
-                self._request_asset_fetch(default_asset)
                 if self._last_eval_state != ("waiting", default_asset, default_checksum):
                     desired = DesiredState(mode=PlaybackMode.SPLASH)
                     write_state(self.settings.desired_state_path, desired)
@@ -1831,6 +1871,11 @@ class CMSClient:
             desired.timestamp = datetime.now(timezone.utc)
             write_state(self.settings.desired_state_path, desired)
 
+        # New bytes are on disk — wake the eval loop so a pending
+        # play-through-update swap (or first show) fires promptly
+        # instead of waiting up to EVAL_INTERVAL seconds.
+        self._eval_wake.set()
+
         ack = {
             "type": "asset_ack",
             "protocol_version": PROTOCOL_VERSION,
@@ -2107,6 +2152,10 @@ class CMSClient:
             logger.info("Re-applying desired state for just-downloaded slideshow: %s", asset_name)
             desired.timestamp = datetime.now(timezone.utc)
             write_state(self.settings.desired_state_path, desired)
+
+        # Wake the eval loop so a pending play-through-update swap fires
+        # promptly now that the new slideshow manifest is on disk.
+        self._eval_wake.set()
 
         logger.info(
             "Slideshow fetched: %s (%d slides, %d unique downloads)",
@@ -2482,6 +2531,10 @@ class CMSClient:
             )
             desired.timestamp = datetime.now(timezone.utc)
             write_state(self.settings.desired_state_path, desired)
+
+        # Wake the eval loop so a pending play-through-update swap fires
+        # promptly now that the new composed bundle is on disk.
+        self._eval_wake.set()
 
         logger.info(
             "Composed fetched: %s (%d siblings, %d unique downloads)",
