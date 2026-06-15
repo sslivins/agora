@@ -262,17 +262,36 @@ class ChromiumPlayer:
         path: Path,
         transition: str = "cut",
         duration_ms: int = DEFAULT_TRANSITION_MS,
+        fit: Optional[str] = None,
+        effect: Optional[str] = None,
+        effect_duration_ms: Optional[int] = None,
     ) -> None:
         url = self._asset_url(path)
         if url is None:
             logger.warning("ChromiumPlayer.show_image: not under assets dir: %s", path)
             return
-        self._enqueue({
+        payload: dict = {
             "cmd": "show_image",
             "url": url,
             "transition": transition,
             "duration_ms": duration_ms,
-        })
+        }
+        # Per-slide object-fit (cover|contain) from the slideshow builder.
+        # Emit whenever provided — the shell's legacy default is
+        # object-fit:contain, so even "contain" must be sent to be explicit
+        # and "cover" must be sent to override. Omit when None so older
+        # callers stay byte-for-byte backward-compatible.
+        if fit:
+            payload["fit"] = fit
+        # Ken Burns slow-pan/zoom. Only emit a real effect (skip "none")
+        # so the default render path is unchanged. effect_duration_ms is
+        # the slide's on-screen dwell so the animation spans the slide;
+        # the shell falls back to a sane default when it's absent/zero.
+        if effect and effect != "none":
+            payload["effect"] = effect
+            if effect_duration_ms and int(effect_duration_ms) > 0:
+                payload["effect_duration_ms"] = int(effect_duration_ms)
+        self._enqueue(payload)
 
     def show_video(
         self,
@@ -283,6 +302,7 @@ class ChromiumPlayer:
         duration_ms: int = DEFAULT_TRANSITION_MS,
         loop_count: Optional[int] = None,
         start_offset_ms: int = 0,
+        fit: Optional[str] = None,
     ) -> None:
         url = self._asset_url(path)
         if url is None:
@@ -296,6 +316,9 @@ class ChromiumPlayer:
             "transition": transition,
             "duration_ms": duration_ms,
         }
+        # Per-slide object-fit (cover|contain). No Ken Burns on video.
+        if fit:
+            payload["fit"] = fit
         # loop_count drives finite-loop playback in player.js: the shell
         # counts down on each video.ended, replays in-place (no layer
         # swap, no fade hiccup) until the count is exhausted, then emits

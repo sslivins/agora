@@ -130,6 +130,80 @@ def test_show_video_defaults_to_cut_transition(cp):
     assert sent[0]["transition"] == "cut"
 
 
+# ── Per-slide fit / Ken Burns effect (manifest schema 1.3) ──────────
+#
+# CMS emits per-slide ``fit`` (cover|contain) and ``effect``
+# (none|ken_burns) on slideshow image members. These must be wired
+# through to the shell as OPT-IN fields so old manifests / callers that
+# don't pass them keep producing the exact legacy command shape.
+
+
+def _make_img(cp):
+    img = cp.assets_dir / "images" / "foo.jpg"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    img.write_bytes(b"\xff\xd8\xff")
+    return img
+
+
+def test_show_image_without_fit_effect_is_backward_compatible(cp):
+    """No fit/effect args -> the original 4-key command, unchanged."""
+    sent = _capture_commands(cp)
+    cp.show_image(_make_img(cp), transition="fade", duration_ms=800)
+    assert sent == [{
+        "cmd": "show_image",
+        "url": "/assets/images/foo.jpg",
+        "transition": "fade",
+        "duration_ms": 800,
+    }]
+
+
+def test_show_image_includes_fit_when_provided(cp):
+    sent = _capture_commands(cp)
+    cp.show_image(_make_img(cp), fit="cover")
+    assert sent[0]["fit"] == "cover"
+    # effect not requested -> absent.
+    assert "effect" not in sent[0]
+    assert "effect_duration_ms" not in sent[0]
+
+
+def test_show_image_includes_effect_and_duration(cp):
+    sent = _capture_commands(cp)
+    cp.show_image(
+        _make_img(cp), fit="contain",
+        effect="ken_burns", effect_duration_ms=8000,
+    )
+    assert sent[0]["fit"] == "contain"
+    assert sent[0]["effect"] == "ken_burns"
+    assert sent[0]["effect_duration_ms"] == 8000
+
+
+def test_show_image_effect_none_is_omitted(cp):
+    """effect='none' is the default -> don't pollute the payload."""
+    sent = _capture_commands(cp)
+    cp.show_image(_make_img(cp), effect="none", effect_duration_ms=5000)
+    assert "effect" not in sent[0]
+    assert "effect_duration_ms" not in sent[0]
+
+
+def test_show_video_includes_fit_when_provided(cp):
+    """fit applies to video too (cover/contain object-fit)."""
+    sent = _capture_commands(cp)
+    vid = cp.assets_dir / "videos" / "clip.mp4"
+    vid.parent.mkdir(parents=True)
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    cp.show_video(vid, fit="cover")
+    assert sent[0]["fit"] == "cover"
+
+
+def test_show_video_without_fit_omits_field(cp):
+    sent = _capture_commands(cp)
+    vid = cp.assets_dir / "videos" / "clip.mp4"
+    vid.parent.mkdir(parents=True)
+    vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    cp.show_video(vid)
+    assert "fit" not in sent[0]
+
+
 def test_show_video_with_loop_count_includes_field(cp):
     sent = _capture_commands(cp)
     vid = cp.assets_dir / "videos" / "clip.mp4"
