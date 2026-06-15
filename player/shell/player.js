@@ -6,9 +6,11 @@
  *
  * Protocol (server -> client):
  *   {"cmd":"show_image","url":"/assets/images/foo.jpg",
- *    "transition":"<mode>","duration_ms":600}
+ *    "transition":"<mode>","duration_ms":600,
+ *    "fit":"cover","effect":"ken_burns","effect_duration_ms":8000}
  *   {"cmd":"show_video","url":"/assets/videos/bar.mp4",
- *    "loop":true,"muted":false,"transition":"<mode>","duration_ms":600}
+ *    "loop":true,"muted":false,"transition":"<mode>","duration_ms":600,
+ *    "fit":"cover"}
  *   {"cmd":"show_video","url":"/assets/videos/bar.mp4",
  *    "loop":false,"loop_count":3,"muted":false,"transition":"<mode>",
  *    "duration_ms":600}
@@ -28,6 +30,16 @@
  * and then emits {event:"ended", asset, completed_loops:N}. When absent
  * or 0, the cmd.loop field is honored as-is (HTML <video loop>).
  *
+ * fit (slideshow per-slide, images + videos): "cover" | "contain".
+ * Applied as CSS object-fit on the media element, overriding the shell's
+ * default of object-fit: contain. Unknown values are ignored.
+ *
+ * effect (slideshow per-slide, images only): "ken_burns" applies a slow
+ * scale/pan animation (see .fx-ken-burns in player.css) to the <img>.
+ * effect_duration_ms sets the animation length (--fx-duration-ms),
+ * falling back to 8000ms when absent or non-positive. Videos never get
+ * the effect.
+ *
  * Client -> server (informational):
  *   {"event":"ready"}                          (on initial connect)
  *   {"event":"ended","asset":"<url>"}           (single-play video ended)
@@ -43,6 +55,18 @@
     document.getElementById("layer-b"),
   ];
   let activeIdx = 0; // which layer is currently visible
+
+  // Per-slide object-fit allow-list. The CMS slideshow builder emits a
+  // ``fit`` field (cover|contain) per slide in manifest schema 1.3; the
+  // shell applies it as CSS object-fit on the image/video element. Only
+  // these two values are honored so a malformed manifest can't inject
+  // arbitrary CSS. The shell's legacy default is ``object-fit: contain``
+  // (player.css), so "cover" must be applied explicitly to override it.
+  const KNOWN_FITS = ["cover", "contain"];
+
+  // Default Ken Burns animation length when the command omits (or sends a
+  // non-positive) effect_duration_ms. Matches the slide's typical dwell.
+  const KEN_BURNS_DEFAULT_MS = 8000;
 
   let ws = null;
   let reconnectTimer = null;
@@ -121,6 +145,11 @@
           } catch (_) { /* ignore -- play from start */ }
         }, { once: true });
       }
+      // Per-slide object-fit override (slideshow schema 1.3). Videos
+      // honor cover/contain but never the Ken Burns effect.
+      if (KNOWN_FITS.indexOf(cmd.fit) !== -1) {
+        v.style.objectFit = cmd.fit;
+      }
       return v;
     }
     if (cmd.cmd === "show_html") {
@@ -143,6 +172,22 @@
     img.addEventListener("error", () => {
       send({ event: "error", asset: cmd.url, msg: "image load failed" });
     });
+    // Per-slide object-fit override (slideshow schema 1.3).
+    if (KNOWN_FITS.indexOf(cmd.fit) !== -1) {
+      img.style.objectFit = cmd.fit;
+    }
+    // Ken Burns: a slow scale/pan applied to the <img> itself (not the
+    // layer, which is reserved for push/zoom/dissolve transitions). The
+    // keyframes in player.css read --fx-duration-ms for the animation
+    // length; we plumb the slide dwell here, falling back to a sane
+    // default when the command omits or sends a non-positive value.
+    if (cmd.effect === "ken_burns") {
+      const durMs = Number.isFinite(cmd.effect_duration_ms)
+        && cmd.effect_duration_ms > 0
+        ? cmd.effect_duration_ms : KEN_BURNS_DEFAULT_MS;
+      img.style.setProperty("--fx-duration-ms", durMs + "ms");
+      img.classList.add("fx-ken-burns");
+    }
     return img;
   }
 
@@ -325,7 +370,7 @@
       // Inherit the same fit/sizing as <img>/<video> in player.css.
       canvas.style.width = "100%";
       canvas.style.height = "100%";
-      canvas.style.objectFit = "contain";
+      canvas.style.objectFit = v.style.objectFit || "contain";
       canvas.style.background = "#000";
       try { v.pause(); v.removeAttribute("src"); v.load(); } catch (_) {}
       layer.replaceChild(canvas, v);

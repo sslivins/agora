@@ -728,6 +728,8 @@ class AgoraPlayer:
             # the browser snaps to the nearest decodable frame. Only
             # meaningful for videos; images ignore the field.
             slide_duration_ms = int(slide.get("duration_ms") or 0)
+            slide_fit = slide.get("fit") or None
+            slide_effect = slide.get("effect") or None
             start_offset_ms = (
                 max(0, slide_duration_ms - remaining_ms)
                 if is_video_slide and slide_duration_ms > 0 else 0
@@ -754,12 +756,16 @@ class AgoraPlayer:
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
                     start_offset_ms=start_offset_ms,
+                    fit=slide_fit,
                 )
             else:
                 self._chromium_player.show_image(
                     path,
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
+                    fit=slide_fit,
+                    effect=slide_effect,
+                    effect_duration_ms=slide_duration_ms or None,
                 )
             self._update_current(
                 mode=PlaybackMode.PLAY,
@@ -974,6 +980,12 @@ class AgoraPlayer:
             # slide's on-screen duration (that's duration_ms below).
             slide_transition = slide.get("transition") or "cut"
             slide_transition_ms = int(slide.get("transition_ms") or 600)
+            slide_fit = slide.get("fit") or None
+            slide_effect = slide.get("effect") or None
+            # On-screen dwell for this slide (drives the next-slide
+            # timeout below AND the Ken Burns animation length). Computed
+            # up-front so it can be passed to show_image as effect_duration_ms.
+            slide_dwell_ms = int(slide.get("duration_ms") or 0)
             if is_video_slide and play_to_end:
                 self._play_slide_to_end_chromium(
                     slide, slide_name, path, ss,
@@ -988,6 +1000,7 @@ class AgoraPlayer:
                     path, loop=True, muted=False,
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
+                    fit=slide_fit,
                 )
             elif is_composed_slide:
                 # Composed members render as a self-contained HTML bundle
@@ -1002,8 +1015,11 @@ class AgoraPlayer:
                     path,
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
+                    fit=slide_fit,
+                    effect=slide_effect,
+                    effect_duration_ms=slide_dwell_ms or None,
                 )
-            duration_ms = int(slide.get("duration_ms") or 0)
+            duration_ms = slide_dwell_ms
             if duration_ms <= 0:
                 duration_ms = 10000
             ss["timeout_id"] = GLib.timeout_add(
@@ -1148,6 +1164,7 @@ class AgoraPlayer:
                 path, loop=True, muted=False,
                 transition=transition, duration_ms=transition_ms,
                 start_offset_ms=start_offset_ms,
+                fit=slide.get("fit") or None,
             )
             duration_ms = int(slide.get("duration_ms") or 0)
             if duration_ms <= 0:
@@ -1166,6 +1183,7 @@ class AgoraPlayer:
             path, loop=False, muted=False,
             transition=transition, duration_ms=transition_ms,
             start_offset_ms=start_offset_ms,
+            fit=slide.get("fit") or None,
         )
 
         # Watchdog: 2× hinted duration with a 60s floor, capped at the

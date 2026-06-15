@@ -116,3 +116,19 @@ html, body {
 /* fade_black is sequenced JS-side (two half-duration fades through the
  * black stage background) — no extra CSS needed here. */
 
+/* Ken Burns (slideshow per-slide effect, images only). Applied to the
+ * <img> element itself rather than .layer, because .layer's transform is
+ * reserved for the push/zoom/dissolve transitions above — animating both
+ * on the same element would conflict. player.js sets --fx-duration-ms
+ * from the command's effect_duration_ms (default 8000ms). */
+@keyframes fx-ken-burns {
+  from { transform: scale(1) translate(0, 0); }
+  to   { transform: scale(1.12) translate(-2%, -2%); }
+}
+.layer img.fx-ken-burns {
+  animation: fx-ken-burns var(--fx-duration-ms, 8000ms) ease-out both;
+  transform-origin: center center;
+  will-change: transform;
+}
+
+

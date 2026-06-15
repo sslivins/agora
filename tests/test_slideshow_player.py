@@ -1191,6 +1191,52 @@ class TestAnchoredPlayback:
         passed = args[0] if args else kwargs.get("path")
         assert str(passed).endswith("c.html")
 
+    def test_chromium_anchored_image_passes_fit_and_effect(self, mpv_player):
+        """Per-slide fit + Ken Burns effect (manifest schema 1.3) are
+        forwarded to ``show_image`` so the shell can render object-fit
+        and the Ken Burns animation. effect_duration_ms is the slide's
+        on-screen dwell so the animation spans the whole slide."""
+        player, svc = mpv_player
+        (player.assets_dir / "images" / "a.png").touch()
+        from datetime import datetime, timedelta, timezone
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=5)
+        self._write_anchored(player, "Show", [
+            {"name": "a.png", "asset_type": "image", "duration_ms": 8_000,
+             "play_to_end": False, "fit": "contain", "effect": "ken_burns"},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/a.png"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_image.assert_called_once()
+        kwargs = player._chromium_player.show_image.call_args.kwargs
+        assert kwargs["fit"] == "contain"
+        assert kwargs["effect"] == "ken_burns"
+        assert kwargs["effect_duration_ms"] == 8_000
+
+    def test_chromium_anchored_video_passes_fit(self, mpv_player):
+        """A per-slide ``fit`` on a video member reaches ``show_video``."""
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        from datetime import datetime, timedelta, timezone
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=2)
+        self._write_anchored(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video", "duration_ms": 60_000,
+             "play_to_end": False, "fit": "cover"},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/v.mp4"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_video.assert_called_once()
+        kwargs = player._chromium_player.show_video.call_args.kwargs
+        assert kwargs["fit"] == "cover"
+
+
     def test_chromium_play_to_end_overrun_keeps_kiosk_alive(self, mpv_player):
         """Regression: play_to_end overrun on the chromium backend used
         to call ``ChromiumPlayer.stop()`` (full kiosk + shell server
