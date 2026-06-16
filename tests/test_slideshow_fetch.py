@@ -294,6 +294,66 @@ class TestSlideshowFetch:
         assert manifest["slides"][0]["transition_ms"] == 850
 
     @pytest.mark.asyncio
+    async def test_fit_effect_fields_propagated_from_wire(self, cms_client):
+        """Ken Burns regression: when CMS provides per-slide ``fit``/
+        ``effect`` (manifest schema 1.3), they must be persisted verbatim
+        into the on-disk manifest. The player reads them from there and
+        forwards them to the chromium shell; dropping them here silently
+        disables the Ken Burns effect on the device.
+        """
+        b1 = b"slide-bytes"
+        slide = _make_slide("a.png", b1, asset_type="image", duration_ms=8000)
+        slide["fit"] = "cover"
+        slide["effect"] = "ken_burns"
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "KenBurns.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "manifest_schema_version": "1.3",
+            "slides": [slide],
+        }
+        mapping = {slide["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest_path = cms_client.settings.slideshows_dir / "KenBurns.slideshow.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["slides"][0]["fit"] == "cover"
+        assert manifest["slides"][0]["effect"] == "ken_burns"
+
+    @pytest.mark.asyncio
+    async def test_fit_effect_default_when_absent(self, cms_client):
+        """Older CMS (pre-1.3) omits ``fit``/``effect``. Persist ``null``
+        so the player's ``slide.get(...) or None`` reads a no-op,
+        preserving the legacy object-fit: contain / no-effect behavior.
+        """
+        b1 = b"sb"
+        slides = [_make_slide("a.png", b1, asset_type="image", duration_ms=5000)]
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "NoFx.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "slides": slides,
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest = json.loads(
+            (cms_client.settings.slideshows_dir / "NoFx.slideshow.json").read_text()
+        )
+        assert manifest["slides"][0]["fit"] is None
+        assert manifest["slides"][0]["effect"] is None
+
+    @pytest.mark.asyncio
     async def test_wall_clock_fields_absent_persist_as_none(self, cms_client):
         """agora#226 Phase 1b: older CMS (or non-slideshow paths) won't
         emit ``cycle_duration_ms``/``started_at``.  Persist as ``null``
