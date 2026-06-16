@@ -2435,6 +2435,13 @@ class CMSClient:
                     "play_to_end": bool(s.get("play_to_end", False)),
                     "transition": s.get("transition", "cut"),
                     "transition_ms": int(s.get("transition_ms", 600)),
+                    # Per-slide motion/scaling (manifest schema 1.3+). The
+                    # player forwards these to the chromium shell to drive
+                    # object-fit + the Ken Burns effect. Persist verbatim;
+                    # default to None so legacy (pre-1.3) manifests read as
+                    # a no-op (contain / no effect) rather than a missing key.
+                    "fit": s.get("fit"),
+                    "effect": s.get("effect"),
                     # Composed members persist their sibling list so cold-start
                     # completeness + eviction-protection survive a reboot.
                     **(
