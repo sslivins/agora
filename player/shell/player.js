@@ -146,7 +146,9 @@
         }, { once: true });
       }
       // Per-slide object-fit override (slideshow schema 1.3). Videos
-      // honor cover/contain but never the Ken Burns effect.
+      // honor cover/contain but never the Ken Burns effect. "contain_blur"
+      // is not in KNOWN_FITS, so video falls through to the default
+      // object-fit:contain (no blurred backdrop for video in v1).
       if (KNOWN_FITS.indexOf(cmd.fit) !== -1) {
         v.style.objectFit = cmd.fit;
       }
@@ -187,6 +189,28 @@
         ? cmd.effect_duration_ms : KEN_BURNS_DEFAULT_MS;
       img.style.setProperty("--fx-duration-ms", durMs + "ms");
       img.classList.add("fx-ken-burns");
+    }
+    // Blur-fill backdrop (slideshow roadmap, agora#261). When fit is
+    // "contain_blur" the image renders contained over a blurred, zoomed
+    // cover copy of itself, so letterbox bars are filled with the image's
+    // own colours instead of black. The foreground <img> built above (and
+    // any Ken Burns animation it carries) becomes .fit-blur-fg; a sibling
+    // backdrop <img> sits behind it inside a wrapper. "contain_blur" is
+    // deliberately NOT in KNOWN_FITS — the styling is driven by CSS classes,
+    // not a direct object-fit assignment. Pre-blur shells never see this
+    // branch and fall through to plain contain (graceful). Video never uses
+    // this path (no blurred backdrop for video in v1).
+    if (cmd.fit === "contain_blur") {
+      img.classList.add("fit-blur-fg");
+      const wrap = document.createElement("div");
+      wrap.className = "fit-blur-wrap";
+      const backdrop = document.createElement("img");
+      backdrop.src = cmd.url;
+      backdrop.className = "fit-blur-backdrop";
+      backdrop.setAttribute("aria-hidden", "true");
+      wrap.appendChild(backdrop);
+      wrap.appendChild(img);
+      return wrap;
     }
     return img;
   }

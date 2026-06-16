@@ -73,6 +73,39 @@ def test_player_css_ken_burns_uses_duration_variable():
     assert "--fx-duration-ms" in css
 
 
+# ── blur-fill backdrop (contain_blur) ───────────────────────────────
+
+def test_player_js_handles_contain_blur_fit():
+    js = _js()
+    # The contain_blur branch builds a wrapper + backdrop instead of a
+    # bare object-fit assignment.
+    assert "contain_blur" in js
+    assert "fit-blur-wrap" in js
+    assert "fit-blur-backdrop" in js
+    assert "fit-blur-fg" in js
+
+
+def test_player_js_contain_blur_not_in_known_fits():
+    js = _js()
+    # contain_blur must NOT be allow-listed in KNOWN_FITS: it is styled
+    # via CSS classes, not a direct object-fit value (which would be an
+    # invalid CSS keyword).
+    start = js.index("KNOWN_FITS")
+    snippet = js[start:start + 120]
+    assert "contain_blur" not in snippet
+
+
+def test_player_css_defines_blur_fill_rules():
+    css = _css()
+    assert ".fit-blur-wrap" in css
+    # Two-class selectors so they outrank the base ".layer img" object-fit.
+    assert "img.fit-blur-backdrop" in css
+    assert "img.fit-blur-fg" in css
+    # Backdrop is a blurred cover copy.
+    assert "blur(" in css
+    assert "object-fit: cover" in css
+
+
 # ── protocol doc ────────────────────────────────────────────────────
 
 def test_player_js_header_documents_fit_and_effect():
