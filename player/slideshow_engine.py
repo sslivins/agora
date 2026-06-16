@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -41,7 +42,7 @@ from typing import Optional
 #: with a higher version are still played back (best-effort) but log a
 #: one-shot "CMS is ahead of this player" INFO message.  Older versions
 #: are accepted unconditionally.
-PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.1"
+PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.4"
 
 
 def parse_schema_version(version: str) -> tuple[int, int]:
@@ -152,7 +153,63 @@ def locate_slide_at(
     return (len(slides) - 1, max(durations[-1], 1))
 
 
-# ── Manifest reading (agora#226 Phase 4 PR-2) ──
+# ── Deck shuffle (agora#261, manifest schema 1.4) ──
+
+
+def cycle_index_at(elapsed_ms: int, cycle_duration_ms: int) -> int:
+    """Return the 0-based cycle ordinal for ``elapsed_ms`` into playback.
+
+    ``elapsed_ms`` is ``now - anchor`` in milliseconds (may be negative
+    under small clock skew within tolerance). Cycle 0 is the first pass
+    through the deck, cycle 1 the second, etc. Floor division matches
+    :func:`locate_slide_at`'s ``elapsed_ms % cycle_ms`` so the index and
+    the in-cycle position are computed from the same wall clock and never
+    disagree at a boundary.
+
+    ``cycle_duration_ms <= 0`` (degenerate deck) returns ``0`` — the
+    caller should not be on the anchored/shuffle path in that case, but a
+    defensive constant keeps the seed stable rather than dividing by zero.
+    """
+    if cycle_duration_ms <= 0:
+        return 0
+    return elapsed_ms // cycle_duration_ms
+
+
+def ordered_slides_for_cycle(
+    base_slides: list[dict],
+    shuffle: bool,
+    shuffle_seed: int,
+    cycle_index: int,
+) -> list[dict]:
+    """Return the slide order to play for cycle ``cycle_index``.
+
+    Pure and deterministic: every device that shares ``shuffle_seed`` (the
+    CMS emits a stable per-asset seed in the manifest) and computes the
+    same ``cycle_index`` produces an identical permutation, so a fleet
+    stays frame-for-frame in sync even though the order is "random".
+
+    * ``shuffle`` False, or fewer than two slides → ``base_slides``
+      order unchanged (returned as a new list; inputs are never mutated).
+    * Otherwise a per-cycle seeded Fisher–Yates (``random.Random.shuffle``)
+      permutes a fresh copy. The seed mixes ``shuffle_seed`` and
+      ``cycle_index`` so consecutive cycles re-shuffle rather than
+      repeating the same order, while staying reproducible.
+
+    The total cycle duration is order-independent (the anchored engine
+    sums per-slide durations), so permuting within a cycle never shifts
+    cycle boundaries — :func:`cycle_index_at` stays valid across the
+    permutation.
+    """
+    if not shuffle or len(base_slides) < 2:
+        return list(base_slides)
+    # Deterministic integer seed; bit-mix keeps adjacent cycles distinct.
+    seed = (int(shuffle_seed) & 0x7FFFFFFF) * 0x9E3779B1 ^ int(cycle_index)
+    order = list(range(len(base_slides)))
+    random.Random(seed).shuffle(order)
+    return [base_slides[i] for i in order]
+
+
+
 
 
 def read_slideshow_manifest(

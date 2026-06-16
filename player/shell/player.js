@@ -68,6 +68,37 @@
   // non-positive) effect_duration_ms. Matches the slide's typical dwell.
   const KEN_BURNS_DEFAULT_MS = 8000;
 
+  // Ken Burns directions (manifest schema 1.4 effect_direction).
+  // The token encodes two orthogonal tracks: a ZOOM ("in" | "out") and an
+  // optional PAN (one of 8 compass directions, including diagonals). Grammar:
+  //   "in" / "out"                 -> pure zoom, no pan
+  //   "in_<pan>" / "out_<pan>"     -> zoom + pan (e.g. "out_up_right")
+  //   "<pan>" (bare, legacy 1.4)   -> zoom-in + pan (back-compat alias)
+  // Pan tokens use underscores on the wire ("up_right") and map to hyphenated
+  // CSS classes ("fx-kb-out-up-right"). Allow-listed so a malformed manifest
+  // can't inject an arbitrary class name. Anything unknown / absent falls back
+  // to pure zoom-in ("fx-kb-in"), the safe default. Mirrors
+  // cms.schemas.asset.KEN_BURNS_DIRECTIONS and cms/composed/widgets/media.py.
+  const KB_PANS = [
+    "left", "right", "up", "down",
+    "up_left", "up_right", "down_left", "down_right",
+  ];
+
+  // Parse an effect_direction token into exactly one ``fx-kb-*`` class name.
+  // Never throws; unknown input degrades to "fx-kb-in".
+  function kbDirectionClass(token) {
+    const t = (typeof token === "string" ? token : "").trim().toLowerCase();
+    if (t === "" || t === "in") return "fx-kb-in";
+    if (t === "out") return "fx-kb-out";
+    let zoom = "in";
+    let pan = t;
+    if (t.indexOf("in_") === 0) { zoom = "in"; pan = t.slice(3); }
+    else if (t.indexOf("out_") === 0) { zoom = "out"; pan = t.slice(4); }
+    // else: bare pan, zoom stays "in" (legacy alias)
+    if (KB_PANS.indexOf(pan) === -1) return "fx-kb-in";
+    return "fx-kb-" + zoom + "-" + pan.replace(/_/g, "-");
+  }
+
   let ws = null;
   let reconnectTimer = null;
 
@@ -189,6 +220,10 @@
         ? cmd.effect_duration_ms : KEN_BURNS_DEFAULT_MS;
       img.style.setProperty("--fx-duration-ms", durMs + "ms");
       img.classList.add("fx-ken-burns");
+      // effect_direction encodes zoom + optional pan. Parse it to exactly
+      // one fx-kb-* class (always present, including the default "fx-kb-in"),
+      // since the .fx-ken-burns base rule no longer carries an animation-name.
+      img.classList.add(kbDirectionClass(cmd.effect_direction));
     }
     // Blur-fill backdrop (slideshow roadmap, agora#261). When fit is
     // "contain_blur" the image renders contained over a blurred, zoomed

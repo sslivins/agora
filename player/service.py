@@ -33,8 +33,10 @@ from player.slideshow_engine import (  # noqa: E402
     CLOCK_SKEW_TOLERANCE_S as _CLOCK_SKEW_TOLERANCE_S,
     PLAYER_MAX_MANIFEST_SCHEMA_VERSION as _PLAYER_MAX_MANIFEST_SCHEMA_VERSION,
     RESYNC_CAP_MS as _RESYNC_CAP_MS,
+    cycle_index_at as _cycle_index_at,
     is_forward_schema as _is_forward_schema,
     locate_slide_at as _locate_slide_at,
+    ordered_slides_for_cycle as _ordered_slides_for_cycle,
     parse_iso8601_utc as _parse_iso8601_utc,
     parse_schema_version as _parse_schema_version,
     read_slideshow_manifest as _read_slideshow_manifest_pure,
@@ -586,6 +588,17 @@ class AgoraPlayer:
             # - tolerance``, so we play via legacy timers and re-check
             # the wall clock each tick.
             "clock_skew_active": False,
+            # Schema 1.4 deck shuffle. ``shuffle`` flips on the per-cycle
+            # reorder in ``_resolve_anchored_target``; ``shuffle_seed`` is
+            # the CMS-emitted stable per-asset seed that keeps the whole
+            # fleet permuting in lock-step. Missing on pre-1.4 manifests →
+            # shuffle off, base manifest order (graceful downgrade).
+            "shuffle": bool(manifest.get("shuffle")),
+            "shuffle_seed": int(manifest.get("shuffle_seed") or 0),
+            # Per-cycle ordered slide list (base order until the anchored
+            # path computes a shuffled cycle). Seeded with the manifest
+            # order so dispatch/resync can always read it unconditionally.
+            "active_cycle_slides": list(slides),
         }
         self._slideshow_manifest_digest = digest
         self._loops_completed = 0
@@ -607,22 +620,62 @@ class AgoraPlayer:
         :func:`player.slideshow_engine.resolve_anchored_target` that:
 
         * extracts the slides/cycle/anchor from ``ss`` so callers can
-          continue passing the existing slideshow-state dict, and
+          continue passing the existing slideshow-state dict,
+        * applies deck shuffle (manifest schema 1.4): when the manifest
+          requested ``shuffle`` it computes the per-cycle permuted slide
+          order for the current wall-clock cycle and stores it on
+          ``ss["active_cycle_slides"]`` so the dispatch + resync paths
+          index the same order. Non-shuffle decks store the base order
+          unchanged, so downstream code can always read
+          ``ss.get("active_cycle_slides")``. The permutation is a pure
+          function of the manifest's stable ``shuffle_seed`` and the
+          cycle index, so every device in the fleet stays in sync.
         * owns the clock-skew telemetry (mutates
           ``ss["clock_skew_active"]`` and logs the transition exactly
           once per direction).  The pure helper is silent so softplayer
           can surface skew differently.
         """
+        now = datetime.now(timezone.utc)
+        base_slides = ss.get("slides") or []
+        cycle_ms = int(ss.get("cycle_duration_ms") or 0)
+        anchor = ss.get("anchor")
+
+        # Default: play the manifest order. Shuffle only ever reorders
+        # the anchored path; the legacy timer chain below reads
+        # ``ss["slides"]`` directly and is intentionally left untouched.
+        ordered_slides = list(base_slides)
+        if (
+            ss.get("shuffle")
+            and anchor is not None
+            and cycle_ms > 0
+            and len(base_slides) > 1
+        ):
+            # Gate the reshuffle on the same clock-skew tolerance the pure
+            # resolver uses, so a pre-NTP boot (now << anchor) doesn't
+            # compute a negative/garbage cycle index. When skew is within
+            # tolerance the elapsed/cycle math matches the resolver's.
+            skew_s = (anchor - now).total_seconds()
+            if skew_s <= _CLOCK_SKEW_TOLERANCE_S:
+                elapsed_ms = int((now - anchor).total_seconds() * 1000)
+                cycle_index = _cycle_index_at(elapsed_ms, cycle_ms)
+                ordered_slides = _ordered_slides_for_cycle(
+                    base_slides,
+                    shuffle=True,
+                    shuffle_seed=int(ss.get("shuffle_seed") or 0),
+                    cycle_index=cycle_index,
+                )
+        ss["active_cycle_slides"] = ordered_slides
+
         resolution = _resolve_anchored_target_pure(
-            slides=ss.get("slides") or [],
-            cycle_duration_ms=int(ss.get("cycle_duration_ms") or 0),
-            anchor=ss.get("anchor"),
+            slides=ordered_slides,
+            cycle_duration_ms=cycle_ms,
+            anchor=anchor,
+            now=now,
             clock_skew_tolerance_s=_CLOCK_SKEW_TOLERANCE_S,
         )
 
         if resolution.status is _AnchorStatus.CLOCK_SKEW_BEHIND:
             if not ss.get("clock_skew_active"):
-                now = datetime.now(timezone.utc)
                 logger.info(
                     "Slideshow %s: clock-skew guard ACTIVE "
                     "(now=%s anchor=%s skew_s=%.0f) — using legacy timer chain",
@@ -634,7 +687,6 @@ class AgoraPlayer:
             return None
 
         if ss.get("clock_skew_active") and resolution.status is _AnchorStatus.OK:
-            now = datetime.now(timezone.utc)
             logger.info(
                 "Slideshow %s: clock-skew guard CLEARED (now=%s anchor=%s) "
                 "— switching to anchored playback",
@@ -668,7 +720,7 @@ class AgoraPlayer:
         video's expected end by more than the overrun tolerance
         (``max(2 × _RESYNC_CAP_MS, 0.25 × cycle_duration_ms, 10s)``).
         """
-        slides = ss["slides"]
+        slides = ss.get("active_cycle_slides") or ss["slides"]
         slide = slides[target_idx]
         slide_name = slide.get("name") or ""
         path = self._resolve_asset(slide_name)
@@ -765,6 +817,7 @@ class AgoraPlayer:
                     duration_ms=slide_transition_ms,
                     fit=slide_fit,
                     effect=slide_effect,
+                    effect_direction=slide.get("effect_direction") or None,
                     effect_duration_ms=slide_duration_ms or None,
                 )
             self._update_current(
@@ -840,7 +893,8 @@ class AgoraPlayer:
                 2 * _RESYNC_CAP_MS, cycle_ms // 4, 10_000,
             )
             armed_at: Optional[datetime] = pending.get("armed_at")
-            slide = ss["slides"][current_idx] if 0 <= current_idx < len(ss["slides"]) else None
+            cycle_slides = ss.get("active_cycle_slides") or ss["slides"]
+            slide = cycle_slides[current_idx] if 0 <= current_idx < len(cycle_slides) else None
             slide_dur = int((slide or {}).get("duration_ms") or 0)
             if armed_at is not None and slide_dur > 0:
                 elapsed_since_arm = (
@@ -1017,6 +1071,7 @@ class AgoraPlayer:
                     duration_ms=slide_transition_ms,
                     fit=slide_fit,
                     effect=slide_effect,
+                    effect_direction=slide.get("effect_direction") or None,
                     effect_duration_ms=slide_dwell_ms or None,
                 )
             duration_ms = slide_dwell_ms
