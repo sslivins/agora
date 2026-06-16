@@ -17,8 +17,10 @@ from player.slideshow_engine import (
     CLOCK_SKEW_TOLERANCE_S,
     PLAYER_MAX_MANIFEST_SCHEMA_VERSION,
     RESYNC_CAP_MS,
+    cycle_index_at,
     is_forward_schema,
     locate_slide_at,
+    ordered_slides_for_cycle,
     parse_iso8601_utc,
     parse_schema_version,
     read_slideshow_manifest,
@@ -217,4 +219,110 @@ class TestConstants:
         # docs and the CMS-side scheduler.
         assert CLOCK_SKEW_TOLERANCE_S == 3600
         assert RESYNC_CAP_MS == 5000
-        assert PLAYER_MAX_MANIFEST_SCHEMA_VERSION == "1.1"
+        assert PLAYER_MAX_MANIFEST_SCHEMA_VERSION == "1.4"
+
+
+class TestCycleIndexAt:
+    def test_first_cycle(self):
+        # 0ms in and partway into cycle 0 both return 0.
+        assert cycle_index_at(0, 10_000) == 0
+        assert cycle_index_at(9_999, 10_000) == 0
+
+    def test_cycle_boundary(self):
+        # Exactly one cycle in starts cycle 1.
+        assert cycle_index_at(10_000, 10_000) == 1
+        assert cycle_index_at(25_000, 10_000) == 2
+
+    def test_floor_division_matches_locate(self):
+        # The ordinal must use floor division so it agrees with
+        # locate_slide_at's elapsed % cycle math at every boundary.
+        assert cycle_index_at(19_999, 10_000) == 1
+        assert cycle_index_at(20_000, 10_000) == 2
+
+    def test_negative_elapsed_floors(self):
+        # Small clock skew can make elapsed negative; floor division
+        # yields -1 (Python floors toward negative infinity), which the
+        # seed mixing tolerates without blowing up.
+        assert cycle_index_at(-1, 10_000) == -1
+        assert cycle_index_at(-10_000, 10_000) == -1
+        assert cycle_index_at(-10_001, 10_000) == -2
+
+    def test_zero_or_negative_duration_guard(self):
+        # Degenerate deck: never divide by zero, return a stable 0.
+        assert cycle_index_at(5_000, 0) == 0
+        assert cycle_index_at(5_000, -1) == 0
+
+
+class TestOrderedSlidesForCycle:
+    def _slides(self, n: int) -> list[dict]:
+        return [{"name": f"s{i}", "duration_ms": 1000} for i in range(n)]
+
+    def test_shuffle_off_is_identity(self):
+        base = self._slides(4)
+        out = ordered_slides_for_cycle(base, False, 12345, 0)
+        assert out == base
+
+    def test_shuffle_off_returns_new_list(self):
+        # Identity in content but a fresh list — callers must never get
+        # the caller's own list back to mutate.
+        base = self._slides(3)
+        out = ordered_slides_for_cycle(base, False, 1, 0)
+        assert out is not base
+
+    def test_fewer_than_two_slides_identity(self):
+        # A single-slide deck can't be permuted; shuffle is a no-op.
+        base = self._slides(1)
+        assert ordered_slides_for_cycle(base, True, 999, 5) == base
+        assert ordered_slides_for_cycle([], True, 999, 5) == []
+
+    def test_deterministic_same_seed_and_cycle(self):
+        base = self._slides(8)
+        a = ordered_slides_for_cycle(base, True, 4242, 3)
+        b = ordered_slides_for_cycle(base, True, 4242, 3)
+        assert a == b
+
+    def test_actually_permutes(self):
+        # With enough slides a shuffle should differ from base order for
+        # at least one cycle (guards against a no-op seed bug).
+        base = self._slides(10)
+        orders = [
+            [s["name"] for s in ordered_slides_for_cycle(base, True, 7, c)]
+            for c in range(5)
+        ]
+        base_names = [s["name"] for s in base]
+        assert any(o != base_names for o in orders)
+
+    def test_different_cycles_reshuffle(self):
+        # Consecutive cycles should generally produce different orders so
+        # the deck doesn't repeat the same "random" sequence every cycle.
+        base = self._slides(10)
+        c0 = [s["name"] for s in ordered_slides_for_cycle(base, True, 88, 0)]
+        c1 = [s["name"] for s in ordered_slides_for_cycle(base, True, 88, 1)]
+        assert c0 != c1
+
+    def test_different_seeds_diverge(self):
+        # Two devices with different (buggy) seeds would desync; pin that
+        # the seed actually drives the permutation.
+        base = self._slides(10)
+        a = [s["name"] for s in ordered_slides_for_cycle(base, True, 1, 0)]
+        b = [s["name"] for s in ordered_slides_for_cycle(base, True, 2, 0)]
+        assert a != b
+
+    def test_permutation_preserves_membership(self):
+        # Every slide appears exactly once — no drops or dupes.
+        base = self._slides(6)
+        out = ordered_slides_for_cycle(base, True, 555, 9)
+        assert sorted(s["name"] for s in out) == sorted(s["name"] for s in base)
+        assert len(out) == len(base)
+
+    def test_does_not_mutate_input(self):
+        base = self._slides(6)
+        snapshot = list(base)
+        ordered_slides_for_cycle(base, True, 555, 9)
+        assert base == snapshot
+
+    def test_negative_cycle_index_is_stable(self):
+        # Clock-skew can yield a negative cycle index; it must not raise.
+        base = self._slides(5)
+        out = ordered_slides_for_cycle(base, True, 33, -1)
+        assert sorted(s["name"] for s in out) == sorted(s["name"] for s in base)

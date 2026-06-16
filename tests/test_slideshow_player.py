@@ -169,15 +169,15 @@ class TestManifestSchemaVersion:
         self._write_versioned_manifest(player, "Show", [
             {"name": "a.png", "asset_type": "image",
              "duration_ms": 1000, "play_to_end": False},
-        ], version="1.2")
+        ], version="1.5")
         with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
             player._start_slideshow("Show", None)
         assert player._slideshow is not None
-        assert player._slideshow["schema_version"] == "1.2"
+        assert player._slideshow["schema_version"] == "1.5"
         # INFO logged, mentions both the observed and the player-max version.
         assert any(
-            "manifest_schema_version=1.2" in rec.getMessage()
-            and "player max=1.1" in rec.getMessage()
+            "manifest_schema_version=1.5" in rec.getMessage()
+            and "player max=1.4" in rec.getMessage()
             for rec in caplog.records
         ), f"forward-version INFO not logged: {[r.getMessage() for r in caplog.records]}"
 
@@ -187,14 +187,14 @@ class TestManifestSchemaVersion:
         self._write_versioned_manifest(player, "Show", [
             {"name": "a.png", "asset_type": "image",
              "duration_ms": 1000, "play_to_end": False},
-        ], version="1.2")
+        ], version="1.5")
         with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
             player._start_slideshow("Show", None)
             player._clear_slideshow()
             player._start_slideshow("Show", None)
         forward_logs = [
             r for r in caplog.records
-            if "manifest_schema_version=1.2" in r.getMessage()
+            if "manifest_schema_version=1.5" in r.getMessage()
         ]
         assert len(forward_logs) == 1, (
             f"forward-version INFO should fire once per digest, got "

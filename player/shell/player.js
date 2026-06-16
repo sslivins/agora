@@ -68,6 +68,14 @@
   // non-positive) effect_duration_ms. Matches the slide's typical dwell.
   const KEN_BURNS_DEFAULT_MS = 8000;
 
+  // Ken Burns directions (manifest schema 1.4 effect_direction, agora#261).
+  // Mirrors cms.schemas.asset.KEN_BURNS_DIRECTIONS. "in" is the base
+  // keyframe (no extra class); the other five map to ``fx-kb-<dir>``
+  // override rules in player.css. Allow-listed so a malformed manifest
+  // can't inject an arbitrary class name. Unknown / absent values fall
+  // back to "in" (the base zoom), keeping older decks byte-identical.
+  const KNOWN_KB_DIRECTIONS = ["in", "out", "left", "right", "up", "down"];
+
   let ws = null;
   let reconnectTimer = null;
 
@@ -189,6 +197,13 @@
         ? cmd.effect_duration_ms : KEN_BURNS_DEFAULT_MS;
       img.style.setProperty("--fx-duration-ms", durMs + "ms");
       img.classList.add("fx-ken-burns");
+      // effect_direction picks the pan/zoom axis. "in" is the base
+      // keyframe (already applied by .fx-ken-burns); the other five
+      // directions add an override class. Anything unknown stays "in".
+      const dir = cmd.effect_direction;
+      if (KNOWN_KB_DIRECTIONS.includes(dir) && dir !== "in") {
+        img.classList.add("fx-kb-" + dir);
+      }
     }
     // Blur-fill backdrop (slideshow roadmap, agora#261). When fit is
     // "contain_blur" the image renders contained over a blurred, zoomed

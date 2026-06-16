@@ -265,6 +265,7 @@ class ChromiumPlayer:
         fit: Optional[str] = None,
         effect: Optional[str] = None,
         effect_duration_ms: Optional[int] = None,
+        effect_direction: Optional[str] = None,
     ) -> None:
         url = self._asset_url(path)
         if url is None:
@@ -291,6 +292,12 @@ class ChromiumPlayer:
             payload["effect"] = effect
             if effect_duration_ms and int(effect_duration_ms) > 0:
                 payload["effect_duration_ms"] = int(effect_duration_ms)
+            # Ken Burns direction (manifest schema 1.4). "in" is the shell's
+            # base keyframe, so only emit a real non-"in" direction — older
+            # decks (and the absent case) stay byte-for-byte compatible and
+            # the shell plays the default zoom-in.
+            if effect_direction and effect_direction != "in":
+                payload["effect_direction"] = effect_direction
         self._enqueue(payload)
 
     def show_video(

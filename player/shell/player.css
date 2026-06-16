@@ -120,16 +120,54 @@ html, body {
  * <img> element itself rather than .layer, because .layer's transform is
  * reserved for the push/zoom/dissolve transitions above — animating both
  * on the same element would conflict. player.js sets --fx-duration-ms
- * from the command's effect_duration_ms (default 8000ms). */
+ * from the command's effect_duration_ms (default 8000ms).
+ *
+ * The base keyframe is the "in" direction (a slow centred zoom-in). Per
+ * the manifest schema 1.4 effect_direction field (agora#261), five more
+ * directions are available; player.js adds an ``fx-kb-<dir>`` class that
+ * overrides ``animation-name`` to the matching directional keyframe. The
+ * six keyframes mirror the CMS preview transforms verbatim
+ * (cms/composed/widgets/media.py _KB_DIRECTION_TRANSFORMS) so a device
+ * renders byte-for-byte what the builder preview showed (WYSIWYG). The
+ * "in" default is the base keyframe, so all-default decks need no extra
+ * class and an older shell (pre-1.4) silently plays "in" for every slide. */
 @keyframes fx-ken-burns {
-  from { transform: scale(1) translate(0, 0); }
-  to   { transform: scale(1.12) translate(-2%, -2%); }
+  from { transform: scale(1.0001) translate(0, 0); }
+  to   { transform: scale(1.08) translate(0, 0); }
+}
+@keyframes fx-kb-out {
+  from { transform: scale(1.08) translate(0, 0); }
+  to   { transform: scale(1.0001) translate(0, 0); }
+}
+@keyframes fx-kb-left {
+  from { transform: scale(1.08) translate(2%, 0); }
+  to   { transform: scale(1.08) translate(-2%, 0); }
+}
+@keyframes fx-kb-right {
+  from { transform: scale(1.08) translate(-2%, 0); }
+  to   { transform: scale(1.08) translate(2%, 0); }
+}
+@keyframes fx-kb-up {
+  from { transform: scale(1.08) translate(0, 2%); }
+  to   { transform: scale(1.08) translate(0, -2%); }
+}
+@keyframes fx-kb-down {
+  from { transform: scale(1.08) translate(0, -2%); }
+  to   { transform: scale(1.08) translate(0, 2%); }
 }
 .layer img.fx-ken-burns {
   animation: fx-ken-burns var(--fx-duration-ms, 8000ms) ease-out both;
   transform-origin: center center;
   will-change: transform;
 }
+/* Direction overrides. Two-class selectors (specificity 0,0,2,1) outrank
+ * the single-class base rule (0,0,1,1) so animation-name wins; duration,
+ * easing and fill are inherited from the base shorthand above. */
+.layer img.fx-ken-burns.fx-kb-out   { animation-name: fx-kb-out; }
+.layer img.fx-ken-burns.fx-kb-left  { animation-name: fx-kb-left; }
+.layer img.fx-ken-burns.fx-kb-right { animation-name: fx-kb-right; }
+.layer img.fx-ken-burns.fx-kb-up    { animation-name: fx-kb-up; }
+.layer img.fx-ken-burns.fx-kb-down  { animation-name: fx-kb-down; }
 
 /* Blur-fill backdrop (slideshow roadmap, agora#261). The foreground image
  * renders contained over a blurred, zoomed cover copy of itself, filling the

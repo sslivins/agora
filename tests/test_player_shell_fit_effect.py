@@ -106,6 +106,40 @@ def test_player_css_defines_blur_fill_rules():
     assert "object-fit: cover" in css
 
 
+# ── Ken Burns direction (manifest schema 1.4, agora#261) ────────────
+
+def test_player_js_defines_kb_directions_allowlist():
+    js = _js()
+    assert "KNOWN_KB_DIRECTIONS" in js
+    # All six presets must be allow-listed so a malformed manifest can't
+    # inject an arbitrary class name.
+    for d in ("in", "out", "left", "right", "up", "down"):
+        assert f'"{d}"' in js
+
+
+def test_player_js_applies_direction_class_from_cmd():
+    js = _js()
+    assert "effect_direction" in js
+    # The directional class is prefixed fx-kb- and built from the cmd.
+    assert "fx-kb-" in js
+    assert "cmd.effect_direction" in js
+
+
+def test_player_css_defines_direction_keyframes():
+    css = _css()
+    # Five directional keyframes layered on top of the base in-zoom.
+    for d in ("out", "left", "right", "up", "down"):
+        assert f"@keyframes fx-kb-{d}" in css
+
+
+def test_player_css_direction_override_rules():
+    css = _css()
+    # Two-class selectors so the directional animation-name outranks the
+    # single-class base rule. "in" needs no class (it's the base).
+    for d in ("out", "left", "right", "up", "down"):
+        assert f"img.fx-ken-burns.fx-kb-{d}" in css
+
+
 # ── protocol doc ────────────────────────────────────────────────────
 
 def test_player_js_header_documents_fit_and_effect():
