@@ -305,6 +305,7 @@ class TestSlideshowFetch:
         slide = _make_slide("a.png", b1, asset_type="image", duration_ms=8000)
         slide["fit"] = "cover"
         slide["effect"] = "ken_burns"
+        slide["effect_direction"] = "out_down_right"
         msg = {
             "type": "fetch_asset",
             "asset_name": "KenBurns.slideshow",
@@ -312,7 +313,7 @@ class TestSlideshowFetch:
             "download_url": "",
             "checksum": "h",
             "size_bytes": 0,
-            "manifest_schema_version": "1.3",
+            "manifest_schema_version": "1.4",
             "slides": [slide],
         }
         mapping = {slide["download_url"]: b1}
@@ -324,6 +325,7 @@ class TestSlideshowFetch:
         manifest = json.loads(manifest_path.read_text())
         assert manifest["slides"][0]["fit"] == "cover"
         assert manifest["slides"][0]["effect"] == "ken_burns"
+        assert manifest["slides"][0]["effect_direction"] == "out_down_right"
 
     @pytest.mark.asyncio
     async def test_fit_effect_default_when_absent(self, cms_client):
@@ -352,6 +354,7 @@ class TestSlideshowFetch:
         )
         assert manifest["slides"][0]["fit"] is None
         assert manifest["slides"][0]["effect"] is None
+        assert manifest["slides"][0]["effect_direction"] is None
 
     @pytest.mark.asyncio
     async def test_wall_clock_fields_absent_persist_as_none(self, cms_client):

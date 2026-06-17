@@ -2442,6 +2442,13 @@ class CMSClient:
                     # a no-op (contain / no effect) rather than a missing key.
                     "fit": s.get("fit"),
                     "effect": s.get("effect"),
+                    # Ken Burns pan/zoom direction (manifest schema 1.4). Without
+                    # this the player reads ``effect_direction`` as absent ->
+                    # ``None`` and every ken_burns slide falls back to the
+                    # centered zoom-in (``fx-kb-in``) regardless of the authored
+                    # direction. Persist verbatim; default None so pre-1.4
+                    # manifests stay a no-op.
+                    "effect_direction": s.get("effect_direction"),
                     # Composed members persist their sibling list so cold-start
                     # completeness + eviction-protection survive a reboot.
                     **(
