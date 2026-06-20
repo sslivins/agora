@@ -37,10 +37,14 @@ from player.slideshow_engine import (  # noqa: E402
     is_forward_schema as _is_forward_schema,
     locate_slide_at as _locate_slide_at,
     ordered_slides_for_cycle as _ordered_slides_for_cycle,
+    next_window_boundary as _next_window_boundary,
     parse_iso8601_utc as _parse_iso8601_utc,
     parse_schema_version as _parse_schema_version,
     read_slideshow_manifest as _read_slideshow_manifest_pure,
     resolve_anchored_target as _resolve_anchored_target_pure,
+    slide_has_window as _slide_has_window,
+    visible_slides as _visible_slides,
+    WINDOW_BOUNDARY_MAX_SLEEP_S as _WINDOW_BOUNDARY_MAX_SLEEP_S,
 )
 
 logger = logging.getLogger("agora.player")
@@ -636,19 +640,70 @@ class AgoraPlayer:
           can surface skew differently.
         """
         now = datetime.now(timezone.utc)
+        # Naive system-local civil time for per-slide visibility windows.
+        # On the Pi the OS timezone is set by cms_client, so a naive
+        # ``datetime.now()`` reads the device's local wall clock — exactly
+        # what the CMS predicate evaluates against. Softplayer on Windows
+        # gets Windows-local time (a dev-tool caveat, not a fleet concern).
+        local_now = datetime.now()
         base_slides = ss.get("slides") or []
-        cycle_ms = int(ss.get("cycle_duration_ms") or 0)
         anchor = ss.get("anchor")
 
-        # Default: play the manifest order. Shuffle only ever reorders
-        # the anchored path; the legacy timer chain below reads
+        # --- Per-slide visibility windows (manifest schema 1.5) ----------
+        # Filter the deck to the slides whose civil-clock window is open
+        # right now, mirroring the server-side scheduler predicate so the
+        # device flips slides open/closed at exact local-clock boundaries
+        # even while network-isolated. Windowless decks (no slide carries
+        # any window metadata) skip every branch below and behave
+        # byte-identically to schema <= 1.4.
+        windowed = any(_slide_has_window(s) for s in base_slides)
+        # Only trust the local clock for window evaluation once the
+        # wall-clock anchor is within the clock-skew tolerance. A pre-NTP
+        # boot (now << anchor) has a bogus ``local_now``, so windowing is
+        # suppressed until the clock catches up — the full deck plays for
+        # that brief transient, matching the legacy timer chain.
+        clock_trustworthy = (
+            anchor is None
+            or (anchor - now).total_seconds() <= _CLOCK_SKEW_TOLERANCE_S
+        )
+        if windowed and clock_trustworthy:
+            active_base = _visible_slides(base_slides, local_now)
+            # Recompute the cycle over the visible deck and persist it so
+            # the dispatch/resync overrun math (which reads
+            # ``ss["cycle_duration_ms"]``) stays consistent with what is
+            # actually on screen.
+            cycle_ms = sum(
+                max(int(s.get("duration_ms") or 0), 0) for s in active_base
+            )
+            ss["cycle_duration_ms"] = cycle_ms
+            # Earliest strictly-future civil instant the visible set may
+            # change, so the dispatch + hold timers can wake precisely on
+            # the boundary (see ``_anchored_tick_ms``).
+            ss["window_boundary"] = _next_window_boundary(base_slides, local_now)
+            if not active_base:
+                # Every slide is currently closed by its window. The
+                # anchored math can't run on an empty deck and the legacy
+                # timer chain would replay the FULL (unfiltered) deck, so
+                # signal the caller to enter the all-closed holding state.
+                ss["windows_all_closed"] = True
+                ss["active_cycle_slides"] = []
+                return None
+        else:
+            active_base = base_slides
+            cycle_ms = int(ss.get("cycle_duration_ms") or 0)
+            ss["window_boundary"] = None
+        ss["windows_all_closed"] = False
+        ss["windows_closed_shown"] = False
+
+        # Default: play the (visible) manifest order. Shuffle only ever
+        # reorders the anchored path; the legacy timer chain below reads
         # ``ss["slides"]`` directly and is intentionally left untouched.
-        ordered_slides = list(base_slides)
+        ordered_slides = list(active_base)
         if (
             ss.get("shuffle")
             and anchor is not None
             and cycle_ms > 0
-            and len(base_slides) > 1
+            and len(active_base) > 1
         ):
             # Gate the reshuffle on the same clock-skew tolerance the pure
             # resolver uses, so a pre-NTP boot (now << anchor) doesn't
@@ -659,7 +714,7 @@ class AgoraPlayer:
                 elapsed_ms = int((now - anchor).total_seconds() * 1000)
                 cycle_index = _cycle_index_at(elapsed_ms, cycle_ms)
                 ordered_slides = _ordered_slides_for_cycle(
-                    base_slides,
+                    active_base,
                     shuffle=True,
                     shuffle_seed=int(ss.get("shuffle_seed") or 0),
                     cycle_index=cycle_index,
@@ -698,6 +753,55 @@ class AgoraPlayer:
         if resolution.status is _AnchorStatus.OK:
             return resolution.target
         return None
+
+    def _anchored_tick_ms(self, ss: dict, remaining_ms: int) -> int:
+        """Clamp the next resync/hold tick.
+
+        Always bounded by the resync cap. When the deck carries
+        per-slide visibility windows (manifest 1.5) the tick is *also*
+        clamped to the next civil window boundary so a slide flips
+        open/closed at the exact local-clock instant rather than up to
+        ``_RESYNC_CAP_MS`` late. The boundary clamp is itself capped at
+        ``_WINDOW_BOUNDARY_MAX_SLEEP_S`` as a daily safety net.
+        """
+        tick = min(max(int(remaining_ms), 1), _RESYNC_CAP_MS)
+        boundary = ss.get("window_boundary")
+        if boundary is not None:
+            ms_to_boundary = int(
+                (boundary - datetime.now()).total_seconds() * 1000
+            )
+            ms_to_boundary = max(
+                1,
+                min(ms_to_boundary, _WINDOW_BOUNDARY_MAX_SLEEP_S * 1000),
+            )
+            tick = min(tick, ms_to_boundary)
+        return tick
+
+    def _enter_windows_closed(self, ss: dict) -> bool:
+        """Holding state when every slide is closed by its window.
+
+        Shows the splash once and arms a re-check timer at the next
+        window boundary (capped) so the deck reappears at the exact
+        local-clock instant a slide opens — even while network-isolated.
+        Re-uses the anchored resync tick as the wake callback: when a
+        slide opens, ``_resolve_anchored_target`` returns a real target
+        and playback resumes; while still closed it routes back here.
+        """
+        self._cancel_slide_timeout()
+        if not ss.get("windows_closed_shown"):
+            logger.info(
+                "Slideshow %s: all slides closed by visibility windows "
+                "— holding on splash until next window boundary",
+                ss["name"],
+            )
+            self._show_splash()
+            ss["windows_closed_shown"] = True
+            ss["anchored_current_idx"] = -1
+        tick_ms = self._anchored_tick_ms(ss, _RESYNC_CAP_MS)
+        ss["timeout_id"] = GLib.timeout_add(
+            tick_ms, self._on_anchored_resync_tick, ss["epoch"],
+        )
+        return False
 
     def _play_anchored_slide(
         self, ss: dict, target_idx: int, remaining_ms: int,
@@ -839,7 +943,7 @@ class AgoraPlayer:
                 started_at=datetime.now(timezone.utc),
             )
 
-        tick_ms = min(max(remaining_ms, 1), _RESYNC_CAP_MS)
+        tick_ms = self._anchored_tick_ms(ss, remaining_ms)
         epoch = ss["epoch"]
         ss["timeout_id"] = GLib.timeout_add(
             tick_ms, self._on_anchored_resync_tick, epoch,
@@ -860,6 +964,10 @@ class AgoraPlayer:
 
         target = self._resolve_anchored_target(ss)
         if target is None:
+            if ss.get("windows_all_closed"):
+                # Every slide is window-closed — keep holding on splash
+                # and re-arm the boundary timer instead of advancing.
+                return self._enter_windows_closed(ss)
             # Anchor became unusable (e.g. someone replaced the manifest
             # mid-flight).  Fall back to a legacy natural advance so
             # playback keeps moving.
@@ -938,7 +1046,7 @@ class AgoraPlayer:
                     return self._play_next_slide()
 
         # Same target, no overrun — just arm another tick.
-        tick_ms = min(max(remaining_ms, 1), _RESYNC_CAP_MS)
+        tick_ms = self._anchored_tick_ms(ss, remaining_ms)
         ss["timeout_id"] = GLib.timeout_add(
             tick_ms, self._on_anchored_resync_tick, epoch,
         )
@@ -969,6 +1077,12 @@ class AgoraPlayer:
         anchored = self._resolve_anchored_target(ss)
         if anchored is not None:
             return self._play_anchored_slide(ss, *anchored)
+
+        if ss.get("windows_all_closed"):
+            # Anchored deck is entirely window-closed: hold on splash and
+            # re-check at the next boundary rather than falling through to
+            # the legacy chain (which would replay the unfiltered deck).
+            return self._enter_windows_closed(ss)
 
         if ss["index"] >= len(ss["slides"]):
             ss["loops_completed"] += 1

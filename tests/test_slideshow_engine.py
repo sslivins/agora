@@ -7,7 +7,7 @@ upcoming consumption of the same module.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -17,14 +17,20 @@ from player.slideshow_engine import (
     CLOCK_SKEW_TOLERANCE_S,
     PLAYER_MAX_MANIFEST_SCHEMA_VERSION,
     RESYNC_CAP_MS,
+    WINDOW_BOUNDARY_MAX_SLEEP_S,
     cycle_index_at,
     is_forward_schema,
     locate_slide_at,
+    next_window_boundary,
     ordered_slides_for_cycle,
     parse_iso8601_utc,
     parse_schema_version,
+    parse_window,
     read_slideshow_manifest,
     resolve_anchored_target,
+    slide_has_window,
+    slide_window_open,
+    visible_slides,
 )
 
 
@@ -219,7 +225,7 @@ class TestConstants:
         # docs and the CMS-side scheduler.
         assert CLOCK_SKEW_TOLERANCE_S == 3600
         assert RESYNC_CAP_MS == 5000
-        assert PLAYER_MAX_MANIFEST_SCHEMA_VERSION == "1.4"
+        assert PLAYER_MAX_MANIFEST_SCHEMA_VERSION == "1.5"
 
 
 class TestCycleIndexAt:
@@ -326,3 +332,251 @@ class TestOrderedSlidesForCycle:
         base = self._slides(5)
         out = ordered_slides_for_cycle(base, True, 33, -1)
         assert sorted(s["name"] for s in out) == sorted(s["name"] for s in base)
+
+
+# ---------------------------------------------------------------------------
+# Per-slide visibility windows (manifest schema 1.5)
+# ---------------------------------------------------------------------------
+
+
+def _wslide(**kw) -> dict:
+    """A minimal slide dict exposing only the five window fields.
+
+    ``slide_window_open`` reads nothing else off the slide for the
+    predicate, so this keeps the predicate tests focused.
+    """
+    d = {
+        "valid_from": None,
+        "valid_to": None,
+        "active_days": None,
+        "active_start": None,
+        "active_end": None,
+    }
+    d.update(kw)
+    return d
+
+
+def _ln(y, m, d, hh=12, mm=0) -> datetime:
+    """A naive local-civil datetime (the clock domain the predicate uses)."""
+    return datetime(y, m, d, hh, mm)
+
+
+class TestSlideWindowOpen:
+    """Verbatim parity with the CMS resolver predicate
+    (``cms.services.slideshow_resolver._slide_window_open``) — the firmware
+    MUST flip a slide open/closed at the exact same civil instant the
+    server would.  Cases ported 1:1 from agora-cms
+    ``tests/test_slideshow_visibility.py::TestSlideWindowOpen``.
+    """
+
+    def test_no_window_is_always_open(self):
+        assert slide_window_open(_wslide(), _ln(2026, 12, 25, 3, 0)) is True
+
+    def test_date_range_inclusive_both_ends(self):
+        row = _wslide(valid_from="2026-12-01", valid_to="2026-12-26")
+        assert slide_window_open(row, _ln(2026, 11, 30)) is False
+        assert slide_window_open(row, _ln(2026, 12, 1)) is True
+        assert slide_window_open(row, _ln(2026, 12, 26)) is True
+        assert slide_window_open(row, _ln(2026, 12, 27)) is False
+
+    def test_only_valid_from(self):
+        row = _wslide(valid_from="2026-06-01")
+        assert slide_window_open(row, _ln(2026, 5, 31)) is False
+        assert slide_window_open(row, _ln(2026, 6, 1)) is True
+        assert slide_window_open(row, _ln(2030, 1, 1)) is True
+
+    def test_only_valid_to(self):
+        row = _wslide(valid_to="2026-06-01")
+        assert slide_window_open(row, _ln(2026, 6, 1)) is True
+        assert slide_window_open(row, _ln(2026, 6, 2)) is False
+
+    def test_normal_time_window_start_incl_end_excl(self):
+        row = _wslide(active_start="13:00:00", active_end="14:00:00")
+        assert slide_window_open(row, _ln(2026, 6, 1, 12, 59)) is False
+        assert slide_window_open(row, _ln(2026, 6, 1, 13, 0)) is True
+        assert slide_window_open(row, _ln(2026, 6, 1, 13, 59)) is True
+        assert slide_window_open(row, _ln(2026, 6, 1, 14, 0)) is False
+
+    def test_only_active_start(self):
+        row = _wslide(active_start="09:00:00")
+        assert slide_window_open(row, _ln(2026, 6, 1, 8, 59)) is False
+        assert slide_window_open(row, _ln(2026, 6, 1, 9, 0)) is True
+
+    def test_only_active_end(self):
+        row = _wslide(active_end="17:00:00")
+        assert slide_window_open(row, _ln(2026, 6, 1, 16, 59)) is True
+        assert slide_window_open(row, _ln(2026, 6, 1, 17, 0)) is False
+
+    def test_overnight_wrap_window(self):
+        row = _wslide(active_start="22:00:00", active_end="02:00:00")
+        assert slide_window_open(row, _ln(2026, 6, 1, 21, 59)) is False
+        assert slide_window_open(row, _ln(2026, 6, 1, 22, 0)) is True
+        assert slide_window_open(row, _ln(2026, 6, 1, 23, 30)) is True
+        assert slide_window_open(row, _ln(2026, 6, 2, 1, 59)) is True
+        assert slide_window_open(row, _ln(2026, 6, 2, 2, 0)) is False
+
+    def test_weekday_only(self):
+        # 2026-06-01 is a Monday (weekday 0).
+        row = _wslide(active_days=[0, 2, 4])  # Mon, Wed, Fri
+        assert slide_window_open(row, _ln(2026, 6, 1)) is True   # Mon
+        assert slide_window_open(row, _ln(2026, 6, 2)) is False  # Tue
+        assert slide_window_open(row, _ln(2026, 6, 3)) is True   # Wed
+
+    def test_empty_weekday_list_is_every_day(self):
+        assert slide_window_open(_wslide(active_days=[]), _ln(2026, 6, 2)) is True
+
+    def test_wrap_tail_belongs_to_opening_days_weekday(self):
+        # Fri 22:00 .. Sat 02:00, allowed only on Friday (weekday 4).
+        row = _wslide(
+            active_start="22:00:00", active_end="02:00:00", active_days=[4],
+        )
+        assert slide_window_open(row, _ln(2026, 6, 5, 23, 0)) is True
+        # Sat 00:30 wrap tail -> effective weekday Friday -> open.
+        assert slide_window_open(row, _ln(2026, 6, 6, 0, 30)) is True
+        # Sat 22:00 is a fresh Saturday opening -> not allowed.
+        assert slide_window_open(row, _ln(2026, 6, 6, 22, 0)) is False
+
+    def test_full_mixture_all_constraints(self):
+        # Christmas-week flash sale: Dec 1-26, 1-2pm, weekdays only.
+        row = _wslide(
+            valid_from="2026-12-01",
+            valid_to="2026-12-26",
+            active_start="13:00:00",
+            active_end="14:00:00",
+            active_days=[0, 1, 2, 3, 4],
+        )
+        assert slide_window_open(row, _ln(2026, 12, 4, 13, 30)) is True
+        assert slide_window_open(row, _ln(2026, 11, 27, 13, 30)) is False
+        assert slide_window_open(row, _ln(2026, 12, 4, 9, 0)) is False
+        assert slide_window_open(row, _ln(2026, 12, 5, 13, 30)) is False
+
+    def test_fractional_second_time_parses(self):
+        # CMS may serialise times with microseconds; both ends parse.
+        row = _wslide(active_start="13:00:00.000000", active_end="14:00:00")
+        assert slide_window_open(row, _ln(2026, 6, 1, 13, 30)) is True
+
+
+class TestParseWindowFailOpen:
+    """Each dimension fails OPEN (-> None) on missing/garbage input so a
+    malformed manifest never strands a slide closed."""
+
+    def test_all_none_when_no_fields(self):
+        assert parse_window({}) == {
+            "valid_from": None, "valid_to": None, "active_days": None,
+            "active_start": None, "active_end": None,
+        }
+
+    def test_garbage_date_is_none(self):
+        w = parse_window({"valid_from": "not-a-date", "valid_to": 12345})
+        assert w["valid_from"] is None
+        assert w["valid_to"] is None
+
+    def test_garbage_time_is_none(self):
+        w = parse_window({"active_start": "25:99:99", "active_end": None})
+        assert w["active_start"] is None
+
+    def test_active_days_deduped_sorted_clamped(self):
+        # Out-of-range + duplicate + bool entries are dropped/normalised.
+        w = parse_window({"active_days": [4, 0, 0, 9, -1, True]})
+        assert w["active_days"] == [0, 4]
+
+    def test_active_days_empty_becomes_none(self):
+        assert parse_window({"active_days": []})["active_days"] is None
+
+    def test_garbage_slide_window_open_is_visible(self):
+        # A fully-garbage window dict -> all dimensions open -> visible.
+        garbage = {
+            "valid_from": "xx", "valid_to": object(), "active_days": "nope",
+            "active_start": "99:99", "active_end": [],
+        }
+        assert slide_window_open(garbage, _ln(2026, 6, 1)) is True
+
+
+class TestSlideHasWindow:
+    def test_false_when_no_fields(self):
+        assert slide_has_window({}) is False
+        assert slide_has_window({"name": "x", "duration_ms": 5000}) is False
+
+    def test_false_when_all_unparseable(self):
+        assert slide_has_window({"valid_from": "garbage"}) is False
+
+    def test_true_when_any_valid_constraint(self):
+        assert slide_has_window({"valid_from": "2026-12-01"}) is True
+        assert slide_has_window({"active_start": "09:00:00"}) is True
+        assert slide_has_window({"active_days": [0, 1]}) is True
+
+
+class TestVisibleSlides:
+    def test_windowless_deck_all_pass_in_order(self):
+        deck = [{"name": "a"}, {"name": "b"}, {"name": "c"}]
+        assert visible_slides(deck, _ln(2026, 6, 1)) == deck
+
+    def test_filters_closed_and_preserves_order(self):
+        deck = [
+            {"name": "always"},
+            {"name": "morning", "active_start": "09:00:00",
+             "active_end": "12:00:00"},
+            {"name": "afternoon", "active_start": "13:00:00",
+             "active_end": "17:00:00"},
+        ]
+        out = visible_slides(deck, _ln(2026, 6, 1, 13, 30))
+        assert [s["name"] for s in out] == ["always", "afternoon"]
+
+    def test_all_closed_yields_empty(self):
+        deck = [
+            {"name": "x", "active_start": "09:00:00", "active_end": "10:00:00"},
+            {"name": "y", "active_start": "11:00:00", "active_end": "12:00:00"},
+        ]
+        assert visible_slides(deck, _ln(2026, 6, 1, 15, 0)) == []
+
+
+class TestNextWindowBoundary:
+    def test_none_for_windowless_deck(self):
+        deck = [{"name": "a"}, {"name": "b"}]
+        assert next_window_boundary(deck, _ln(2026, 6, 1, 10, 0)) is None
+
+    def test_intraday_returns_next_time_edge(self):
+        # Slide opens 13:00, closes 14:00.  At 10:00 the next edge is 13:00.
+        deck = [{"name": "s", "active_start": "13:00:00", "active_end": "14:00:00"}]
+        b = next_window_boundary(deck, _ln(2026, 6, 1, 10, 0))
+        assert b == _ln(2026, 6, 1, 13, 0)
+
+    def test_after_open_returns_close_edge(self):
+        deck = [{"name": "s", "active_start": "13:00:00", "active_end": "14:00:00"}]
+        b = next_window_boundary(deck, _ln(2026, 6, 1, 13, 30))
+        assert b == _ln(2026, 6, 1, 14, 0)
+
+    def test_valid_to_closes_next_midnight(self):
+        # valid_to is inclusive, so the slide closes at midnight after it.
+        deck = [{"name": "s", "valid_to": "2026-12-26"}]
+        b = next_window_boundary(deck, _ln(2026, 12, 26, 10, 0))
+        assert b == _ln(2026, 12, 27, 0, 0)
+
+    def test_valid_from_opens_that_midnight(self):
+        deck = [{"name": "s", "valid_from": "2026-12-25"}]
+        b = next_window_boundary(deck, _ln(2026, 12, 20, 10, 0))
+        assert b == _ln(2026, 12, 25, 0, 0)
+
+    def test_strictly_future_only(self):
+        # An edge exactly at now is not a *future* boundary; the next one
+        # (the close edge) is returned instead.
+        deck = [{"name": "s", "active_start": "13:00:00", "active_end": "14:00:00"}]
+        b = next_window_boundary(deck, _ln(2026, 6, 1, 13, 0))
+        assert b == _ln(2026, 6, 1, 14, 0)
+
+    def test_expired_slide_falls_back_to_midnight(self):
+        # Every computed edge is in the past -> daily safety-net midnight.
+        deck = [{"name": "s", "valid_to": "2020-01-01"}]
+        b = next_window_boundary(deck, _ln(2026, 6, 1, 10, 0))
+        assert b == _ln(2026, 6, 2, 0, 0)
+
+    def test_weekday_slide_wakes_at_midnight(self):
+        deck = [{"name": "s", "active_days": [0]}]  # Mondays only
+        b = next_window_boundary(deck, _ln(2026, 6, 1, 10, 0))
+        # The weekday dimension can change at the next midnight.
+        assert b == _ln(2026, 6, 2, 0, 0)
+
+
+class TestWindowBoundaryConstant:
+    def test_documented_value(self):
+        assert WINDOW_BOUNDARY_MAX_SLEEP_S == 900
