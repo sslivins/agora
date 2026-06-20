@@ -30,7 +30,7 @@ import hashlib
 import json
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -42,7 +42,7 @@ from typing import Optional
 #: with a higher version are still played back (best-effort) but log a
 #: one-shot "CMS is ahead of this player" INFO message.  Older versions
 #: are accepted unconditionally.
-PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.4"
+PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.5"
 
 
 def parse_schema_version(version: str) -> tuple[int, int]:
@@ -209,6 +209,208 @@ def ordered_slides_for_cycle(
     return [base_slides[i] for i in order]
 
 
+# ── Per-slide visibility windows (agora#226 Phase 2, manifest 1.5) ──
+
+#: Safety net for the window-boundary wake timer in ``player/service.py``.
+#: ``next_window_boundary`` returns the exact civil instant a slide flips
+#: open/closed, but a caller never sleeps longer than this between
+#: re-evaluations so a missed/!misjudged boundary self-heals within ~15min
+#: even on a drifting clock.
+WINDOW_BOUNDARY_MAX_SLEEP_S = 900
+
+
+def _parse_window_date(value: object) -> Optional[date]:
+    """Parse an ISO ``YYYY-MM-DD`` string → :class:`date`; fail-open to None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _parse_window_time(value: object) -> Optional[time]:
+    """Parse an ISO ``HH:MM:SS[.ffffff]`` string → :class:`time`; fail-open."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return time.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _parse_window_days(value: object) -> Optional[list[int]]:
+    """Normalize ``active_days`` → sorted unique ints in [0,6], or None.
+
+    Empty list, None, wrong type, or all-invalid entries → None
+    (always-open for the weekday dimension).
+    """
+    if not isinstance(value, (list, tuple)):
+        return None
+    days = sorted({
+        int(d) for d in value
+        if isinstance(d, int) and not isinstance(d, bool) and 0 <= d <= 6
+    })
+    return days or None
+
+
+def parse_window(slide: dict) -> dict:
+    """Extract + normalize the per-slide visibility window off a manifest slide.
+
+    Returns a dict with keys ``valid_from``/``valid_to`` (:class:`date` | None),
+    ``active_days`` (sorted ``list[int]`` | None), and
+    ``active_start``/``active_end`` (:class:`time` | None).
+
+    **Fail-open per dimension:** any missing, wrong-typed, or unparseable
+    field becomes ``None`` (always-open for that dimension) rather than
+    crashing playback or stranding a slide.  A slide with no window fields
+    yields an all-``None`` dict, which :func:`slide_window_open` treats as
+    always visible — byte-identical to pre-1.5 behaviour.
+    """
+    return {
+        "valid_from": _parse_window_date(slide.get("valid_from")),
+        "valid_to": _parse_window_date(slide.get("valid_to")),
+        "active_days": _parse_window_days(slide.get("active_days")),
+        "active_start": _parse_window_time(slide.get("active_start")),
+        "active_end": _parse_window_time(slide.get("active_end")),
+    }
+
+
+def slide_has_window(slide: dict) -> bool:
+    """True iff ``slide`` carries at least one (well-formed) window constraint."""
+    return any(parse_window(slide).values())
+
+
+def slide_window_open(slide: dict, local_now: datetime) -> bool:
+    """Return True iff ``slide``'s visibility window is open at ``local_now``.
+
+    ``local_now`` is device-local civil time — on the Pi a naive
+    ``datetime.now()`` (the OS timezone is set by cms_client, so the naive
+    system clock already reads device-local wall time).
+
+    Ported verbatim from the CMS resolver predicate
+    (``cms.services.slideshow_resolver._slide_window_open``) so the firmware
+    flips a slide open/closed at the exact same instant the server would.
+
+    A slide is VISIBLE iff ALL configured constraints pass; any unset
+    (None) constraint is "always open" for that dimension:
+
+      * Date range ``[valid_from, valid_to]`` — both ends INCLUSIVE.
+      * Weekday set ``active_days`` (0=Mon..6=Sun) — empty/None = all days.
+      * Time-of-day ``[active_start, active_end)`` — start INCLUSIVE, end
+        EXCLUSIVE; ``active_start > active_end`` is an overnight wrap.
+
+    Wrap + weekday interaction: in the post-midnight tail of a wrapped
+    window the effective weekday is *yesterday's* (the window belongs to
+    the day it opened).
+    """
+    w = parse_window(slide)
+    d = local_now.date()
+    t = local_now.time()
+
+    valid_from = w["valid_from"]
+    valid_to = w["valid_to"]
+    if valid_from is not None and d < valid_from:
+        return False
+    if valid_to is not None and d > valid_to:
+        return False
+
+    start = w["active_start"]
+    end = w["active_end"]
+    days = w["active_days"]
+
+    if start is not None and end is not None and start > end and t < end:
+        effective_wd = (local_now - timedelta(days=1)).weekday()
+    else:
+        effective_wd = local_now.weekday()
+
+    if days and effective_wd not in days:
+        return False
+
+    if start is not None and end is not None:
+        if start < end:
+            if not (start <= t < end):
+                return False
+        else:  # overnight wrap
+            if not (t >= start or t < end):
+                return False
+    elif start is not None:
+        if t < start:
+            return False
+    elif end is not None:
+        if t >= end:
+            return False
+
+    return True
+
+
+def visible_slides(slides: list[dict], local_now: datetime) -> list[dict]:
+    """Filter ``slides`` to those whose visibility window is open at
+    ``local_now``, preserving order.  Windowless slides always pass.
+    """
+    return [s for s in slides if slide_window_open(s, local_now)]
+
+
+def next_window_boundary(
+    slides: list[dict], local_now: datetime,
+) -> Optional[datetime]:
+    """Earliest strictly-future civil instant at which the visible set may
+    change, or ``None`` if no slide carries a window.
+
+    Returns a naive local-civil :class:`datetime` (same clock domain as
+    ``local_now``).  We over-generate candidates — a redundant wake is
+    harmless because the caller re-evaluates :func:`visible_slides` on every
+    wake — but never under-generate, so a boundary is never missed.
+
+    Candidates per windowed slide:
+      * ``valid_from`` @ 00:00 (opens that calendar day)
+      * ``valid_to + 1 day`` @ 00:00 (inclusive end → closes next midnight)
+      * today's + tomorrow's ``active_start`` / ``active_end``
+      * midnight tomorrow for weekday-restricted slides (weekday rolls over)
+
+    Deliberately uses civil ``datetime.combine`` candidates (never
+    ``local_now + timedelta``) so a DST transition shifts the wake to the
+    correct wall-clock instant instead of an absolute offset.
+    """
+    today = local_now.date()
+    midnight_tomorrow = datetime.combine(today + timedelta(days=1), time(0, 0))
+    candidates: list[datetime] = []
+    has_window = False
+
+    for s in slides:
+        w = parse_window(s)
+        if not any(w.values()):
+            continue
+        has_window = True
+        valid_from = w["valid_from"]
+        valid_to = w["valid_to"]
+        start = w["active_start"]
+        end = w["active_end"]
+        days = w["active_days"]
+
+        if valid_from is not None:
+            candidates.append(datetime.combine(valid_from, time(0, 0)))
+        if valid_to is not None:
+            candidates.append(
+                datetime.combine(valid_to + timedelta(days=1), time(0, 0))
+            )
+        for base in (today, today + timedelta(days=1)):
+            if start is not None:
+                candidates.append(datetime.combine(base, start))
+            if end is not None:
+                candidates.append(datetime.combine(base, end))
+        if days is not None:
+            candidates.append(midnight_tomorrow)
+
+    future = [c for c in candidates if c > local_now]
+    if future:
+        return min(future)
+    # Windowed slides exist but every computed boundary is in the past
+    # (e.g. a permanently-closed expired slide): re-evaluate at the next
+    # midnight as a daily safety net rather than never waking.
+    if has_window:
+        return midnight_tomorrow
+    return None
 
 
 

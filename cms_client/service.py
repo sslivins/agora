@@ -54,7 +54,21 @@ PROTOCOL_VERSION = 2
 #   persisting them, and rendering the member via ``show_html`` in the
 #   slideshow loop. The CMS gates composed-bearing slideshows on this
 #   flag so pre-feature firmware never receives one.
-DEVICE_CAPABILITIES = ["slideshow_v1", "composed_siblings_v1", "slideshow_composed_v1"]
+# - "slideshow_visibility_v1": this firmware evaluates per-slide
+#   visibility windows (manifest schema 1.5: ``valid_from``/``valid_to``
+#   date range, ``active_days`` weekday mask, ``active_start``/
+#   ``active_end`` time-of-day window) on-device in device-local civil
+#   time, showing/hiding individual slides at the exact local-clock
+#   boundary even while network-isolated. The CMS sends the full deck
+#   (including currently-closed slides) to such devices and lets the
+#   firmware do the windowing; pre-feature firmware keeps receiving the
+#   server-side filtered deck.
+DEVICE_CAPABILITIES = [
+    "slideshow_v1",
+    "composed_siblings_v1",
+    "slideshow_composed_v1",
+    "slideshow_visibility_v1",
+]
 
 # Bootstrap v2 renewal policy (issue #420 stage B.3).
 # Minimum delay between JWT refreshes on the renewal task, so a clock
