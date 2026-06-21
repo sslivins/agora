@@ -42,7 +42,7 @@ from typing import Optional
 #: with a higher version are still played back (best-effort) but log a
 #: one-shot "CMS is ahead of this player" INFO message.  Older versions
 #: are accepted unconditionally.
-PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.5"
+PLAYER_MAX_MANIFEST_SCHEMA_VERSION = "1.6"
 
 
 def parse_schema_version(version: str) -> tuple[int, int]:

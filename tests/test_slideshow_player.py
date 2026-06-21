@@ -169,15 +169,15 @@ class TestManifestSchemaVersion:
         self._write_versioned_manifest(player, "Show", [
             {"name": "a.png", "asset_type": "image",
              "duration_ms": 1000, "play_to_end": False},
-        ], version="1.6")
+        ], version="1.7")
         with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
             player._start_slideshow("Show", None)
         assert player._slideshow is not None
-        assert player._slideshow["schema_version"] == "1.6"
+        assert player._slideshow["schema_version"] == "1.7"
         # INFO logged, mentions both the observed and the player-max version.
         assert any(
-            "manifest_schema_version=1.6" in rec.getMessage()
-            and "player max=1.5" in rec.getMessage()
+            "manifest_schema_version=1.7" in rec.getMessage()
+            and "player max=1.6" in rec.getMessage()
             for rec in caplog.records
         ), f"forward-version INFO not logged: {[r.getMessage() for r in caplog.records]}"
 
@@ -187,14 +187,14 @@ class TestManifestSchemaVersion:
         self._write_versioned_manifest(player, "Show", [
             {"name": "a.png", "asset_type": "image",
              "duration_ms": 1000, "play_to_end": False},
-        ], version="1.6")
+        ], version="1.7")
         with patch.object(svc, "GLib"), caplog.at_level("INFO", logger="agora.player"):
             player._start_slideshow("Show", None)
             player._clear_slideshow()
             player._start_slideshow("Show", None)
         forward_logs = [
             r for r in caplog.records
-            if "manifest_schema_version=1.6" in r.getMessage()
+            if "manifest_schema_version=1.7" in r.getMessage()
         ]
         assert len(forward_logs) == 1, (
             f"forward-version INFO should fire once per digest, got "
@@ -1296,3 +1296,177 @@ class TestAnchoredPlayback:
             "overrun branch must NOT call stop() -- that kills the "
             "kiosk + shell server and orphans every subsequent show_*"
         )
+
+
+class TestSlideshowVideoClip:
+    """Per-slide source trim (manifest schema 1.6, capability
+    ``slideshow_clip_v1``).
+
+    ``clip_start_ms`` is a seek offset into the *source* video. On the
+    anchored path it stacks on top of the within-slot offset so a
+    late/restarted player lines up with the rest of the wall; a clipped
+    video must not loop (looping would wrap past the clip's source EOF
+    back to pre-clip frames).
+    """
+
+    def _write_anchored(self, player, name, slides, started_at,
+                        schema="1.6"):
+        import json
+        path = player.assets_dir / "slideshows" / f"{name}.json"
+        path.write_text(json.dumps({
+            "name": name,
+            "manifest_schema_version": schema,
+            "started_at": started_at,
+            "cycle_duration_ms": sum(s["duration_ms"] for s in slides),
+            "slides": slides,
+        }))
+        return path
+
+    def test_anchored_clip_stacks_on_within_slot_offset(self, mpv_player):
+        """source seek = within_slot_offset + clip_start_ms."""
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        from datetime import datetime, timedelta, timezone
+        # 60s slide, anchored 25s ago -> within_slot == 25_000;
+        # clip_start_ms == 10_000 -> source seek ~= 35_000.
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=25)
+        self._write_anchored(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video", "duration_ms": 60_000,
+             "play_to_end": False, "clip_start_ms": 10_000},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/v.mp4"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_video.assert_called_once()
+        kwargs = player._chromium_player.show_video.call_args.kwargs
+        assert 34_000 <= kwargs["start_offset_ms"] <= 36_000
+        # Clipped video must not loop.
+        assert kwargs["loop"] is False
+
+    def test_anchored_unclipped_video_still_loops(self, mpv_player):
+        """No clip_start_ms -> loop stays True (no source-seek wrap risk)."""
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        from datetime import datetime, timedelta, timezone
+        anchor = datetime.now(timezone.utc) - timedelta(seconds=5)
+        self._write_anchored(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video", "duration_ms": 60_000,
+             "play_to_end": False},
+        ], started_at=anchor.isoformat().replace("+00:00", "Z"))
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/v.mp4"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_video.assert_called_once()
+        kwargs = player._chromium_player.show_video.call_args.kwargs
+        assert kwargs["loop"] is True
+
+    def test_nonanchored_clip_seek_and_no_loop(self, mpv_player):
+        """On the non-anchored next-slide path, clip_start_ms is the bare
+        source seek (no within-slot stacking) and loop is disabled."""
+        player, svc = mpv_player
+        (player.assets_dir / "videos" / "v.mp4").touch()
+        _write_manifest(player, "Show", [
+            {"name": "v.mp4", "asset_type": "video", "duration_ms": 8_000,
+             "play_to_end": False, "clip_start_ms": 3_000},
+        ])
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        player._chromium_player.asset_url.return_value = "file:///x/v.mp4"
+        with patch.object(svc, "GLib") as glib:
+            glib.timeout_add.return_value = 1
+            player._start_slideshow("Show", None)
+        player._chromium_player.show_video.assert_called_once()
+        kwargs = player._chromium_player.show_video.call_args.kwargs
+        assert kwargs["start_offset_ms"] == 3_000
+        assert kwargs["loop"] is False
+
+
+class TestAnchoredSnapGuard:
+    """``_should_defer_anchored_snap`` — defers a wall-clock SNAP only
+    while a play_to_end video is inside its natural-end window, so the
+    natural ``ended`` event wins instead of an early teardown +
+    double-advance. A bounded clip (no pending record) or a multi-slide
+    jump must NOT be deferred.
+    """
+
+    def _ss(self, slides, pending=None, cycle_ms=None):
+        return {
+            "name": "Show",
+            "slides": slides,
+            "cycle_duration_ms": (
+                cycle_ms if cycle_ms is not None
+                else sum(s["duration_ms"] for s in slides)
+            ),
+            "pending_play_to_end_chromium": pending,
+        }
+
+    def _slides(self):
+        return [
+            {"name": "v.mp4", "asset_type": "video", "duration_ms": 10_000,
+             "play_to_end": True},
+            {"name": "n.png", "asset_type": "image", "duration_ms": 10_000,
+             "play_to_end": False},
+        ]
+
+    def _armed(self, slide_index, seconds_ago):
+        from datetime import datetime, timedelta, timezone
+        return {
+            "slide_index": slide_index,
+            "slide_name": "v.mp4",
+            "armed_at": datetime.now(timezone.utc) - timedelta(seconds=seconds_ago),
+            "asset_url": "/assets/v.mp4",
+        }
+
+    def test_defers_play_to_end_at_immediate_next(self, mpv_player):
+        player, _ = mpv_player
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        ss = self._ss(self._slides(), pending=self._armed(0, seconds_ago=11))
+        # current=0 (the play_to_end video), target=1 (immediate next),
+        # armed 11s ago vs 10s slide -> within overrun tolerance -> defer.
+        assert player._should_defer_anchored_snap(ss, 0, 1) is True
+
+    def test_does_not_defer_bounded_clip_no_pending(self, mpv_player):
+        player, _ = mpv_player
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        # A pure bounded clip arms NO pending record: its SNAP at the
+        # slot edge IS its advance mechanism -> must not be deferred.
+        ss = self._ss(self._slides(), pending=None)
+        assert player._should_defer_anchored_snap(ss, 0, 1) is False
+
+    def test_does_not_defer_multi_slide_jump(self, mpv_player):
+        player, _ = mpv_player
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        slides = self._slides() + [
+            {"name": "c.png", "asset_type": "image", "duration_ms": 10_000,
+             "play_to_end": False},
+        ]
+        ss = self._ss(slides, pending=self._armed(0, seconds_ago=5))
+        # target jumps from 0 to 2 (genuine drift) -> snap immediately.
+        assert player._should_defer_anchored_snap(ss, 0, 2) is False
+
+    def test_does_not_defer_past_overrun_tolerance(self, mpv_player):
+        player, _ = mpv_player
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        # Armed 5 minutes ago: well past slide_dur + tolerance -> stop
+        # holding so playback can never wedge.
+        ss = self._ss(self._slides(), pending=self._armed(0, seconds_ago=300))
+        assert player._should_defer_anchored_snap(ss, 0, 1) is False
+
+    def test_does_not_defer_pending_for_other_slide(self, mpv_player):
+        player, _ = mpv_player
+        player._use_chromium_backend = True
+        player._chromium_player = MagicMock()
+        # Pending record is for a different slide index than current ->
+        # not the end-wait we protect.
+        ss = self._ss(self._slides(), pending=self._armed(1, seconds_ago=5))
+        assert player._should_defer_anchored_snap(ss, 0, 1) is False

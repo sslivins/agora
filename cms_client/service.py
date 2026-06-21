@@ -63,11 +63,18 @@ PROTOCOL_VERSION = 2
 #   (including currently-closed slides) to such devices and lets the
 #   firmware do the windowing; pre-feature firmware keeps receiving the
 #   server-side filtered deck.
+# - "slideshow_clip_v1": this firmware honours per-slide source trim
+#   (manifest schema 1.6: ``clip_start_ms``) by seeking the source video
+#   to that offset (stacked on top of the within-slot anchored offset)
+#   and disabling loop for clipped slides so they never wrap back to
+#   pre-clip frames. Pre-feature firmware ignores the field and plays
+#   the slide from t=0.
 DEVICE_CAPABILITIES = [
     "slideshow_v1",
     "composed_siblings_v1",
     "slideshow_composed_v1",
     "slideshow_visibility_v1",
+    "slideshow_clip_v1",
 ]
 
 # Bootstrap v2 renewal policy (issue #420 stage B.3).
