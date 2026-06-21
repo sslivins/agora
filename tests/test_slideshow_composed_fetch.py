@@ -169,6 +169,11 @@ class TestSlideshowComposedCapability:
         only emits composed slideshow members to capable firmware."""
         assert "slideshow_composed_v1" in DEVICE_CAPABILITIES
 
+    def test_clip_capability_advertised(self):
+        """Per-slide video clip (trim) capability must be advertised so
+        the CMS only emits clip_start_ms slides to capable firmware."""
+        assert "slideshow_clip_v1" in DEVICE_CAPABILITIES
+
 
 class TestSlideshowComposedFetch:
     @pytest.mark.asyncio

@@ -886,10 +886,19 @@ class AgoraPlayer:
             slide_duration_ms = int(slide.get("duration_ms") or 0)
             slide_fit = slide.get("fit") or None
             slide_effect = slide.get("effect") or None
-            start_offset_ms = (
+            # Per-slide source trim (manifest 1.6): ``clip_start_ms`` is a
+            # seek offset into the *source* file. It stacks on top of the
+            # within-slot offset so a late/restarted player still lines up
+            # with the rest of the wall: source currentTime =
+            # clip_start_ms + (how far into this slide's slot we are).
+            clip_start_ms = (
+                int(slide.get("clip_start_ms") or 0) if is_video_slide else 0
+            )
+            within_slot_ms = (
                 max(0, slide_duration_ms - remaining_ms)
                 if is_video_slide and slide_duration_ms > 0 else 0
             )
+            start_offset_ms = within_slot_ms + clip_start_ms
             if play_to_end:
                 self._play_slide_to_end_chromium(
                     slide, slide_name, path, ss,
@@ -907,8 +916,11 @@ class AgoraPlayer:
                     duration_ms=slide_transition_ms,
                 )
             elif is_video_slide:
+                # A clipped video (clip_start_ms > 0) must NOT loop: looping
+                # would wrap past the clip's source EOF back to pre-clip
+                # frames. Un-clipped videos keep looping within their slot.
                 self._chromium_player.show_video(
-                    path, loop=True, muted=False,
+                    path, loop=(clip_start_ms == 0), muted=False,
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
                     start_offset_ms=start_offset_ms,
@@ -950,6 +962,56 @@ class AgoraPlayer:
         )
         return False
 
+    def _should_defer_anchored_snap(
+        self, ss: dict, current_idx: int, target_idx: int,
+    ) -> bool:
+        """Anchored-resync SNAP guard.
+
+        When a ``play_to_end`` video is a hair from its natural ``ended``
+        event, a wall-clock SNAP to the next slide would (a) tear the
+        video down a fraction early and (b) leave a stale
+        ``pending_play_to_end*`` record that the late ``ended`` then
+        matches → a spurious *second* advance. Defer the SNAP (re-arm a
+        tick) so the natural end wins — but only while we're still inside
+        the overrun tolerance. Past that, the normal SNAP / overrun
+        watchdog takes over so playback can never wedge.
+
+        Only ``play_to_end`` slides arm a ``pending`` record, so a pure
+        bounded video clip (no pending) is *never* deferred — its SNAP at
+        the slot edge IS its advance mechanism. Likewise a multi-slide
+        jump (genuine drift) snaps immediately to catch up.
+        """
+        slides = ss.get("active_cycle_slides") or ss["slides"]
+        n = len(slides)
+        if n <= 0 or not (0 <= current_idx < n):
+            return False
+        # Only the immediate-next slide is a natural-end race; a jump of
+        # more than one slide means we've genuinely drifted → snap now.
+        if target_idx != (current_idx + 1) % n:
+            return False
+        if self._use_chromium_backend and self._chromium_player:
+            pending = ss.get("pending_play_to_end_chromium")
+        else:
+            pending = ss.get("pending_play_to_end")
+        # No pending, or pending for a different slide → not a play_to_end
+        # end-wait we need to protect (e.g. a bounded clip or plain timed
+        # slide) → snap normally.
+        if not pending or pending.get("slide_index") != current_idx:
+            return False
+        armed_at = pending.get("armed_at")
+        if armed_at is None:
+            return False
+        slide_dur = int((slides[current_idx] or {}).get("duration_ms") or 0)
+        if slide_dur <= 0:
+            return False
+        cycle_ms = int(ss.get("cycle_duration_ms") or 0)
+        overrun_tolerance = max(2 * _RESYNC_CAP_MS, cycle_ms // 4, 10_000)
+        elapsed_since_arm = (
+            datetime.now(timezone.utc) - armed_at
+        ).total_seconds() * 1000
+        # Inside the natural-end window → hold and let the video finish.
+        return elapsed_since_arm <= slide_dur + overrun_tolerance
+
     def _on_anchored_resync_tick(self, epoch: int) -> bool:
         """GLib timeout for the wall-clock-anchored resync tick.
 
@@ -977,6 +1039,17 @@ class AgoraPlayer:
         current_idx = ss.get("anchored_current_idx", -1)
 
         if target_idx != current_idx:
+            if self._should_defer_anchored_snap(ss, current_idx, target_idx):
+                logger.info(
+                    "Slideshow %s: anchored resync deferring SNAP idx=%d→%d "
+                    "(play_to_end still within natural-end window)",
+                    ss["name"], current_idx, target_idx,
+                )
+                tick_ms = self._anchored_tick_ms(ss, remaining_ms)
+                ss["timeout_id"] = GLib.timeout_add(
+                    tick_ms, self._on_anchored_resync_tick, epoch,
+                )
+                return False
             logger.info(
                 "Slideshow %s: anchored resync SNAP from idx=%d to idx=%d "
                 "(remaining_ms=%d)",
@@ -1163,11 +1236,16 @@ class AgoraPlayer:
                 return False
             if is_video_slide:
                 # Slideshow videos loop within their fixed duration; the
-                # next-slide timeout drives advance.
+                # next-slide timeout drives advance. A clipped video
+                # (clip_start_ms > 0) seeks into the source and must NOT
+                # loop (it would wrap past the clip back to pre-clip
+                # frames).
+                clip_start_ms = int(slide.get("clip_start_ms") or 0)
                 self._chromium_player.show_video(
-                    path, loop=True, muted=False,
+                    path, loop=(clip_start_ms == 0), muted=False,
                     transition=slide_transition,
                     duration_ms=slide_transition_ms,
+                    start_offset_ms=clip_start_ms,
                     fit=slide_fit,
                 )
             elif is_composed_slide:

@@ -225,7 +225,7 @@ class TestConstants:
         # docs and the CMS-side scheduler.
         assert CLOCK_SKEW_TOLERANCE_S == 3600
         assert RESYNC_CAP_MS == 5000
-        assert PLAYER_MAX_MANIFEST_SCHEMA_VERSION == "1.5"
+        assert PLAYER_MAX_MANIFEST_SCHEMA_VERSION == "1.6"
 
 
 class TestCycleIndexAt:
