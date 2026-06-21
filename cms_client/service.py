@@ -2470,6 +2470,16 @@ class CMSClient:
                     # direction. Persist verbatim; default None so pre-1.4
                     # manifests stay a no-op.
                     "effect_direction": s.get("effect_direction"),
+                    # Per-slide source trim (manifest schema 1.6, capability
+                    # ``slideshow_clip_v1``). ``clip_start_ms`` is a seek
+                    # offset into the source video. The player honours it
+                    # (player/service.py) ONLY if it survives persistence —
+                    # without this line the wire value was silently dropped
+                    # here, so a trimmed slide played from 0 (duration was
+                    # still honoured because ``duration_ms`` is persisted).
+                    # Persist as an int; default 0 so legacy/untrimmed and
+                    # pre-1.6 manifests read as a no-op (no seek).
+                    "clip_start_ms": int(s.get("clip_start_ms") or 0),
                     # Composed members persist their sibling list so cold-start
                     # completeness + eviction-protection survive a reboot.
                     **(

@@ -328,6 +328,64 @@ class TestSlideshowFetch:
         assert manifest["slides"][0]["effect_direction"] == "out_down_right"
 
     @pytest.mark.asyncio
+    async def test_clip_start_ms_propagated_from_wire(self, cms_client):
+        """Per-slide source trim regression (manifest schema 1.6,
+        capability ``slideshow_clip_v1``): when CMS provides
+        ``clip_start_ms``, it must be persisted into the on-disk
+        manifest. The player reads it from there to seek the source
+        video; dropping it here silently played trimmed videos from 0
+        (the symptom the user hit: duration honoured, start ignored).
+        """
+        b1 = b"trimmed-video-bytes"
+        slide = _make_slide("Sony_AV1.mp4", b1, asset_type="video",
+                            duration_ms=30000)
+        slide["clip_start_ms"] = 15000
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "Trimmed.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "manifest_schema_version": "1.6",
+            "slides": [slide],
+        }
+        mapping = {slide["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest_path = cms_client.settings.slideshows_dir / "Trimmed.slideshow.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["slides"][0]["clip_start_ms"] == 15000
+
+    @pytest.mark.asyncio
+    async def test_clip_start_ms_defaults_to_zero_when_absent(self, cms_client):
+        """Older CMS (pre-1.6) or untrimmed slides omit ``clip_start_ms``.
+        Persist ``0`` so the player's seek is a no-op (plays from start).
+        """
+        b1 = b"sb"
+        slides = [_make_slide("a.mp4", b1, asset_type="video", duration_ms=5000)]
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "NoClip.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "slides": slides,
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest = json.loads(
+            (cms_client.settings.slideshows_dir / "NoClip.slideshow.json").read_text()
+        )
+        assert manifest["slides"][0]["clip_start_ms"] == 0
+
+    @pytest.mark.asyncio
     async def test_fit_effect_default_when_absent(self, cms_client):
         """Older CMS (pre-1.3) omits ``fit``/``effect``. Persist ``null``
         so the player's ``slide.get(...) or None`` reads a no-op,
