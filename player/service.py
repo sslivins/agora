@@ -50,6 +50,29 @@ from player.slideshow_engine import (  # noqa: E402
 logger = logging.getLogger("agora.player")
 
 
+def _device_local_now() -> datetime:
+    """Return naive device-local civil time, refreshing the process
+    timezone from ``/etc/localtime`` first.
+
+    The player process can start *before* ``cms_client`` sets the OS
+    timezone (a boot-ordering race). When that happens glibc caches UTC
+    at the first ``localtime()`` call and a naive ``datetime.now()``
+    stays on UTC for the whole process lifetime — so every per-slide
+    visibility window (manifest schema >= 1.5) is evaluated against the
+    wrong civil clock and otherwise-open slides are suppressed (or
+    closed slides shown) until the player happens to restart.
+
+    ``time.tzset()`` forces glibc to re-read ``/etc/localtime`` so the
+    process picks up the timezone even if it was set after launch, and
+    windows flip at the correct local boundary. ``tzset`` is Unix-only;
+    on Windows (softplayer dev tool) it is absent and the call is a
+    no-op, preserving the existing behavior.
+    """
+    if hasattr(time, "tzset"):
+        time.tzset()
+    return datetime.now()
+
+
 def _parse_schema_version(version: str) -> tuple[int, int]:
     """Parse a ``major.minor`` (or ``major.minor.patch``) version string.
 
@@ -642,10 +665,14 @@ class AgoraPlayer:
         now = datetime.now(timezone.utc)
         # Naive system-local civil time for per-slide visibility windows.
         # On the Pi the OS timezone is set by cms_client, so a naive
-        # ``datetime.now()`` reads the device's local wall clock — exactly
-        # what the CMS predicate evaluates against. Softplayer on Windows
-        # gets Windows-local time (a dev-tool caveat, not a fleet concern).
-        local_now = datetime.now()
+        # device-local clock reads the device's local wall clock — exactly
+        # what the CMS predicate evaluates against. ``_device_local_now``
+        # refreshes the process timezone first so a player that started
+        # before cms_client set ``/etc/localtime`` does not stay stuck on
+        # UTC (which would mis-evaluate every window). Softplayer on
+        # Windows gets Windows-local time (a dev-tool caveat, not a fleet
+        # concern).
+        local_now = _device_local_now()
         base_slides = ss.get("slides") or []
         anchor = ss.get("anchor")
 
@@ -768,7 +795,7 @@ class AgoraPlayer:
         boundary = ss.get("window_boundary")
         if boundary is not None:
             ms_to_boundary = int(
-                (boundary - datetime.now()).total_seconds() * 1000
+                (boundary - _device_local_now()).total_seconds() * 1000
             )
             ms_to_boundary = max(
                 1,
