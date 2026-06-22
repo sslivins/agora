@@ -2480,6 +2480,24 @@ class CMSClient:
                     # Persist as an int; default 0 so legacy/untrimmed and
                     # pre-1.6 manifests read as a no-op (no seek).
                     "clip_start_ms": int(s.get("clip_start_ms") or 0),
+                    # Per-slide visibility windows (manifest schema 1.5,
+                    # capability ``slideshow_visibility_v1``). The player's
+                    # window engine (player/slideshow_engine.py ->
+                    # parse_window/slide_window_open) evaluates these against
+                    # the device's local clock so a slide flips open/closed at
+                    # the exact local boundary, even offline. The player reads
+                    # them from the PERSISTED manifest (player/service.py:659
+                    # ``any(_slide_has_window(s) for s in base_slides)``), so
+                    # without these lines the wire values were silently dropped
+                    # here -> every persisted slide had no window -> the deck
+                    # read as ``windowed=False`` and ALL slides played always
+                    # (the window was never honoured). Persist verbatim; default
+                    # None so windowless/pre-1.5 slides read as always-visible.
+                    "valid_from": s.get("valid_from"),
+                    "valid_to": s.get("valid_to"),
+                    "active_days": s.get("active_days"),
+                    "active_start": s.get("active_start"),
+                    "active_end": s.get("active_end"),
                     # Composed members persist their sibling list so cold-start
                     # completeness + eviction-protection survive a reboot.
                     **(

@@ -386,6 +386,78 @@ class TestSlideshowFetch:
         assert manifest["slides"][0]["clip_start_ms"] == 0
 
     @pytest.mark.asyncio
+    async def test_visibility_window_fields_propagated_from_wire(self, cms_client):
+        """Per-slide visibility regression (manifest schema 1.5, capability
+        ``slideshow_visibility_v1``): when CMS provides window fields
+        (``valid_from``/``valid_to``/``active_days``/``active_start``/
+        ``active_end``) they must be persisted verbatim into the on-disk
+        manifest. The player's window engine reads them from the PERSISTED
+        manifest (player/service.py ``any(_slide_has_window(s) for s in
+        base_slides)``); dropping them here makes every deck read as
+        ``windowed=False`` so ALL slides play always (the symptom the user
+        hit: a 09:10-09:15 slide showed at 09:08).
+        """
+        b1 = b"windowed-slide-bytes"
+        slide = _make_slide("promo.png", b1, asset_type="image",
+                            duration_ms=8000)
+        slide["valid_from"] = "2026-12-01"
+        slide["valid_to"] = "2026-12-26"
+        slide["active_days"] = [0, 1, 2, 3, 4]
+        slide["active_start"] = "09:10:00"
+        slide["active_end"] = "09:15:00"
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "Windowed.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "manifest_schema_version": "1.5",
+            "slides": [slide],
+        }
+        mapping = {slide["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        manifest_path = cms_client.settings.slideshows_dir / "Windowed.slideshow.json"
+        persisted = json.loads(manifest_path.read_text())["slides"][0]
+        assert persisted["valid_from"] == "2026-12-01"
+        assert persisted["valid_to"] == "2026-12-26"
+        assert persisted["active_days"] == [0, 1, 2, 3, 4]
+        assert persisted["active_start"] == "09:10:00"
+        assert persisted["active_end"] == "09:15:00"
+
+    @pytest.mark.asyncio
+    async def test_visibility_window_fields_default_none_when_absent(self, cms_client):
+        """Older CMS (pre-1.5) or always-visible slides omit the window
+        fields. Persist ``null`` so the player's ``parse_window`` reads an
+        all-None window -> ``slide_has_window`` False -> the slide is always
+        visible (byte-identical to pre-1.5 behaviour).
+        """
+        b1 = b"sb"
+        slides = [_make_slide("a.png", b1, asset_type="image", duration_ms=5000)]
+        msg = {
+            "type": "fetch_asset",
+            "asset_name": "NoWindow.slideshow",
+            "asset_type": "slideshow",
+            "download_url": "",
+            "checksum": "h",
+            "size_bytes": 0,
+            "slides": slides,
+        }
+        mapping = {slides[0]["download_url"]: b1}
+        fake_aiohttp, _ = _patch_aiohttp(mapping)
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
+            await cms_client._handle_fetch_asset(msg, cms_client._ws)
+
+        persisted = json.loads(
+            (cms_client.settings.slideshows_dir / "NoWindow.slideshow.json").read_text()
+        )["slides"][0]
+        for k in ("valid_from", "valid_to", "active_days", "active_start", "active_end"):
+            assert persisted[k] is None, f"{k} should persist as None when absent"
+
+    @pytest.mark.asyncio
     async def test_fit_effect_default_when_absent(self, cms_client):
         """Older CMS (pre-1.3) omits ``fit``/``effect``. Persist ``null``
         so the player's ``slide.get(...) or None`` reads a no-op,
