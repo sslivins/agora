@@ -1470,3 +1470,62 @@ class TestAnchoredSnapGuard:
         # not the end-wait we protect.
         ss = self._ss(self._slides(), pending=self._armed(1, seconds_ago=5))
         assert player._should_defer_anchored_snap(ss, 0, 1) is False
+
+
+# --- Regression: player cached-timezone window suppression -------------------
+#
+# The agora-player process can start *before* cms_client finalizes the OS
+# timezone (a boot-ordering race). With TZ unset, glibc reads /etc/localtime
+# exactly once and caches it for the process lifetime, so a naive
+# datetime.now() is permanently stuck on UTC -- and every per-slide
+# visibility window (manifest schema >= 1.5) is evaluated against the wrong
+# civil clock. _device_local_now() forces time.tzset() before reading the
+# clock so the process self-heals once the zone is set, without a restart.
+
+
+def _import_player_service():
+    """Import player.service with gi mocked (works on Windows + Linux)."""
+    with patch.dict("sys.modules", {
+        "gi": MagicMock(),
+        "gi.repository": MagicMock(),
+    }):
+        import importlib
+        import player.service as svc
+        importlib.reload(svc)
+        return svc
+
+
+def test_device_local_now_forces_timezone_refresh(monkeypatch):
+    """The helper must call time.tzset() (re-reading /etc/localtime) before
+    sampling the clock, so a process that cached UTC at boot recovers the
+    correct device-local zone for window math."""
+    svc = _import_player_service()
+    if not hasattr(svc.time, "tzset"):
+        pytest.skip("time.tzset is POSIX-only")
+
+    calls = {"n": 0}
+    real_tzset = svc.time.tzset
+
+    def counting_tzset():
+        calls["n"] += 1
+        return real_tzset()
+
+    monkeypatch.setattr(svc.time, "tzset", counting_tzset)
+
+    result = svc._device_local_now()
+
+    assert calls["n"] == 1, "expected exactly one tzset() refresh per call"
+    assert isinstance(result, svc.datetime)
+    assert result.tzinfo is None, "window math relies on naive local civil time"
+
+
+def test_device_local_now_no_tzset_is_safe(monkeypatch):
+    """On platforms without tzset (Windows / softplayer dev tool) the helper
+    is a no-op over datetime.now() -- it must not raise."""
+    svc = _import_player_service()
+    monkeypatch.delattr(svc.time, "tzset", raising=False)
+
+    result = svc._device_local_now()
+
+    assert isinstance(result, svc.datetime)
+    assert result.tzinfo is None
