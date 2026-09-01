@@ -119,6 +119,17 @@ class TestScheduleMatchesNow:
         entry = self._entry(start_time="22:00", end_time="06:00")
         assert _schedule_matches_now(entry, datetime(2026, 3, 28, 14, 0)) is False
 
+    def test_overnight_uses_yesterdays_weekday_for_post_midnight_tail(self):
+        """Mon 22:00-02:00 remains active during the Tuesday early-morning tail."""
+        entry = self._entry(start_time="22:00", end_time="02:00", days_of_week=[1])
+        assert _schedule_matches_now(entry, datetime(2026, 3, 31, 1, 0)) is True
+        assert _schedule_matches_now(entry, datetime(2026, 4, 1, 1, 0)) is False
+
+    def test_plain_overnight_matches_on_both_sides_of_midnight(self):
+        entry = self._entry(start_time="22:00", end_time="02:00")
+        assert _schedule_matches_now(entry, datetime(2026, 3, 30, 23, 0)) is True
+        assert _schedule_matches_now(entry, datetime(2026, 3, 31, 1, 0)) is True
+
     def test_before_start_date(self):
         entry = self._entry(start_date="2026-04-01")
         now = datetime(2026, 3, 28, 12, 0)
@@ -163,7 +174,9 @@ class TestScheduleMatchesNow:
     def test_same_start_end(self):
         """Zero-length window should not match."""
         entry = self._entry(start_time="12:00", end_time="12:00")
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 11, 59)) is False
         assert _schedule_matches_now(entry, datetime(2026, 3, 28, 12, 0)) is False
+        assert _schedule_matches_now(entry, datetime(2026, 3, 28, 12, 1)) is False
 
     def test_second_resolution_start_inclusive(self):
         """Start time with seconds is inclusive."""
@@ -203,6 +216,98 @@ class TestScheduleMatchesNow:
         entry = self._entry(start_date="2026-03-28")
         now = datetime(2026, 3, 28, 12, 0)
         assert _schedule_matches_now(entry, now) is True
+
+    def test_overnight_yesterday_anchor_honors_inclusive_end_date(self):
+        """A schedule ending Monday remains active in its Tuesday tail."""
+        entry = self._entry(
+            start_time="22:00",
+            end_time="02:00",
+            start_date="2026-03-30",
+            end_date="2026-03-30",
+            days_of_week=[1],
+        )
+        assert _schedule_matches_now(entry, datetime(2026, 3, 31, 1, 0)) is True
+
+    def test_overnight_yesterday_anchor_rejects_anchor_before_start_date(self):
+        entry = self._entry(
+            start_time="22:00",
+            end_time="02:00",
+            start_date="2026-03-31",
+        )
+        assert _schedule_matches_now(entry, datetime(2026, 3, 31, 1, 0)) is False
+
+
+class TestScheduleWinnerSelection:
+    """Test deterministic winner selection among matching schedules."""
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 3, 28, 12, 0, tzinfo=tz)
+
+        @classmethod
+        def utcnow(cls):
+            return cls(2026, 3, 28, 12, 0)
+
+    def _make_client(self, tmp_path, assets):
+        from api.config import Settings
+        from cms_client.service import CMSClient
+
+        settings = Settings(
+            agora_base=tmp_path,
+            api_key="test",
+            web_username="admin",
+            web_password="test",
+            secret_key="test",
+            device_name="test",
+        )
+        settings.ensure_dirs()
+        client = CMSClient(settings)
+        for asset in assets:
+            client.asset_manager.register(asset, f"videos/{asset}", 1024, "")
+        return client
+
+    def _entry(self, schedule_id, asset, priority=10):
+        return {
+            "id": schedule_id,
+            "name": schedule_id,
+            "asset": asset,
+            "start_time": "00:00",
+            "end_time": "23:59:59",
+            "start_date": None,
+            "end_date": None,
+            "days_of_week": None,
+            "priority": priority,
+        }
+
+    def _evaluate_asset(self, tmp_path, schedules):
+        from shared.models import DesiredState
+        from shared.state import read_state
+
+        client = self._make_client(tmp_path, ["aaa.mp4", "zzz.mp4"])
+        with patch("cms_client.service.datetime", self._FixedDateTime):
+            client._evaluate_schedule(
+                {
+                    "timezone": "UTC",
+                    "schedules": schedules,
+                    "default_asset": None,
+                }
+            )
+        return read_state(client.settings.desired_state_path, DesiredState).asset
+
+    def test_equal_priority_chooses_lexicographically_smallest_id(self, tmp_path):
+        schedules = [
+            self._entry("zzz", "zzz.mp4"),
+            self._entry("aaa", "aaa.mp4"),
+        ]
+        assert self._evaluate_asset(tmp_path, schedules) == "aaa.mp4"
+
+    def test_equal_priority_tie_break_is_independent_of_input_order(self, tmp_path):
+        schedules = [
+            self._entry("aaa", "aaa.mp4"),
+            self._entry("zzz", "zzz.mp4"),
+        ]
+        assert self._evaluate_asset(tmp_path, schedules) == "aaa.mp4"
 
 
 # ── _schedule_starts_within_hours tests ──

@@ -287,32 +287,35 @@ def _parse_time(s: str) -> tuple[int, int, int]:
 
 
 def _schedule_matches_now(entry: dict, now: datetime) -> bool:
-    """Check if a schedule entry is active at the given local datetime."""
-    start_date = entry.get("start_date")
-    if start_date and now.date() < date.fromisoformat(start_date):
-        return False
-    end_date = entry.get("end_date")
-    if end_date and now.date() > date.fromisoformat(end_date):
-        return False
-
-    days = entry.get("days_of_week")
-    if days and now.isoweekday() not in days:
-        return False
-
+    """Check if a schedule entry has an occurrence covering ``now``."""
     sh, sm, ss = _parse_time(entry["start_time"])
     eh, em, es = _parse_time(entry["end_time"])
     start_secs = sh * 3600 + sm * 60 + ss
     end_secs = eh * 3600 + em * 60 + es
+    if end_secs == start_secs:
+        return False
+    if end_secs < start_secs:
+        end_secs += 24 * 3600
+
+    start_date = entry.get("start_date")
+    start_date_value = date.fromisoformat(start_date) if start_date else None
+    end_date = entry.get("end_date")
+    end_date_value = date.fromisoformat(end_date) if end_date else None
+    days = set(entry.get("days_of_week") or range(1, 8))
     cur_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-    if start_secs <= end_secs:
-        if not (start_secs <= cur_secs < end_secs):
-            return False
-    else:
-        if not (cur_secs >= start_secs or cur_secs < end_secs):
-            return False
+    for anchor in (now.date(), now.date() - timedelta(days=1)):
+        if anchor.isoweekday() not in days:
+            continue
+        if start_date_value is not None and anchor < start_date_value:
+            continue
+        if end_date_value is not None and anchor > end_date_value:
+            continue
+        offset_secs = cur_secs if anchor == now.date() else cur_secs + 24 * 3600
+        if start_secs <= offset_secs < end_secs:
+            return True
 
-    return True
+    return False
 
 
 def _compute_schedule_anchor_for_today(
@@ -1271,12 +1274,20 @@ class CMSClient:
         except Exception:
             local_now = datetime.utcnow()
 
-        # Find the highest-priority active schedule
+        # Find the highest-priority active schedule; use id as a deterministic tie-break.
         winner = None
         for entry in schedules:
             if not _schedule_matches_now(entry, local_now):
                 continue
-            if winner is None or entry.get("priority", 0) > winner.get("priority", 0):
+            entry_priority = entry.get("priority", 0)
+            if (
+                winner is None
+                or entry_priority > winner.get("priority", 0)
+                or (
+                    entry_priority == winner.get("priority", 0)
+                    and str(entry.get("id", "")) < str(winner.get("id", ""))
+                )
+            ):
                 winner = entry
 
         if winner:
