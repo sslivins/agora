@@ -22,7 +22,9 @@ _MODEL_PATH = Path("/proc/device-tree/model")
 _ASOUND_CARDS_PATH = Path("/proc/asound/cards")
 
 # ALSA card name used by the upstream snd_soc_hifiberry_dacplus driver
-# (which the InnoMaker PCM5122 HAT binds against via dtoverlay=hifiberry-dacplus).
+# (which the InnoMaker PCM5122 HAT binds against via
+# dtoverlay=hifiberry-dacplus-std). The card name is the same regardless
+# of which hifiberry-dacplus* overlay variant is loaded.
 _HIFIBERRY_CARD = "sndrpihifiberry"
 
 
@@ -223,7 +225,7 @@ def detect_audio_device() -> tuple[str, str]:
 
     If a HiFiBerry-compatible DAC HAT (e.g. the InnoMaker PCM5122 HAT) is
     present, ``/proc/asound/cards`` will list a ``sndrpihifiberry`` card
-    once ``dtoverlay=hifiberry-dacplus`` has registered the driver. In
+    once ``dtoverlay=hifiberry-dacplus-std`` has registered the driver. In
     that case audio is routed via ALSA ``hw:`` (raw PCM, no HDMI quirks),
     and we return ``("sndrpihifiberry", "hw")``.
 
