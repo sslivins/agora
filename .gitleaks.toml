@@ -4,13 +4,20 @@
 # known non-secret patterns (placeholder strings, test fixtures, CI
 # service credentials).
 #
-# Run locally:   gitleaks detect --config .gitleaks.toml
-# Scan history:  gitleaks detect --config .gitleaks.toml --log-opts="--all"
+# Run locally:   gitleaks git --config .gitleaks.toml
+# Scan history:  gitleaks git --config .gitleaks.toml --log-opts="--all"
+#
+# NOTE: allowlists use the `[[allowlists]]` array form, not the singular
+# `[allowlist]` table. The two cannot be mixed -- gitleaks >= 8.27 exits
+# with "[allowlist] is deprecated, it cannot be used alongside
+# [[allowlists]]", and 8.24 (what CI pins) silently ignores the array
+# entries when a singular table is also present. Keep every allowlist
+# below in this form.
 
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Known non-secret placeholders and test-fixture credentials."
 
 # Files that exist specifically to document secret shapes or contain
@@ -36,3 +43,21 @@ regexes = [
 # Commit SHAs can be added here if history cleanup reveals a false
 # positive that rulesets can't target:
 # commits = ["abcdef0123..."]
+
+# Test modules routinely contain secret-shaped literals ("rotated-key-123")
+# that exist purely to assert rotation/persistence logic. The entropy-based
+# `generic-api-key` rule cannot tell those apart from real credentials, so
+# it is scoped off within tests/ -- and *only* it.
+#
+# This is deliberately narrow. High-confidence rules (private keys, AWS and
+# Azure credentials, GitHub/Slack tokens, connection strings) keep firing
+# inside tests/, because those match unmistakable key material rather than
+# entropy, so a genuine credential committed to a test file is still caught.
+# Dropping all of tests/ from the scan would not be.
+#
+# The pre-existing `tests/.*fixtures?/.*` path entry above only covers
+# fixture directories, not test modules, which is why these slipped through.
+[[allowlists]]
+description = "Entropy-based generic-api-key false positives in test modules."
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)tests/.*\.py$''']
